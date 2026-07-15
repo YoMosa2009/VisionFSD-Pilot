@@ -35,7 +35,7 @@ Designed for **Intel iGPU** (OpenVINO `intel:gpu` / `GPU`) with a target of ~25+
 ## Quick start
 
 ```bat
-git clone https://github.com/<YOUR_USER>/VisionFSD-Pilot.git
+git clone https://github.com/YoMosa2009/VisionFSD-Pilot.git
 cd VisionFSD-Pilot
 setup.bat
 run.bat
