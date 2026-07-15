@@ -1,0 +1,2 @@
+# Git LFS for OpenVINO weights over GitHub's 100 MB hard limit
+models/ufld/openvino_fp16/ufld_tusimple_18.bin filter=lfs diff=lfs merge=lfs -text

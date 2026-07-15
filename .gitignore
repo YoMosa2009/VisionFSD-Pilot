@@ -1,0 +1,48 @@
+# Python
+.venv/
+.pip-cache/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local secrets & runtime data (never publish)
+logs/youtube-cookies.txt
+logs/youtube_cache/
+logs/crash.log
+logs/screenshots/
+logs/*.json
+logs/*.log
+logs/*.png
+logs/*.jpg
+logs/*.mp4
+!logs/YOUTUBE_COOKIES.md
+!logs/.gitkeep
+
+# OpenVINO / Ultralytics compile caches (machine-specific)
+**/cache/
+models/ultralytics/
+Ultralytics/
+
+# Heavy training / intermediate weights (use export scripts instead)
+models/yolopv2/yolopv2.pt
+models/ufld/tusimple_18.pth
+models/ufld/resources_tusimple.tar.gz
+models/ufld/saved_model_tusimple/
+
+# Unused alternate detectors (keep default OpenVINO IR only)
+yolo11n-seg.pt
+yolo11n-seg_openvino_model/
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+kernel.errors.txt
+*.part

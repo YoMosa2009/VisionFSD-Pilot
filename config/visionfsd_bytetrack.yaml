@@ -1,0 +1,14 @@
+# VisionFSD display tracker: retain low-score candidates for ByteTrack's
+# second association stage, while TrackStabilizer controls what is rendered.
+# Low gates help small/distant lights, signs, and people (per-class floors
+# in CLASS_MIN_CONF still reject pure noise after tracking).
+tracker_type: bytetrack
+track_high_thresh: 0.22
+track_low_thresh: 0.05
+new_track_thresh: 0.20
+# 24 (~3s @ ~7.5 Hz detect) is enough for re-id; longer buffers only grow
+# lost_stracks and were a contributor to the ~25–30s stutter kick.
+# TrackStabilizer already holds display coast separately.
+track_buffer: 24
+match_thresh: 0.78
+fuse_score: true
