@@ -51,6 +51,36 @@ run.bat
 
 First startup can take **20–40 seconds** while OpenVINO compiles graphs. Later runs use the local model cache under `models/**/cache/` (gitignored).
 
+## Raspberry Pi 3B installation (separate runtime)
+
+The Raspberry Pi version is a **separate, low-resource installation** in
+[`pi3b/`](pi3b/). Do not use the Windows `setup.bat` / `run.bat` flow on a Pi:
+the desktop application depends on Intel OpenVINO GPU and several perception
+models that are intentionally not part of the Pi runtime.
+
+The Pi runtime uses a small quantized TFLite detector, keeps only the newest
+camera frame, and displays **one sticky selected car** in its camera and
+low-cost world views. It is still read-only visualization software and never
+controls a vehicle.
+
+On a networked Raspberry Pi 3B running Raspberry Pi OS, install everything with:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/YoMosa2009/VisionFSD-Pilot/main/pi3b/install.sh | bash
+```
+
+The installer creates `~/visionfsd-pi`, installs the Pi-only dependencies,
+downloads the verified TFLite model, and verifies its SHA-256. Then start it:
+
+```bash
+~/visionfsd-pi/pi3b/run.sh --camera 0 --fps 25
+```
+
+Use `--fps 30` only after the Pi's sustained benchmark proves it can maintain
+that rate without thermal throttling. The HUD reports display FPS and detector
+FPS separately. See [`pi3b/README.md`](pi3b/README.md) for camera, model, and
+benchmark details.
+
 ### Controls
 
 | Key | Action |
