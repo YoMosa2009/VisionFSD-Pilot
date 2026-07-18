@@ -25,6 +25,8 @@ curl -fsSL https://raw.githubusercontent.com/YoMosa2009/VisionFSD-Pilot/main/pi3
 
 The installer downloads the same model from TensorFlow's storage and verifies
 its SHA-256. A custom HTTPS model can be supplied only with its SHA-256.
+It intentionally does not require the optional `libatlas-base-dev` package,
+which is unavailable on some current Raspberry Pi OS package sources.
 
 ## Run from this checkout
 

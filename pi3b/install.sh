@@ -36,7 +36,7 @@ fi
 
 sudo apt-get update
 sudo apt-get install -y --no-install-recommends \
-  git python3 python3-venv python3-pip python3-opencv libatlas-base-dev curl
+  git python3 python3-venv python3-pip python3-opencv curl
 
 if [[ -e "$INSTALL_ROOT/.git" ]]; then
   git -C "$INSTALL_ROOT" fetch --depth 1 origin "$REF"
