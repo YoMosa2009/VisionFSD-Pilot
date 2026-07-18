@@ -8,7 +8,16 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from visionfsd_pi import Detection, TFLiteVehicleDetector, TargetSelector, bearing_deg, estimate_car_range_m, nms
+from visionfsd_pi import (
+    Detection,
+    TFLiteVehicleDetector,
+    TargetSelector,
+    bearing_deg,
+    estimate_car_range_m,
+    nms,
+    touch_action_at,
+    touch_buttons,
+)
 
 
 class PiCoreTests(unittest.TestCase):
@@ -72,6 +81,14 @@ class PiCoreTests(unittest.TestCase):
         bgr = np.array([[[30, 20, 10]]], dtype=np.uint8)
         tensor = detector._input_tensor(bgr)
         np.testing.assert_array_equal(tensor, np.array([[[[10, 20, 30]]]], dtype=np.uint8))
+
+    def test_touch_buttons_select_all_three_views_and_quit(self) -> None:
+        buttons = touch_buttons(640, 480)
+        self.assertEqual([button.action for button in buttons], ["quit", "world", "camera", "split"])
+        for button in buttons:
+            x1, y1, x2, y2 = button.rect
+            self.assertEqual(touch_action_at(buttons, (x1 + x2) // 2, (y1 + y2) // 2), button.action)
+        self.assertIsNone(touch_action_at(buttons, 0, 0))
 
 
 if __name__ == "__main__":

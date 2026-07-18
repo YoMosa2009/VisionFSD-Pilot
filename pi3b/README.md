@@ -46,8 +46,11 @@ python3 -m venv --system-site-packages .venv
 .venv/bin/python visionfsd_pi.py --camera 0 --model models/vehicle_ssd_mobilenet_v1.tflite
 ```
 
-`1`, `2`, `3` select world, camera, split; `S` saves a screenshot; `Q`/`Esc`
-quits. The world panel is a low-cost OpenCV pseudo-3D view, not desktop OpenGL.
+The bottom of every visual screen has large touchscreen controls: **Quit**,
+**Screen 1** (world), **Screen 2** (camera), and **Screen 3** (split).
+They also work with a regular mouse. `1`, `2`, `3` select world, camera,
+split; `S` saves a screenshot; `Q`/`Esc` quits. The world panel is a low-cost
+OpenCV pseudo-3D view, not desktop OpenGL.
 
 ## Performance
 

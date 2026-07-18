@@ -23,6 +23,7 @@ import numpy as np
 PROJECT_ROOT = Path(__file__).resolve().parent
 CAR_CLASS_ID = 2  # COCO car. The Pi renderer intentionally shows this class only.
 CAR_WIDTH_M = 1.80
+WINDOW_TITLE = "VisionFSD Pi 3B - read only"
 
 
 @dataclass(frozen=True)
@@ -49,6 +50,15 @@ class DetectorResult:
     inference_ms: float
     capture_time: float
     completed_time: float
+
+
+@dataclass(frozen=True)
+class TouchButton:
+    """A large, touchscreen-friendly control in rendered image coordinates."""
+
+    action: str
+    label: str
+    rect: tuple[int, int, int, int]
 
 
 def focal_length_px(frame_width: int, fov_deg: float) -> float:
@@ -484,6 +494,54 @@ def compose_view(frame: np.ndarray, target: Target | None, rates: Rates, view: s
     return np.hstack((world, camera))
 
 
+def touch_buttons(frame_width: int, frame_height: int) -> list[TouchButton]:
+    """Lay out the permanent touch controls across the bottom of any view."""
+    margin = max(6, min(14, frame_height // 35))
+    gap = max(5, margin // 2)
+    button_height = max(42, min(68, frame_height // 7))
+    available_width = frame_width - (2 * margin) - (3 * gap)
+    button_width = max(1, available_width // 4)
+    y1 = frame_height - margin - button_height
+    specs = (
+        ("quit", "QUIT"),
+        ("world", "SCREEN 1"),
+        ("camera", "SCREEN 2"),
+        ("split", "SCREEN 3"),
+    )
+    buttons: list[TouchButton] = []
+    for index, (action, label) in enumerate(specs):
+        x1 = margin + index * (button_width + gap)
+        x2 = frame_width - margin if index == len(specs) - 1 else x1 + button_width
+        buttons.append(TouchButton(action, label, (x1, y1, x2, frame_height - margin)))
+    return buttons
+
+
+def touch_action_at(buttons: list[TouchButton], x: int, y: int) -> str | None:
+    """Return the action for a touchscreen click, if it landed on a button."""
+    for button in buttons:
+        x1, y1, x2, y2 = button.rect
+        if x1 <= x <= x2 and y1 <= y <= y2:
+            return button.action
+    return None
+
+
+def draw_touch_controls(panel: np.ndarray) -> list[TouchButton]:
+    """Render high-contrast buttons after the camera/world panels are composed."""
+    buttons = touch_buttons(panel.shape[1], panel.shape[0])
+    font_scale = 0.48 if panel.shape[0] < 600 else 0.62
+    for button in buttons:
+        x1, y1, x2, y2 = button.rect
+        colour = (45, 45, 185) if button.action == "quit" else (42, 105, 42)
+        cv2.rectangle(panel, (x1, y1), (x2, y2), colour, -1)
+        cv2.rectangle(panel, (x1, y1), (x2, y2), (230, 235, 240), 2)
+        text_size, _ = cv2.getTextSize(button.label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)
+        text_x = x1 + max(4, (x2 - x1 - text_size[0]) // 2)
+        text_y = y1 + (y2 - y1 + text_size[1]) // 2
+        cv2.putText(panel, button.label, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX,
+                    font_scale, (255, 255, 255), 1, cv2.LINE_AA)
+    return buttons
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Read-only, single-target Pi 3B vehicle visualizer")
     parser.add_argument("--camera", default="0", help="V4L2 camera index or local video path")
@@ -521,6 +579,17 @@ def main() -> int:
     view = args.view
     deadline = rates.started + args.test_seconds if args.test_seconds > 0 else None
     next_tick = time.perf_counter()
+    controls: list[TouchButton] = []
+    pending_touch_action: str | None = None
+
+    def on_mouse(event: int, x: int, y: int, _flags: int, _userdata: object) -> None:
+        nonlocal pending_touch_action
+        if event == cv2.EVENT_LBUTTONUP:
+            pending_touch_action = touch_action_at(controls, x, y)
+
+    if not args.no_display:
+        cv2.namedWindow(WINDOW_TITLE, cv2.WINDOW_AUTOSIZE)
+        cv2.setMouseCallback(WINDOW_TITLE, on_mouse)
     try:
         while True:
             sequence, frame, captured = camera.latest()
@@ -544,17 +613,21 @@ def main() -> int:
                 time.sleep(0.01)
                 continue
             rendered = compose_view(last_frame, target, rates, view, worker.error or camera.error)
+            if not args.no_display:
+                controls = draw_touch_controls(rendered)
             rates.display_frames += 1
             if not args.no_display:
-                cv2.imshow("VisionFSD Pi 3B - read only", rendered)
+                cv2.imshow(WINDOW_TITLE, rendered)
                 key = cv2.waitKey(1) & 0xFF
-                if key in (27, ord("q"), ord("Q")):
+                action = pending_touch_action
+                pending_touch_action = None
+                if key in (27, ord("q"), ord("Q")) or action == "quit":
                     break
-                if key == ord("1"):
+                if key == ord("1") or action == "world":
                     view = "world"
-                elif key == ord("2"):
+                elif key == ord("2") or action == "camera":
                     view = "camera"
-                elif key == ord("3"):
+                elif key == ord("3") or action == "split":
                     view = "split"
                 elif key in (ord("s"), ord("S")):
                     out = PROJECT_ROOT / "logs" / f"pi3b-{int(time.time())}.jpg"
