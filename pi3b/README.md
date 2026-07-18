@@ -8,6 +8,9 @@ single vehicle target, and a target shown in both camera and world panels.
 It intentionally removes OpenVINO GPU, road/lane/depth models, ByteTrack,
 PyTorch, OpenGL, YouTube, and multi-object rendering.
 
+Use **64-bit** Raspberry Pi OS (`aarch64`). Current LiteRT has an ARM64 wheel
+for modern Pi OS/Python 3.13; the obsolete `tflite-runtime` package does not.
+
 ## Runtime contract
 
 The included `models/vehicle_ssd_mobilenet_v1.tflite` is a 4.2 MB quantized

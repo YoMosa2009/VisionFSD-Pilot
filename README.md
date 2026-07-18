@@ -63,7 +63,8 @@ camera frame, and displays **one sticky selected car** in its camera and
 low-cost world views. It is still read-only visualization software and never
 controls a vehicle.
 
-On a networked Raspberry Pi 3B running Raspberry Pi OS, install everything with:
+On a networked Raspberry Pi 3B running **64-bit** Raspberry Pi OS, install
+everything with:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/YoMosa2009/VisionFSD-Pilot/main/pi3b/install.sh | bash

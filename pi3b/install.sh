@@ -33,6 +33,11 @@ if [[ ! "$MODEL_SHA256" =~ ^[A-Fa-f0-9]{64}$ ]]; then
   echo "A 64-character SHA-256 is required for a custom model URL." >&2
   exit 2
 fi
+if [[ "$(uname -m)" != "aarch64" ]]; then
+  echo "VisionFSD Pi requires 64-bit Raspberry Pi OS (aarch64)." >&2
+  echo "Reflash the Pi 3B with Raspberry Pi OS (64-bit), then re-run this command." >&2
+  exit 2
+fi
 
 sudo apt-get update
 sudo apt-get install -y --no-install-recommends \

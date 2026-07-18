@@ -90,9 +90,16 @@ class TFLiteVehicleDetector:
 
     def __init__(self, model_path: Path, confidence: float, threads: int) -> None:
         try:
-            from tflite_runtime.interpreter import Interpreter
-        except ImportError as exc:  # pragma: no cover - requires Pi LiteRT runtime
-            raise RuntimeError("tflite-runtime is missing; run pi3b/install.sh") from exc
+            # Current Google LiteRT package; supports Python 3.13 on ARM64.
+            from ai_edge_litert.interpreter import Interpreter
+        except ImportError:
+            try:
+                # Legacy fallback for existing Bookworm/Python <=3.11 installs.
+                from tflite_runtime.interpreter import Interpreter
+            except ImportError as exc:  # pragma: no cover - requires Pi runtime
+                raise RuntimeError(
+                    "LiteRT is missing. Run pi3b/install.sh on 64-bit Raspberry Pi OS."
+                ) from exc
         if not model_path.is_file():
             raise FileNotFoundError(f"TFLite model not found: {model_path}")
         self._interpreter = Interpreter(model_path=str(model_path), num_threads=max(1, threads))

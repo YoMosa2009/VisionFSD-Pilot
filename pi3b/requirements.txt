@@ -1,4 +1,5 @@
 # OpenCV is installed by install.sh from Raspberry Pi OS packages so it can use
-# the platform camera/display stack. LiteRT is the only ML runtime on the Pi.
+# the platform camera/display stack. Current LiteRT supports 64-bit Pi OS,
+# including Trixie's Python 3.13; legacy tflite-runtime does not.
 numpy>=1.24,<3
-tflite-runtime>=2.14
+ai-edge-litert>=2.1,<3
