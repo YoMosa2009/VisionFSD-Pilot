@@ -77,6 +77,12 @@ downloads the verified TFLite model, and verifies its SHA-256. Then start it:
 ~/visionfsd-pi/pi3b/run.sh --camera 0 --fps 25
 ```
 
+To update an existing Pi installation after later releases:
+
+```bash
+~/visionfsd-pi/pi3b/update.sh
+```
+
 Use `--fps 30` only after the Pi's sustained benchmark proves it can maintain
 that rate without thermal throttling. The HUD reports display FPS and detector
 FPS separately. See [`pi3b/README.md`](pi3b/README.md) for camera, model, and

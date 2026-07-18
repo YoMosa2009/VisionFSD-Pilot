@@ -31,6 +31,12 @@ its SHA-256. A custom HTTPS model can be supplied only with its SHA-256.
 It intentionally does not require the optional `libatlas-base-dev` package,
 which is unavailable on some current Raspberry Pi OS package sources.
 
+To update an existing installation after a release is merged to `main`:
+
+```bash
+~/visionfsd-pi/pi3b/update.sh
+```
+
 ## Run from this checkout
 
 ```bash
@@ -49,6 +55,10 @@ quits. The world panel is a low-cost OpenCV pseudo-3D view, not desktop OpenGL.
 separately: a 30 FPS display is not claimed as 30 FPS inference. Acceptance
 requires a sustained Pi benchmark with no thermal throttling. If CPU inference
 does not sustain the goal after input/model tuning, add a USB accelerator.
+
+The default two LiteRT threads and one OpenCV thread leave headroom for camera
+capture and the desktop. Do not claim 25 FPS **detection** unless the HUD's
+`DETECT` rate reaches it on the physical Pi; 25 FPS display alone is expected.
 
 ## Desktop provenance
 

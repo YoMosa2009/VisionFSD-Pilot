@@ -68,6 +68,7 @@ if [[ "$actual_hash" != "${MODEL_SHA256^^}" ]]; then
 fi
 mv -f "$PI_ROOT/models/vehicle_yolo11n_320_int8.tflite" "$PI_ROOT/models/vehicle_ssd_mobilenet_v1.tflite"
 
-chmod +x "$PI_ROOT/run.sh"
+chmod +x "$PI_ROOT/run.sh" "$PI_ROOT/update.sh"
 echo "Installed at $PI_ROOT"
 echo "Run: $PI_ROOT/run.sh --camera 0 --fps 25"
+echo "Update later: $PI_ROOT/update.sh"
