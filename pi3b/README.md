@@ -8,6 +8,9 @@ single vehicle target, and a target shown in both camera and world panels.
 It intentionally removes OpenVINO GPU, road/lane/depth models, ByteTrack,
 PyTorch, OpenGL, YouTube, and multi-object rendering.
 
+Use **64-bit** Raspberry Pi OS (`aarch64`). Current LiteRT has an ARM64 wheel
+for modern Pi OS/Python 3.13; the obsolete `tflite-runtime` package does not.
+
 ## Runtime contract
 
 The included `models/vehicle_ssd_mobilenet_v1.tflite` is a 4.2 MB quantized
@@ -25,6 +28,14 @@ curl -fsSL https://raw.githubusercontent.com/YoMosa2009/VisionFSD-Pilot/main/pi3
 
 The installer downloads the same model from TensorFlow's storage and verifies
 its SHA-256. A custom HTTPS model can be supplied only with its SHA-256.
+It intentionally does not require the optional `libatlas-base-dev` package,
+which is unavailable on some current Raspberry Pi OS package sources.
+
+To update an existing installation after a release is merged to `main`:
+
+```bash
+~/visionfsd-pi/pi3b/update.sh
+```
 
 ## Run from this checkout
 
@@ -44,6 +55,10 @@ quits. The world panel is a low-cost OpenCV pseudo-3D view, not desktop OpenGL.
 separately: a 30 FPS display is not claimed as 30 FPS inference. Acceptance
 requires a sustained Pi benchmark with no thermal throttling. If CPU inference
 does not sustain the goal after input/model tuning, add a USB accelerator.
+
+The default two LiteRT threads and one OpenCV thread leave headroom for camera
+capture and the desktop. Do not claim 25 FPS **detection** unless the HUD's
+`DETECT` rate reaches it on the physical Pi; 25 FPS display alone is expected.
 
 ## Desktop provenance
 

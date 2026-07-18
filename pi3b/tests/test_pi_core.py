@@ -63,6 +63,16 @@ class PiCoreTests(unittest.TestCase):
         self.assertIsNotNone(decoded)
         self.assertEqual(decoded[0].box, (192, 96, 447, 384))
 
+    def test_uint8_ssd_input_keeps_raw_rgb_values(self) -> None:
+        detector = object.__new__(TFLiteVehicleDetector)
+        detector._input = {"dtype": np.uint8, "quantization": (0.0078125, 128)}
+        detector._input_h, detector._input_w = 1, 1
+        # OpenCV frames are BGR. The detector must receive RGB 10,20,30 -- not
+        # a saturated re-quantized value such as 255,255,255.
+        bgr = np.array([[[30, 20, 10]]], dtype=np.uint8)
+        tensor = detector._input_tensor(bgr)
+        np.testing.assert_array_equal(tensor, np.array([[[[10, 20, 30]]]], dtype=np.uint8))
+
 
 if __name__ == "__main__":
     unittest.main()

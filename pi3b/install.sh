@@ -33,10 +33,15 @@ if [[ ! "$MODEL_SHA256" =~ ^[A-Fa-f0-9]{64}$ ]]; then
   echo "A 64-character SHA-256 is required for a custom model URL." >&2
   exit 2
 fi
+if [[ "$(uname -m)" != "aarch64" ]]; then
+  echo "VisionFSD Pi requires 64-bit Raspberry Pi OS (aarch64)." >&2
+  echo "Reflash the Pi 3B with Raspberry Pi OS (64-bit), then re-run this command." >&2
+  exit 2
+fi
 
 sudo apt-get update
 sudo apt-get install -y --no-install-recommends \
-  git python3 python3-venv python3-pip python3-opencv libatlas-base-dev curl
+  git python3 python3-venv python3-pip python3-opencv curl
 
 if [[ -e "$INSTALL_ROOT/.git" ]]; then
   git -C "$INSTALL_ROOT" fetch --depth 1 origin "$REF"
@@ -63,6 +68,7 @@ if [[ "$actual_hash" != "${MODEL_SHA256^^}" ]]; then
 fi
 mv -f "$PI_ROOT/models/vehicle_yolo11n_320_int8.tflite" "$PI_ROOT/models/vehicle_ssd_mobilenet_v1.tflite"
 
-chmod +x "$PI_ROOT/run.sh"
+chmod +x "$PI_ROOT/run.sh" "$PI_ROOT/update.sh"
 echo "Installed at $PI_ROOT"
 echo "Run: $PI_ROOT/run.sh --camera 0 --fps 25"
+echo "Update later: $PI_ROOT/update.sh"
