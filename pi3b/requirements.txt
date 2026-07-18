@@ -1,0 +1,4 @@
+# OpenCV is installed by install.sh from Raspberry Pi OS packages so it can use
+# the platform camera/display stack. LiteRT is the only ML runtime on the Pi.
+numpy>=1.24,<3
+tflite-runtime>=2.14
