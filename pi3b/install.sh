@@ -54,6 +54,7 @@ PI_ROOT="$INSTALL_ROOT/pi3b"
 python3 -m venv --system-site-packages "$PI_ROOT/.venv"
 "$PI_ROOT/.venv/bin/python" -m pip install --upgrade pip
 "$PI_ROOT/.venv/bin/python" -m pip install -r "$PI_ROOT/requirements.txt"
+printf '%s\n' "$REF" > "$PI_ROOT/.install-ref"
 
 mkdir -p "$PI_ROOT/models" "$PI_ROOT/logs"
 TMP_MODEL="$PI_ROOT/models/.vehicle_model.download"

@@ -5,11 +5,14 @@ import time
 import unittest
 from pathlib import Path
 
+import cv2
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from visionfsd_pi import (
     Detection,
+    LowCostLaneDetector,
+    SceneObjectTracker,
     TFLiteVehicleDetector,
     TargetSelector,
     bearing_deg,
@@ -30,6 +33,11 @@ class PiCoreTests(unittest.TestCase):
         items = [Detection("car", 0.90, (10, 10, 100, 100)), Detection("car", 0.60, (12, 12, 99, 99))]
         self.assertEqual(nms(items), [items[0]])
 
+    def test_nms_preserves_overlapping_different_scene_classes(self) -> None:
+        car = Detection("car", 0.90, (10, 10, 100, 100))
+        person = Detection("person", 0.75, (10, 10, 100, 100))
+        self.assertEqual(nms([car, person]), [car, person])
+
     def test_target_requires_persistent_materially_closer_challenger(self) -> None:
         selector = TargetSelector(70.0)
         now = time.perf_counter()
@@ -37,13 +45,22 @@ class PiCoreTests(unittest.TestCase):
         first = selector.update([incumbent], 640, now)
         self.assertIsNotNone(first)
         first_id = first.track_id
-        # A closer, non-overlapping challenger needs six detector updates.
-        challenger = Detection("car", 0.9, (40, 100, 260, 460))
+        # A closer, forward challenger needs six detector updates.
+        challenger = Detection("car", 0.9, (210, 100, 430, 460))
         for step in range(5):
             current = selector.update([incumbent, challenger], 640, now + (step + 1) * 0.03)
             self.assertEqual(current.track_id, first_id)
         current = selector.update([incumbent, challenger], 640, now + 0.20)
         self.assertNotEqual(current.track_id, first_id)
+
+    def test_target_switches_to_a_new_forward_corridor_vehicle(self) -> None:
+        selector = TargetSelector(70.0)
+        side_vehicle = Detection("car", 0.9, (0, 120, 240, 460))
+        forward_vehicle = Detection("car", 0.9, (290, 160, 350, 400))
+        first = selector.update([side_vehicle], 640, 1.0)
+        self.assertIsNotNone(first)
+        current = selector.update([side_vehicle, forward_vehicle], 640, 1.1)
+        self.assertEqual(current.detection.box, forward_vehicle.box)
 
     def test_raw_yolo_output_decodes_car_without_a_runtime(self) -> None:
         # Decode the actual Pi export layout [1, 84, candidate_count] without
@@ -71,6 +88,37 @@ class PiCoreTests(unittest.TestCase):
         decoded = detector._decode_detection_postprocess([boxes, classes, scores, count], 640, 480)
         self.assertIsNotNone(decoded)
         self.assertEqual(decoded[0].box, (192, 96, 447, 384))
+
+    def test_standard_tflite_detection_postprocess_decodes_world_only_classes(self) -> None:
+        detector = object.__new__(TFLiteVehicleDetector)
+        detector._confidence = 0.35
+        boxes = np.array([[
+            (0.2, 0.1, 0.7, 0.3),
+            (0.1, 0.4, 0.6, 0.5),
+            (0.3, 0.7, 0.8, 0.8),
+        ]], dtype=np.float32)
+        classes = np.array([[0.0, 9.0, 11.0]], dtype=np.float32)
+        scores = np.array([[0.91, 0.82, 0.78]], dtype=np.float32)
+        count = np.array([3.0], dtype=np.float32)
+        decoded = detector._decode_detection_postprocess([boxes, classes, scores, count], 640, 480)
+        self.assertEqual([item.label for item in decoded], ["person", "traffic_light", "stop_sign"])
+
+    def test_world_objects_require_two_detections_before_display(self) -> None:
+        tracker = SceneObjectTracker(70.0)
+        person = Detection("person", 0.90, (280, 140, 330, 430))
+        self.assertEqual(tracker.update([person], 640, 1.0), [])
+        confirmed = tracker.update([person], 640, 1.2)
+        self.assertEqual(len(confirmed), 1)
+        self.assertEqual(confirmed[0].detection.label, "person")
+
+    def test_low_cost_lane_detector_requires_and_finds_a_pair(self) -> None:
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        cv2.line(frame, (80, 479), (270, 250), (255, 255, 255), 8, cv2.LINE_AA)
+        cv2.line(frame, (560, 479), (370, 250), (255, 255, 255), 8, cv2.LINE_AA)
+        lane = LowCostLaneDetector().update(frame, 1.0)
+        self.assertTrue(lane.observed)
+        self.assertLess(lane.left_bottom_norm, 0.5)
+        self.assertGreater(lane.right_bottom_norm, 0.5)
 
     def test_uint8_ssd_input_keeps_raw_rgb_values(self) -> None:
         detector = object.__new__(TFLiteVehicleDetector)

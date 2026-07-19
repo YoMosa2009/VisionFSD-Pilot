@@ -4,9 +4,9 @@ This is a **separate, read-only** Raspberry Pi 3B runtime derived from the
 design of the desktop VisionFSD Pilot. It is deliberately not a direct port.
 
 It preserves newest-frame capture, bounded asynchronous inference, a sticky
-single vehicle target, and a target shown in both camera and world panels.
-It intentionally removes OpenVINO GPU, road/lane/depth models, ByteTrack,
-PyTorch, OpenGL, YouTube, and multi-object rendering.
+single lead-vehicle target, and a target shown in both camera and world panels.
+It intentionally removes OpenVINO GPU, neural road/lane/depth models,
+ByteTrack, PyTorch, OpenGL, YouTube, and desktop-scale multi-object rendering.
 
 Use **64-bit** Raspberry Pi OS (`aarch64`). Current LiteRT has an ARM64 wheel
 for modern Pi OS/Python 3.13; the obsolete `tflite-runtime` package does not.
@@ -14,11 +14,17 @@ for modern Pi OS/Python 3.13; the obsolete `tflite-runtime` package does not.
 ## Runtime contract
 
 The included `models/vehicle_ssd_mobilenet_v1.tflite` is a 4.2 MB quantized
-SSD MobileNet V1 COCO detector. The Pi renderer accepts only its `car` result,
-then renders only one sticky target. This immediately makes the Pi folder
-runnable. The desktop repository's OpenVINO/PyTorch artifacts are not Pi
-runtime artifacts. `tools/export_pi_tflite.py` remains available for a future,
-Pi-specific YOLO model once a Linux x86/macOS export environment is available.
+SSD MobileNet V1 COCO detector. It keeps only one sticky **lead vehicle**
+(car, motorcycle, bus, or truck) in the camera and world views. The world view
+can additionally show confirmed pedestrians, traffic lights, and stop signs;
+those extras never clutter the camera view. This immediately makes the Pi
+folder runnable. The desktop repository's OpenVINO/PyTorch artifacts are not
+Pi runtime artifacts. `tools/export_pi_tflite.py` remains available for a
+future, Pi-specific YOLO model once a Linux x86/macOS export environment is
+available.
+
+The bundled COCO model identifies **stop signs**, not arbitrary traffic-sign
+types such as speed-limit signs. Traffic-light colour is not inferred.
 
 The one-command deployment shape is:
 
@@ -31,7 +37,8 @@ its SHA-256. A custom HTTPS model can be supplied only with its SHA-256.
 It intentionally does not require the optional `libatlas-base-dev` package,
 which is unavailable on some current Raspberry Pi OS package sources.
 
-To update an existing installation after a release is merged to `main`:
+To update an existing installation, preserving the release branch it was
+installed from:
 
 ```bash
 ~/visionfsd-pi/pi3b/update.sh
@@ -50,7 +57,10 @@ The bottom of every visual screen has large touchscreen controls: **Quit**,
 **Screen 1** (world), **Screen 2** (camera), and **Screen 3** (split).
 They also work with a regular mouse. `1`, `2`, `3` select world, camera,
 split; `S` saves a screenshot; `Q`/`Esc` quits. The world panel is a low-cost
-OpenCV pseudo-3D view, not desktop OpenGL.
+OpenCV pseudo-3D view with a centred ego vehicle and two lane boundaries.
+The lanes glow bright white only when its low-rate, classical lane pass has a
+fresh left-and-right pair; otherwise they stay dim. It is not desktop OpenGL
+and it is not a driving measurement.
 
 ## Performance
 
@@ -60,8 +70,10 @@ requires a sustained Pi benchmark with no thermal throttling. If CPU inference
 does not sustain the goal after input/model tuning, add a USB accelerator.
 
 The default two LiteRT threads and one OpenCV thread leave headroom for camera
-capture and the desktop. Do not claim 25 FPS **detection** unless the HUD's
-`DETECT` rate reaches it on the physical Pi; 25 FPS display alone is expected.
+capture and the desktop. The new scene classes reuse the same single detector
+result, while the lane pass is bounded to 320 px at 5 Hz. Do not claim 25 FPS
+**detection** unless the HUD's `DETECT` rate reaches it on the physical Pi;
+25 FPS display alone is expected.
 
 ## Desktop provenance
 

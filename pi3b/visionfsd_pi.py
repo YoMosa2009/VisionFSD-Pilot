@@ -21,9 +21,37 @@ import numpy as np
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-CAR_CLASS_ID = 2  # COCO car. The Pi renderer intentionally shows this class only.
 CAR_WIDTH_M = 1.80
 WINDOW_TITLE = "VisionFSD Pi 3B - read only"
+
+# The bundled SSD MobileNet labelmap is zero-based.  Keep this intentionally
+# small: decoding these classes costs no extra model inference, while avoiding
+# clutter and false visual objects from the full 90-class COCO labelmap.
+SUPPORTED_COCO_LABELS = {
+    0: "person",
+    2: "car",
+    3: "motorcycle",
+    5: "bus",
+    7: "truck",
+    9: "traffic_light",
+    11: "stop_sign",
+}
+VEHICLE_LABELS = frozenset(("car", "motorcycle", "bus", "truck"))
+WORLD_ONLY_LABELS = frozenset(("person", "traffic_light", "stop_sign"))
+OBJECT_WIDTH_M = {
+    "car": CAR_WIDTH_M,
+    "motorcycle": 0.85,
+    "bus": 2.55,
+    "truck": 2.50,
+    "person": 0.55,
+    "traffic_light": 0.35,
+    "stop_sign": 0.75,
+}
+DISPLAY_LABELS = {
+    "person": "PED",
+    "traffic_light": "LIGHT",
+    "stop_sign": "STOP",
+}
 
 
 @dataclass(frozen=True)
@@ -65,10 +93,16 @@ def focal_length_px(frame_width: int, fov_deg: float) -> float:
     return (frame_width / 2.0) / math.tan(math.radians(fov_deg) / 2.0)
 
 
-def estimate_car_range_m(box: tuple[int, int, int, int], frame_width: int, fov_deg: float) -> float:
+def estimate_range_m(box: tuple[int, int, int, int], frame_width: int, fov_deg: float,
+                     known_width_m: float = CAR_WIDTH_M) -> float:
     """Coarse pinhole range for visualization; never a driving measurement."""
     width = max(1, box[2] - box[0])
-    return float(np.clip(CAR_WIDTH_M * focal_length_px(frame_width, fov_deg) / width, 1.0, 120.0))
+    return float(np.clip(known_width_m * focal_length_px(frame_width, fov_deg) / width, 1.0, 120.0))
+
+
+def estimate_car_range_m(box: tuple[int, int, int, int], frame_width: int, fov_deg: float) -> float:
+    """Compatibility wrapper for the lead-car visual estimate."""
+    return estimate_range_m(box, frame_width, fov_deg, CAR_WIDTH_M)
 
 
 def bearing_deg(box: tuple[int, int, int, int], frame_width: int, fov_deg: float) -> float:
@@ -90,13 +124,16 @@ def box_iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float
 def nms(detections: list[Detection], threshold: float = 0.45) -> list[Detection]:
     kept: list[Detection] = []
     for item in sorted(detections, key=lambda value: value.confidence, reverse=True):
-        if all(box_iou(item.box, chosen.box) < threshold for chosen in kept):
+        # Different classes may legitimately overlap (for example a person
+        # beside a vehicle), so suppress only duplicate detections of the same
+        # semantic class.
+        if all(item.label != chosen.label or box_iou(item.box, chosen.box) < threshold for chosen in kept):
             kept.append(item)
     return kept
 
 
 class TFLiteVehicleDetector:
-    """TFLite/LiteRT detector that decodes common YOLO and DetectionPostProcess outputs."""
+    """LiteRT scene detector limited to the Pi visualizer's supported classes."""
 
     def __init__(self, model_path: Path, confidence: float, threads: int) -> None:
         try:
@@ -176,7 +213,8 @@ class TFLiteVehicleDetector:
         flat_boxes = np.squeeze(boxes)
         decoded: list[Detection] = []
         for raw_box, class_id, score in zip(flat_boxes, classes, scores):
-            if int(round(float(class_id))) != CAR_CLASS_ID or float(score) < self._confidence:
+            label = SUPPORTED_COCO_LABELS.get(int(round(float(class_id))))
+            if label is None or float(score) < self._confidence:
                 continue
             y1, x1, y2, x2 = [float(value) for value in raw_box]
             # DetectionPostProcess normalized boxes are normally [0, 1].
@@ -185,7 +223,7 @@ class TFLiteVehicleDetector:
                 y1, y2 = y1 * frame_h, y2 * frame_h
             box = (max(0, int(x1)), max(0, int(y1)), min(frame_w - 1, int(x2)), min(frame_h - 1, int(y2)))
             if box[2] - box[0] >= 3 and box[3] - box[1] >= 3:
-                decoded.append(Detection("car", float(score), box))
+                decoded.append(Detection(label, float(score), box))
         return nms(decoded)
 
     def _decode_yolo(self, raw: np.ndarray, frame_w: int, frame_h: int) -> list[Detection]:
@@ -195,21 +233,27 @@ class TFLiteVehicleDetector:
         # YOLO11 export: [84, candidates]; older YOLO variants: [85, candidates].
         if 6 <= array.shape[0] <= 128 and array.shape[1] > array.shape[0]:
             array = array.T
-        if array.shape[1] < 4 + CAR_CLASS_ID + 1:
+        largest_class_id = max(SUPPORTED_COCO_LABELS)
+        if array.shape[1] < 4 + largest_class_id + 1:
             raise RuntimeError(f"Unsupported TFLite detector channels: {array.shape}")
         has_objectness = array.shape[1] >= 85
         class_start = 5 if has_objectness else 4
         decoded: list[Detection] = []
         for row in array:
-            score = float(row[class_start + CAR_CLASS_ID])
-            if has_objectness:
-                score *= float(row[4])
-            if score < self._confidence:
-                continue
-            box = self._to_box(float(row[0]), float(row[1]), float(row[2]), float(row[3]),
-                               frame_w, frame_h, self._input_w, self._input_h)
-            if box is not None:
-                decoded.append(Detection("car", score, box))
+            box: tuple[int, int, int, int] | None = None
+            for class_id, label in SUPPORTED_COCO_LABELS.items():
+                if class_start + class_id >= array.shape[1]:
+                    continue
+                score = float(row[class_start + class_id])
+                if has_objectness:
+                    score *= float(row[4])
+                if score < self._confidence:
+                    continue
+                if box is None:
+                    box = self._to_box(float(row[0]), float(row[1]), float(row[2]), float(row[3]),
+                                       frame_w, frame_h, self._input_w, self._input_h)
+                if box is not None:
+                    decoded.append(Detection(label, score, box))
         return nms(decoded)
 
     def infer(self, frame: np.ndarray) -> list[Detection]:
@@ -261,7 +305,10 @@ class LatestCamera:
 
     def latest(self) -> tuple[int, np.ndarray | None, float]:
         with self._lock:
-            return self._sequence, None if self._frame is None else self._frame.copy(), self._captured
+            # The capture thread publishes a new frame object rather than
+            # mutating the published one. Returning that immutable-by-contract
+            # reference avoids an extra 640x480 copy every display tick.
+            return self._sequence, self._frame, self._captured
 
     @property
     def error(self) -> str:
@@ -340,8 +387,9 @@ class _Track:
 class TargetSelector:
     """Small, deterministic replacement for desktop ByteTrack + sticky LEAD.
 
-    It tracks only cars, chooses one centred/near vehicle, and requires a
-    challenger to be materially closer for several detector updates.
+    It tracks only supported vehicle classes, chooses one centred/near lead
+    vehicle, and requires a challenger to be materially closer for several
+    detector updates.
     """
 
     def __init__(self, fov_deg: float, hold_s: float = 0.75) -> None:
@@ -353,8 +401,12 @@ class TargetSelector:
         self._challenger_id: int | None = None
         self._challenge_hits = 0
 
-    def _match(self, detection: Detection) -> int | None:
-        choices = [(box_iou(detection.box, track.detection.box), track_id) for track_id, track in self._tracks.items()]
+    def _match(self, detection: Detection, reserved: set[int]) -> int | None:
+        choices = [
+            (box_iou(detection.box, track.detection.box), track_id)
+            for track_id, track in self._tracks.items()
+            if track_id not in reserved
+        ]
         if not choices:
             return None
         score, track_id = max(choices)
@@ -363,8 +415,11 @@ class TargetSelector:
     def update(self, detections: list[Detection], frame_width: int, now: float) -> Target | None:
         seen: set[int] = set()
         for detection in detections:
-            track_id = self._match(detection)
-            distance = estimate_car_range_m(detection.box, frame_width, self._fov_deg)
+            if detection.label not in VEHICLE_LABELS:
+                continue
+            track_id = self._match(detection, seen)
+            distance = estimate_range_m(detection.box, frame_width, self._fov_deg,
+                                        OBJECT_WIDTH_M[detection.label])
             heading = bearing_deg(detection.box, frame_width, self._fov_deg)
             if track_id is None:
                 track_id = self._next_id
@@ -378,7 +433,19 @@ class TargetSelector:
                 )
             seen.add(track_id)
         self._tracks = {track_id: track for track_id, track in self._tracks.items() if now - track.last_seen <= self._hold_s}
-        candidates = [(track.distance_m + abs(track.bearing) * 0.08, track_id) for track_id, track in self._tracks.items() if track_id in seen]
+        candidates = [
+            (track.distance_m + abs(track.bearing) * 0.18, track_id)
+            for track_id, track in self._tracks.items()
+            if track_id in seen
+        ]
+        # Prefer the forward corridor whenever it contains a vehicle. This is
+        # only a camera-centre heuristic, not a lane-occupancy claim.
+        forward = [
+            candidate for candidate in candidates
+            if abs(self._tracks[candidate[1]].bearing) <= 18.0
+        ]
+        if forward:
+            candidates = forward
         if not candidates:
             return self.current(now)
         _, best_id = min(candidates)
@@ -387,7 +454,11 @@ class TargetSelector:
         elif best_id != self._target_id:
             incumbent = self._tracks[self._target_id]
             challenger = self._tracks[best_id]
-            if challenger.distance_m < incumbent.distance_m - 3.0:
+            # A newly visible centre-corridor vehicle should replace a stale
+            # side vehicle immediately; other handoffs retain hysteresis.
+            if abs(challenger.bearing) <= 18.0 < abs(incumbent.bearing):
+                self._target_id, self._challenger_id, self._challenge_hits = best_id, None, 0
+            elif challenger.distance_m < incumbent.distance_m - 3.0:
                 self._challenge_hits = self._challenge_hits + 1 if self._challenger_id == best_id else 1
                 self._challenger_id = best_id
                 if self._challenge_hits >= 6:
@@ -408,6 +479,201 @@ class TargetSelector:
             self._target_id = None
             return None
         return Target(self._target_id, track.detection, track.distance_m, track.bearing, age < 0.12, age)
+
+
+@dataclass(frozen=True)
+class SceneObject:
+    """A non-vehicle object shown only in the low-cost world view."""
+
+    track_id: int
+    detection: Detection
+    distance_m: float
+    bearing_deg: float
+    observed: bool
+    age_s: float
+
+
+@dataclass
+class _SceneTrack:
+    detection: Detection
+    distance_m: float
+    bearing: float
+    last_seen: float
+    hits: int
+
+
+class SceneObjectTracker:
+    """Tiny class-aware tracker for world-only pedestrians, lights, and signs."""
+
+    def __init__(self, fov_deg: float, hold_s: float = 0.80, max_objects: int = 4) -> None:
+        self._fov_deg = fov_deg
+        self._hold_s = hold_s
+        self._max_objects = max_objects
+        self._tracks: dict[int, _SceneTrack] = {}
+        self._next_id = 1
+
+    def _match(self, detection: Detection, reserved: set[int]) -> int | None:
+        choices = [
+            (box_iou(detection.box, track.detection.box), track_id)
+            for track_id, track in self._tracks.items()
+            if track.detection.label == detection.label and track_id not in reserved
+        ]
+        if not choices:
+            return None
+        score, track_id = max(choices)
+        return track_id if score >= 0.20 else None
+
+    def update(self, detections: list[Detection], frame_width: int, now: float) -> list[SceneObject]:
+        seen: set[int] = set()
+        for detection in detections:
+            if detection.label not in WORLD_ONLY_LABELS:
+                continue
+            track_id = self._match(detection, seen)
+            distance = estimate_range_m(detection.box, frame_width, self._fov_deg,
+                                        OBJECT_WIDTH_M[detection.label])
+            heading = bearing_deg(detection.box, frame_width, self._fov_deg)
+            if track_id is None:
+                track_id = self._next_id
+                self._next_id += 1
+                self._tracks[track_id] = _SceneTrack(detection, distance, heading, now, 1)
+            else:
+                previous = self._tracks[track_id]
+                self._tracks[track_id] = _SceneTrack(
+                    detection,
+                    previous.distance_m * 0.70 + distance * 0.30,
+                    previous.bearing * 0.65 + heading * 0.35,
+                    now,
+                    previous.hits + 1,
+                )
+            seen.add(track_id)
+        self._tracks = {
+            track_id: track for track_id, track in self._tracks.items()
+            if now - track.last_seen <= self._hold_s
+        }
+        return self.current(now)
+
+    def current(self, now: float) -> list[SceneObject]:
+        candidates = [
+            SceneObject(track_id, track.detection, track.distance_m, track.bearing,
+                        now - track.last_seen < 0.35, now - track.last_seen)
+            for track_id, track in self._tracks.items()
+            if now - track.last_seen <= self._hold_s and track.hits >= 2
+        ]
+        limits = {"person": 2, "traffic_light": 1, "stop_sign": 1}
+        chosen: list[SceneObject] = []
+        label_counts: dict[str, int] = {}
+        for item in sorted(candidates, key=lambda value: (value.distance_m, abs(value.bearing_deg), value.detection.label)):
+            if label_counts.get(item.detection.label, 0) >= limits[item.detection.label]:
+                continue
+            chosen.append(item)
+            label_counts[item.detection.label] = label_counts.get(item.detection.label, 0) + 1
+            if len(chosen) >= self._max_objects:
+                break
+        return chosen
+
+
+@dataclass(frozen=True)
+class LaneEstimate:
+    """Perspective lane geometry from a low-rate, classical image pass."""
+
+    left_bottom_norm: float
+    right_bottom_norm: float
+    vanishing_x_norm: float
+    observed: bool
+    age_s: float
+
+
+class LowCostLaneDetector:
+    """Detect two bright lane boundaries at low rate without a second ML model."""
+
+    def __init__(self, interval_s: float = 0.20, hold_s: float = 0.80, analysis_width: int = 320) -> None:
+        self._interval_s = interval_s
+        self._hold_s = hold_s
+        self._analysis_width = analysis_width
+        self._next_analysis = 0.0
+        self._last_values: tuple[float, float, float] | None = None
+        self._last_seen = 0.0
+
+    def _detect(self, frame: np.ndarray) -> tuple[float, float, float] | None:
+        source_h, source_w = frame.shape[:2]
+        if source_w < 80 or source_h < 60:
+            return None
+        width = min(self._analysis_width, source_w)
+        height = max(80, int(round(source_h * width / source_w)))
+        reduced = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
+        gray = cv2.cvtColor(reduced, cv2.COLOR_BGR2GRAY)
+        top = int(height * 0.52)
+        roi = np.zeros_like(gray)
+        cv2.fillConvexPoly(roi, np.array([
+            (int(width * 0.12), height - 1),
+            (int(width * 0.88), height - 1),
+            (int(width * 0.60), top),
+            (int(width * 0.40), top),
+        ], dtype=np.int32), 255)
+        bright = cv2.inRange(gray, 150, 255)
+        edges = cv2.Canny(gray, 45, 140)
+        candidates = cv2.bitwise_and(cv2.bitwise_or(bright, edges), roi)
+        lines = cv2.HoughLinesP(candidates, 1, np.pi / 180.0, threshold=18,
+                                minLineLength=max(18, height // 12), maxLineGap=max(12, height // 10))
+        if lines is None:
+            return None
+        centre = width * 0.5
+        left_points: list[tuple[int, int]] = []
+        right_points: list[tuple[int, int]] = []
+        for x1, y1, x2, y2 in lines.reshape(-1, 4):
+            if y1 == y2:
+                continue
+            if y2 > y1:
+                bottom_x, bottom_y, top_x, top_y = x2, y2, x1, y1
+            else:
+                bottom_x, bottom_y, top_x, top_y = x1, y1, x2, y2
+            slope = (bottom_x - top_x) / float(bottom_y - top_y)
+            if not 0.14 <= abs(slope) <= 0.95:
+                continue
+            if bottom_x < centre and slope < 0.0:
+                left_points.extend(((top_x, top_y), (bottom_x, bottom_y)))
+            elif bottom_x > centre and slope > 0.0:
+                right_points.extend(((top_x, top_y), (bottom_x, bottom_y)))
+        if len(left_points) < 4 or len(right_points) < 4:
+            return None
+
+        def fit(points: list[tuple[int, int]]) -> tuple[float, float, float]:
+            y = np.array([point[1] for point in points], dtype=np.float32)
+            x = np.array([point[0] for point in points], dtype=np.float32)
+            slope, intercept = np.polyfit(y, x, 1)
+            return float(np.polyval((slope, intercept), height - 1)), float(np.polyval((slope, intercept), top)), float(slope)
+
+        left_bottom, left_top, left_slope = fit(left_points)
+        right_bottom, right_top, right_slope = fit(right_points)
+        if left_bottom >= centre - 4 or right_bottom <= centre + 4 or left_top >= right_top:
+            return None
+        if left_slope >= -0.08 or right_slope <= 0.08:
+            return None
+        vanish = (left_top + right_top) * 0.5
+        return (
+            float(np.clip(left_bottom / width, 0.02, 0.49)),
+            float(np.clip(right_bottom / width, 0.51, 0.98)),
+            float(np.clip(vanish / width, 0.30, 0.70)),
+        )
+
+    def update(self, frame: np.ndarray, now: float) -> LaneEstimate:
+        if now >= self._next_analysis:
+            self._next_analysis = now + self._interval_s
+            detected = self._detect(frame)
+            if detected is not None:
+                if self._last_values is not None:
+                    detected = tuple(previous * 0.68 + current * 0.32
+                                     for previous, current in zip(self._last_values, detected))
+                self._last_values = detected
+                self._last_seen = now
+        return self.current(now)
+
+    def current(self, now: float) -> LaneEstimate:
+        if self._last_values is None or now - self._last_seen > self._hold_s:
+            return LaneEstimate(0.25, 0.75, 0.50, False, float("inf"))
+        left, right, vanish = self._last_values
+        age = now - self._last_seen
+        return LaneEstimate(left, right, vanish, age < self._interval_s * 1.75, age)
 
 
 class Rates:
@@ -436,7 +702,7 @@ def _camera_panel(frame: np.ndarray, target: Target | None, rates: Rates, error:
         colour = (50, 220, 70) if target.observed else (0, 170, 255)
         cv2.rectangle(panel, (x1, y1), (x2, y2), colour, 2)
         state = "LIVE" if target.observed else f"HOLD {target.age_s:.1f}s"
-        text = f"TARGET CAR {target.distance_m:.1f}m {target.bearing_deg:+.1f}deg {state}"
+        text = f"TARGET {target.detection.label.upper()} {target.distance_m:.1f}m {target.bearing_deg:+.1f}deg {state}"
         cv2.putText(panel, text, (max(6, x1), max(22, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.48, colour, 2, cv2.LINE_AA)
     stats = rates.report()
     cv2.rectangle(panel, (0, 0), (min(panel.shape[1], 370), 48), (15, 18, 22), -1)
@@ -449,49 +715,166 @@ def _camera_panel(frame: np.ndarray, target: Target | None, rates: Rates, error:
     return panel
 
 
-def _world_panel(size: tuple[int, int], target: Target | None, rates: Rates) -> np.ndarray:
+_WORLD_BASE_CACHE: dict[tuple[int, int], np.ndarray] = {}
+
+
+def _world_base(size: tuple[int, int]) -> np.ndarray:
+    """Cache the unchanging dark background; render only dynamic objects per frame."""
+    cached = _WORLD_BASE_CACHE.get(size)
+    if cached is not None:
+        return cached
     width, height = size
-    panel = np.full((height, width, 3), (23, 27, 34), dtype=np.uint8)
-    horizon = int(height * 0.28)
-    vanishing = (width // 2, horizon)
-    road = np.array([(int(width * 0.08), height), (int(width * 0.92), height), vanishing], np.int32)
-    cv2.fillConvexPoly(panel, road, (49, 53, 60))
-    for lateral in (-0.30, 0.30):
-        bottom_x = int(width * (0.5 + lateral))
-        cv2.line(panel, (bottom_x, height), vanishing, (125, 135, 145), 1, cv2.LINE_AA)
-    for fraction in (0.16, 0.29, 0.45, 0.65, 0.88):
-        y = int(horizon + (height - horizon) * fraction)
-        half = int((width * 0.44) * fraction)
-        cv2.line(panel, (width // 2 - half, y), (width // 2 + half, y), (68, 73, 80), 1, cv2.LINE_AA)
-    cv2.putText(panel, "TARGET WORLD (visual estimate)", (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (220, 228, 235), 1, cv2.LINE_AA)
-    if target:
-        closeness = 1.0 - float(np.clip((target.distance_m - 2.0) / 80.0, 0.0, 1.0))
-        y = int(horizon + (height - horizon - 35) * (0.18 + 0.82 * closeness))
-        x = int(width / 2 + np.clip(target.bearing_deg / 35.0, -1.0, 1.0) * width * 0.36 * (0.35 + 0.65 * closeness))
-        scale = int(12 + 34 * closeness)
-        body = np.array([(x - scale, y), (x + scale, y), (x + int(scale * .75), y - scale),
-                         (x - int(scale * .75), y - scale)], np.int32)
-        roof = np.array([(x - int(scale * .52), y - scale), (x + int(scale * .52), y - scale),
-                         (x + int(scale * .28), y - int(scale * 1.55)), (x - int(scale * .28), y - int(scale * 1.55))], np.int32)
-        colour = (52, 220, 80) if target.observed else (0, 170, 255)
-        cv2.fillConvexPoly(panel, body, colour)
-        cv2.fillConvexPoly(panel, roof, tuple(int(value * 0.72) for value in colour))
-        cv2.putText(panel, f"CAR {target.distance_m:.1f}m", (x - scale, y - int(scale * 1.7)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (245, 245, 245), 1, cv2.LINE_AA)
+    base = np.empty((height, width, 3), dtype=np.uint8)
+    vertical = np.linspace(0, 1, height, dtype=np.float32)[:, None]
+    # BGR order: keep the scene cool blue-black rather than warm grey.
+    base[:, :, 0] = (25 + 14 * vertical).astype(np.uint8)
+    base[:, :, 1] = (18 + 12 * vertical).astype(np.uint8)
+    base[:, :, 2] = (10 + 9 * vertical).astype(np.uint8)
+    # A restrained horizon glow gives the road depth without a per-frame blur.
+    cv2.line(base, (0, int(height * 0.30)), (width, int(height * 0.30)), (47, 38, 31), 1, cv2.LINE_AA)
+    _WORLD_BASE_CACHE[size] = base
+    return base
+
+
+def _draw_glowing_lane(panel: np.ndarray, start: tuple[int, int], end: tuple[int, int], active: bool) -> None:
+    if active:
+        # Three direct strokes give a glow-like halo without full-frame alpha
+        # buffers or blur work on the Pi 3B.
+        cv2.line(panel, start, end, (130, 155, 178), 12, cv2.LINE_AA)
+        cv2.line(panel, start, end, (255, 246, 230), 5, cv2.LINE_AA)
+        cv2.line(panel, start, end, (255, 255, 255), 2, cv2.LINE_AA)
+    else:
+        cv2.line(panel, start, end, (108, 96, 82), 2, cv2.LINE_AA)
+
+
+def _draw_ego_vehicle(panel: np.ndarray, centre_x: int, bottom_y: int, width: int, height: int) -> None:
+    """Stylised stationary ego car, inspired by the supplied dark-road references."""
+    shadow = (centre_x, bottom_y + 2)
+    cv2.ellipse(panel, shadow, (int(width * 0.60), max(4, int(height * 0.14))), 0, 0, 360, (6, 9, 12), -1, cv2.LINE_AA)
+    body = np.array([
+        (centre_x - int(width * 0.53), bottom_y),
+        (centre_x + int(width * 0.53), bottom_y),
+        (centre_x + int(width * 0.47), bottom_y - int(height * 0.42)),
+        (centre_x + int(width * 0.29), bottom_y - height),
+        (centre_x - int(width * 0.29), bottom_y - height),
+        (centre_x - int(width * 0.47), bottom_y - int(height * 0.42)),
+    ], dtype=np.int32)
+    cv2.fillConvexPoly(panel, body, (224, 229, 232))
+    cv2.polylines(panel, [body], True, (116, 132, 145), 1, cv2.LINE_AA)
+    rear_window = np.array([
+        (centre_x - int(width * 0.27), bottom_y - int(height * 0.47)),
+        (centre_x + int(width * 0.27), bottom_y - int(height * 0.47)),
+        (centre_x + int(width * 0.19), bottom_y - int(height * 0.83)),
+        (centre_x - int(width * 0.19), bottom_y - int(height * 0.83)),
+    ], dtype=np.int32)
+    cv2.fillConvexPoly(panel, rear_window, (25, 37, 48))
+    cv2.polylines(panel, [rear_window], True, (74, 94, 110), 1, cv2.LINE_AA)
+    light_y = bottom_y - int(height * 0.30)
+    for sign in (-1, 1):
+        x1 = centre_x + sign * int(width * 0.43)
+        x2 = centre_x + sign * int(width * 0.12)
+        cv2.line(panel, (x1, light_y), (x2, light_y), (35, 35, 235), max(2, int(height * 0.06)), cv2.LINE_AA)
+    cv2.line(panel, (centre_x - int(width * 0.43), bottom_y - 3),
+             (centre_x + int(width * 0.43), bottom_y - 3), (55, 68, 78), 2, cv2.LINE_AA)
+
+
+def _world_position(distance_m: float, bearing: float, width: int, horizon: int, ego_top: int) -> tuple[int, int, float]:
+    closeness = 1.0 - float(np.clip((distance_m - 2.0) / 80.0, 0.0, 1.0))
+    y = int(horizon + (ego_top - horizon) * (0.16 + 0.80 * closeness))
+    lateral = np.clip(bearing / 35.0, -1.0, 1.0)
+    x = int(width * 0.5 + lateral * width * 0.36 * (0.35 + 0.65 * closeness))
+    return x, y, closeness
+
+
+def _draw_lead_vehicle(panel: np.ndarray, target: Target, width: int, horizon: int, ego_top: int) -> None:
+    x, y, closeness = _world_position(target.distance_m, target.bearing_deg, width, horizon, ego_top)
+    scale = max(9, int(10 + 29 * closeness))
+    colour = (64, 228, 95) if target.observed else (0, 170, 255)
+    body = np.array([
+        (x - scale, y), (x + scale, y),
+        (x + int(scale * .72), y - scale), (x - int(scale * .72), y - scale),
+    ], dtype=np.int32)
+    roof = np.array([
+        (x - int(scale * .48), y - scale), (x + int(scale * .48), y - scale),
+        (x + int(scale * .26), y - int(scale * 1.52)), (x - int(scale * .26), y - int(scale * 1.52)),
+    ], dtype=np.int32)
+    cv2.fillConvexPoly(panel, body, colour)
+    cv2.fillConvexPoly(panel, roof, tuple(int(value * 0.70) for value in colour))
+
+
+def _draw_scene_object(panel: np.ndarray, item: SceneObject, width: int, horizon: int, ego_top: int) -> None:
+    x, y, closeness = _world_position(item.distance_m, item.bearing_deg, width, horizon, ego_top)
+    scale = max(6, int(7 + 20 * closeness))
+    label = item.detection.label
+    if label == "person":
+        colour = (65, 210, 255) if item.observed else (60, 150, 190)
+        cv2.circle(panel, (x, y - scale), max(2, scale // 4), colour, -1, cv2.LINE_AA)
+        cv2.line(panel, (x, y - int(scale * 0.75)), (x, y), colour, max(2, scale // 5), cv2.LINE_AA)
+        cv2.line(panel, (x - scale // 2, y - scale // 2), (x + scale // 2, y - scale // 2), colour, 1, cv2.LINE_AA)
+    elif label == "traffic_light":
+        cv2.line(panel, (x, y), (x, y - int(scale * 1.7)), (120, 130, 140), max(1, scale // 5), cv2.LINE_AA)
+        cv2.rectangle(panel, (x - scale // 3, y - int(scale * 2.2)), (x + scale // 3, y - int(scale * 1.45)), (42, 45, 48), -1)
+        # The model identifies a traffic light, not its signal colour.
+        for index, colour in enumerate(((45, 45, 220), (35, 190, 235), (55, 220, 70))):
+            cv2.circle(panel, (x, y - int(scale * (2.05 - 0.26 * index))), max(1, scale // 9), colour, -1, cv2.LINE_AA)
+    elif label == "stop_sign":
+        points = []
+        for index in range(8):
+            angle = math.radians(22.5 + index * 45.0)
+            points.append((int(x + math.cos(angle) * scale * .60), int(y - scale + math.sin(angle) * scale * .60)))
+        cv2.fillConvexPoly(panel, np.array(points, dtype=np.int32), (35, 45, 220))
+        cv2.putText(panel, "STOP", (x - scale // 2, y - scale + 3), cv2.FONT_HERSHEY_SIMPLEX, 0.22, (245, 245, 245), 1, cv2.LINE_AA)
+
+
+def _world_panel(size: tuple[int, int], target: Target | None, scene_objects: list[SceneObject],
+                 lane: LaneEstimate, rates: Rates) -> np.ndarray:
+    width, height = size
+    panel = _world_base(size).copy()
+    control_top = touch_buttons(width, height)[0].rect[1]
+    horizon = int(height * 0.27)
+    vanishing = (int(width * lane.vanishing_x_norm), horizon)
+    left_bottom = (int(width * lane.left_bottom_norm), control_top)
+    right_bottom = (int(width * lane.right_bottom_norm), control_top)
+    road = np.array([left_bottom, right_bottom, vanishing], dtype=np.int32)
+    cv2.fillConvexPoly(panel, road, (47, 38, 30))
+    _draw_glowing_lane(panel, left_bottom, vanishing, lane.observed)
+    _draw_glowing_lane(panel, right_bottom, vanishing, lane.observed)
+    lane_state = "LANES LIVE" if lane.observed else ("LANES HOLD" if lane.age_s < 1.0 else "LANES SEARCH")
+    cv2.putText(panel, f"TARGET WORLD  |  {lane_state}", (8, 21), cv2.FONT_HERSHEY_SIMPLEX,
+                0.46, (220, 230, 238), 1, cv2.LINE_AA)
+    ego_height = max(62, int(height * 0.19))
+    ego_width = max(88, int(width * 0.20))
+    ego_bottom = control_top - 9
+    ego_top = ego_bottom - ego_height
+    if target is not None:
+        _draw_lead_vehicle(panel, target, width, horizon, ego_top)
+    for item in scene_objects:
+        _draw_scene_object(panel, item, width, horizon, ego_top)
+    _draw_ego_vehicle(panel, width // 2, ego_bottom, ego_width, ego_height)
     stats = rates.report()
-    cv2.putText(panel, f"D {stats['display_fps']:.1f} FPS / I {stats['detect_fps']:.1f} FPS", (8, height - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (175, 190, 205), 1, cv2.LINE_AA)
+    cv2.putText(panel, f"DISPLAY {stats['display_fps']:.1f}  DETECT {stats['detect_fps']:.1f}", (8, 42),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.40, (155, 175, 190), 1, cv2.LINE_AA)
+    if target is not None:
+        cv2.putText(panel, f"LEAD {target.detection.label.upper()} {target.distance_m:.0f}m", (8, 61),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (185, 225, 195), 1, cv2.LINE_AA)
+    if scene_objects:
+        scene_text = "  |  ".join(
+            f"{DISPLAY_LABELS[item.detection.label]} {item.distance_m:.0f}m"
+            for item in scene_objects
+        )
+        cv2.putText(panel, scene_text, (8, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.34,
+                    (190, 205, 218), 1, cv2.LINE_AA)
     return panel
 
 
-def compose_view(frame: np.ndarray, target: Target | None, rates: Rates, view: str, error: str) -> np.ndarray:
-    camera = _camera_panel(frame, target, rates, error)
-    world = _world_panel((frame.shape[1], frame.shape[0]), target, rates)
+def compose_view(frame: np.ndarray, target: Target | None, scene_objects: list[SceneObject], lane: LaneEstimate,
+                 rates: Rates, view: str, error: str) -> np.ndarray:
     if view == "camera":
-        return camera
+        return _camera_panel(frame, target, rates, error)
+    world = _world_panel((frame.shape[1], frame.shape[0]), target, scene_objects, lane, rates)
     if view == "world":
         return world
-    return np.hstack((world, camera))
+    return np.hstack((world, _camera_panel(frame, target, rates, error)))
 
 
 def touch_buttons(frame_width: int, frame_height: int) -> list[TouchButton]:
@@ -567,15 +950,20 @@ def main() -> int:
     # Reserve CPU for LiteRT on the 4-core Pi 3B. OpenCV's resize/draw work is
     # tiny at 640x480, but unrestricted worker pools can still starve inference.
     cv2.setNumThreads(1)
+    cv2.setUseOptimized(True)
     detector = TFLiteVehicleDetector(args.model, args.confidence, args.threads)
     camera = LatestCamera(args.camera, args.width, args.height, args.fps)
     worker = AsyncDetector(detector)
     selector = TargetSelector(args.fov)
+    scene_tracker = SceneObjectTracker(args.fov)
+    lane_detector = LowCostLaneDetector()
     rates = Rates()
     last_camera_sequence = 0
     last_result_sequence = 0
     last_frame: np.ndarray | None = None
     target: Target | None = None
+    scene_objects: list[SceneObject] = []
+    lane = lane_detector.current(time.perf_counter())
     view = args.view
     deadline = rates.started + args.test_seconds if args.test_seconds > 0 else None
     next_tick = time.perf_counter()
@@ -601,18 +989,25 @@ def main() -> int:
             result = worker.latest_after(last_result_sequence)
             if result is not None and last_frame is not None:
                 target = selector.update(result.detections, last_frame.shape[1], result.completed_time)
+                scene_objects = scene_tracker.update(result.detections, last_frame.shape[1], result.completed_time)
                 last_result_sequence = result.sequence
                 rates.detections += 1
                 rates.inference_ms = result.inference_ms
                 rates.capture_latency_ms = (result.completed_time - result.capture_time) * 1000.0
             else:
-                target = selector.current(time.perf_counter())
+                now = time.perf_counter()
+                target = selector.current(now)
+                scene_objects = scene_tracker.current(now)
             if last_frame is None:
                 if camera.error:
                     raise RuntimeError(camera.error)
                 time.sleep(0.01)
                 continue
-            rendered = compose_view(last_frame, target, rates, view, worker.error or camera.error)
+            if not args.no_display and view != "camera":
+                lane = lane_detector.update(last_frame, time.perf_counter())
+            else:
+                lane = lane_detector.current(time.perf_counter())
+            rendered = compose_view(last_frame, target, scene_objects, lane, rates, view, worker.error or camera.error)
             if not args.no_display:
                 controls = draw_touch_controls(rendered)
             rates.display_frames += 1

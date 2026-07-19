@@ -59,9 +59,10 @@ the desktop application depends on Intel OpenVINO GPU and several perception
 models that are intentionally not part of the Pi runtime.
 
 The Pi runtime uses a small quantized TFLite detector, keeps only the newest
-camera frame, and displays **one sticky selected car** in its camera and
-low-cost world views. It is still read-only visualization software and never
-controls a vehicle.
+camera frame, and displays **one sticky selected lead vehicle** in its camera
+and low-cost world views. Its world view can also show confirmed pedestrians,
+traffic lights, and stop signs; these never appear in the camera view. It is
+still read-only visualization software and never controls a vehicle.
 
 On a networked Raspberry Pi 3B running **64-bit** Raspberry Pi OS, install
 everything with:
@@ -77,7 +78,7 @@ downloads the verified TFLite model, and verifies its SHA-256. Then start it:
 ~/visionfsd-pi/pi3b/run.sh --camera 0 --fps 25
 ```
 
-To update an existing Pi installation after later releases:
+To update an existing Pi installation (it remembers the Pi release branch):
 
 ```bash
 ~/visionfsd-pi/pi3b/update.sh
