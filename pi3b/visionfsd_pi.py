@@ -69,6 +69,8 @@ class Target:
     bearing_deg: float
     observed: bool
     age_s: float
+    lane_slot: int = 0
+    lane_offset: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -375,6 +377,41 @@ class AsyncDetector:
         self._thread.join(timeout=3.0)
 
 
+@dataclass(frozen=True)
+class LaneEstimate:
+    """Perspective lane geometry from a low-rate, classical image pass."""
+
+    left_bottom_norm: float
+    right_bottom_norm: float
+    vanishing_x_norm: float
+    observed: bool
+    age_s: float
+    left_top_norm: float = 0.44
+    right_top_norm: float = 0.56
+    confidence: float = 0.0
+
+
+def lane_position(detection: Detection, frame_width: int, frame_height: int,
+                  fov_deg: float, lane: LaneEstimate | None) -> tuple[int, float, bool]:
+    """Classify a detection into ego/left/right lane using its ground contact."""
+    x1, _y1, x2, y2 = detection.box
+    centre_x = ((x1 + x2) * 0.5) / max(1.0, float(frame_width))
+    bottom_y = y2 / max(1.0, float(frame_height))
+    if lane is not None and lane.age_s <= 0.80 and lane.confidence >= 0.30:
+        perspective = float(np.clip((bottom_y - 0.52) / 0.48, 0.0, 1.0))
+        left = lane.left_top_norm + (lane.left_bottom_norm - lane.left_top_norm) * perspective
+        right = lane.right_top_norm + (lane.right_bottom_norm - lane.right_top_norm) * perspective
+        lane_width = right - left
+        if lane_width >= 0.08:
+            offset = (centre_x - (left + right) * 0.5) / lane_width
+            slot = 0 if abs(offset) <= 0.58 else int(np.clip(round(offset), -2, 2))
+            return slot, float(np.clip(offset, -2.0, 2.0)), True
+    heading = bearing_deg(detection.box, frame_width, fov_deg)
+    offset = heading / 16.0
+    slot = 0 if abs(heading) <= 10.0 else (-1 if heading < 0 else 1)
+    return slot, float(np.clip(offset, -2.0, 2.0)), False
+
+
 @dataclass
 class _Track:
     detection: Detection
@@ -382,6 +419,9 @@ class _Track:
     bearing: float
     last_seen: float
     hits: int
+    lane_slot: int
+    lane_offset: float
+    label_scores: dict[str, float]
 
 
 class TargetSelector:
@@ -402,50 +442,83 @@ class TargetSelector:
         self._challenge_hits = 0
 
     def _match(self, detection: Detection, reserved: set[int]) -> int | None:
-        choices = [
-            (box_iou(detection.box, track.detection.box), track_id)
-            for track_id, track in self._tracks.items()
-            if track_id not in reserved
-        ]
+        choices: list[tuple[float, int]] = []
+        x1, y1, x2, y2 = detection.box
+        centre_x, centre_y = (x1 + x2) * 0.5, (y1 + y2) * 0.5
+        for track_id, track in self._tracks.items():
+            if track_id in reserved:
+                continue
+            tx1, ty1, tx2, ty2 = track.detection.box
+            track_x, track_y = (tx1 + tx2) * 0.5, (ty1 + ty2) * 0.5
+            scale = max(24.0, math.hypot(tx2 - tx1, ty2 - ty1))
+            centre_distance = math.hypot(centre_x - track_x, centre_y - track_y) / scale
+            overlap = box_iou(detection.box, track.detection.box)
+            if overlap >= 0.12 or centre_distance <= 0.38:
+                choices.append((overlap * 2.0 + max(0.0, 1.0 - centre_distance), track_id))
         if not choices:
             return None
         score, track_id = max(choices)
-        return track_id if score >= 0.25 else None
+        return track_id if score >= 0.50 else None
 
-    def update(self, detections: list[Detection], frame_width: int, now: float) -> Target | None:
+    def update(self, detections: list[Detection], frame_width: int, now: float,
+               frame_height: int | None = None, lane: LaneEstimate | None = None) -> Target | None:
+        frame_height = frame_height or int(frame_width * 0.75)
         seen: set[int] = set()
         for detection in detections:
             if detection.label not in VEHICLE_LABELS:
                 continue
             track_id = self._match(detection, seen)
-            distance = estimate_range_m(detection.box, frame_width, self._fov_deg,
-                                        OBJECT_WIDTH_M[detection.label])
             heading = bearing_deg(detection.box, frame_width, self._fov_deg)
+            lane_slot, lane_offset, _lane_based = lane_position(
+                detection, frame_width, frame_height, self._fov_deg, lane
+            )
             if track_id is None:
                 track_id = self._next_id
                 self._next_id += 1
-                self._tracks[track_id] = _Track(detection, distance, heading, now, 1)
+                label_scores = {detection.label: detection.confidence}
+                distance = estimate_range_m(detection.box, frame_width, self._fov_deg,
+                                            OBJECT_WIDTH_M[detection.label])
+                self._tracks[track_id] = _Track(
+                    detection, distance, heading, now, 1, lane_slot, lane_offset, label_scores
+                )
             else:
                 previous = self._tracks[track_id]
+                label_scores = {
+                    label: score * 0.82 for label, score in previous.label_scores.items()
+                    if score * 0.82 >= 0.05
+                }
+                label_scores[detection.label] = label_scores.get(detection.label, 0.0) + detection.confidence
+                stable_label = max(label_scores, key=label_scores.get)
+                stable_detection = Detection(stable_label, detection.confidence, detection.box)
+                distance = estimate_range_m(stable_detection.box, frame_width, self._fov_deg,
+                                            OBJECT_WIDTH_M[stable_label])
+                smoothed_offset = previous.lane_offset * 0.68 + lane_offset * 0.32
+                smoothed_slot = 0 if abs(smoothed_offset) <= 0.58 else int(np.clip(round(smoothed_offset), -2, 2))
                 self._tracks[track_id] = _Track(
-                    detection, previous.distance_m * 0.70 + distance * 0.30,
-                    previous.bearing * 0.65 + heading * 0.35, now, previous.hits + 1,
+                    stable_detection,
+                    previous.distance_m * 0.70 + distance * 0.30,
+                    previous.bearing * 0.65 + heading * 0.35,
+                    now,
+                    previous.hits + 1,
+                    smoothed_slot,
+                    smoothed_offset,
+                    label_scores,
                 )
             seen.add(track_id)
         self._tracks = {track_id: track for track_id, track in self._tracks.items() if now - track.last_seen <= self._hold_s}
         candidates = [
-            (track.distance_m + abs(track.bearing) * 0.18, track_id)
+            (track.distance_m + abs(track.lane_offset) * 7.0 + abs(track.bearing) * 0.05, track_id)
             for track_id, track in self._tracks.items()
             if track_id in seen
         ]
-        # Prefer the forward corridor whenever it contains a vehicle. This is
-        # only a camera-centre heuristic, not a lane-occupancy claim.
-        forward = [
+        # Prefer vehicles inside the detected ego lane. Bearing is only the
+        # fallback when fresh lane geometry is unavailable.
+        same_lane = [
             candidate for candidate in candidates
-            if abs(self._tracks[candidate[1]].bearing) <= 18.0
+            if self._tracks[candidate[1]].lane_slot == 0
         ]
-        if forward:
-            candidates = forward
+        if same_lane:
+            candidates = same_lane
         if not candidates:
             return self.current(now)
         _, best_id = min(candidates)
@@ -454,14 +527,14 @@ class TargetSelector:
         elif best_id != self._target_id:
             incumbent = self._tracks[self._target_id]
             challenger = self._tracks[best_id]
-            # A newly visible centre-corridor vehicle should replace a stale
-            # side vehicle immediately; other handoffs retain hysteresis.
-            if abs(challenger.bearing) <= 18.0 < abs(incumbent.bearing):
+            # A newly visible ego-lane vehicle replaces a side-lane target
+            # immediately; handoffs within one lane retain hysteresis.
+            if challenger.lane_slot == 0 and incumbent.lane_slot != 0:
                 self._target_id, self._challenger_id, self._challenge_hits = best_id, None, 0
             elif challenger.distance_m < incumbent.distance_m - 3.0:
                 self._challenge_hits = self._challenge_hits + 1 if self._challenger_id == best_id else 1
                 self._challenger_id = best_id
-                if self._challenge_hits >= 6:
+                if self._challenge_hits >= 3:
                     self._target_id, self._challenger_id, self._challenge_hits = best_id, None, 0
             else:
                 self._challenger_id, self._challenge_hits = None, 0
@@ -478,7 +551,29 @@ class TargetSelector:
             self._tracks.pop(self._target_id, None)
             self._target_id = None
             return None
-        return Target(self._target_id, track.detection, track.distance_m, track.bearing, age < 0.12, age)
+        return Target(
+            self._target_id, track.detection, track.distance_m, track.bearing,
+            age < 0.12, age, track.lane_slot, track.lane_offset,
+        )
+
+    def vehicles(self, now: float, max_vehicles: int = 3) -> list[Target]:
+        """Return the lead plus at most one nearby vehicle per adjacent lane."""
+        live = [
+            Target(track_id, track.detection, track.distance_m, track.bearing,
+                   now - track.last_seen < 0.12, now - track.last_seen,
+                   track.lane_slot, track.lane_offset)
+            for track_id, track in self._tracks.items()
+            if now - track.last_seen <= self._hold_s and track.hits >= 2
+        ]
+        chosen: list[Target] = []
+        lead = next((item for item in live if item.track_id == self._target_id), None)
+        if lead is not None:
+            chosen.append(lead)
+        for slot in (-1, 1):
+            side = [item for item in live if item.lane_slot == slot]
+            if side:
+                chosen.append(min(side, key=lambda item: item.distance_m))
+        return chosen[:max_vehicles]
 
 
 @dataclass(frozen=True)
@@ -572,29 +667,18 @@ class SceneObjectTracker:
         return chosen
 
 
-@dataclass(frozen=True)
-class LaneEstimate:
-    """Perspective lane geometry from a low-rate, classical image pass."""
-
-    left_bottom_norm: float
-    right_bottom_norm: float
-    vanishing_x_norm: float
-    observed: bool
-    age_s: float
-
-
 class LowCostLaneDetector:
     """Detect two bright lane boundaries at low rate without a second ML model."""
 
-    def __init__(self, interval_s: float = 0.20, hold_s: float = 0.80, analysis_width: int = 320) -> None:
+    def __init__(self, interval_s: float = 0.18, hold_s: float = 0.80, analysis_width: int = 256) -> None:
         self._interval_s = interval_s
         self._hold_s = hold_s
         self._analysis_width = analysis_width
         self._next_analysis = 0.0
-        self._last_values: tuple[float, float, float] | None = None
+        self._last_values: tuple[float, float, float, float, float, float] | None = None
         self._last_seen = 0.0
 
-    def _detect(self, frame: np.ndarray) -> tuple[float, float, float] | None:
+    def _detect(self, frame: np.ndarray) -> tuple[float, float, float, float, float, float] | None:
         source_h, source_w = frame.shape[:2]
         if source_w < 80 or source_h < 60:
             return None
@@ -602,6 +686,7 @@ class LowCostLaneDetector:
         height = max(80, int(round(source_h * width / source_w)))
         reduced = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
         gray = cv2.cvtColor(reduced, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
         top = int(height * 0.52)
         roi = np.zeros_like(gray)
         cv2.fillConvexPoly(roi, np.array([
@@ -610,11 +695,14 @@ class LowCostLaneDetector:
             (int(width * 0.60), top),
             (int(width * 0.40), top),
         ], dtype=np.int32), 255)
-        bright = cv2.inRange(gray, 150, 255)
-        edges = cv2.Canny(gray, 45, 140)
-        candidates = cv2.bitwise_and(cv2.bitwise_or(bright, edges), roi)
-        lines = cv2.HoughLinesP(candidates, 1, np.pi / 180.0, threshold=18,
-                                minLineLength=max(18, height // 12), maxLineGap=max(12, height // 10))
+        bright = cv2.inRange(gray, 155, 255)
+        blue, green, red = cv2.split(reduced)
+        yellow = ((red > 145) & (green > 115) & (blue < 165)).astype(np.uint8) * 255
+        edges = cv2.Canny(gray, 42, 135)
+        colour_edges = cv2.bitwise_and(edges, cv2.bitwise_or(bright, yellow))
+        candidates = cv2.bitwise_and(cv2.bitwise_or(colour_edges, bright), roi)
+        lines = cv2.HoughLinesP(candidates, 1, np.pi / 180.0, threshold=14,
+                                minLineLength=max(14, height // 13), maxLineGap=max(10, height // 9))
         if lines is None:
             return None
         centre = width * 0.5
@@ -649,11 +737,23 @@ class LowCostLaneDetector:
             return None
         if left_slope >= -0.08 or right_slope <= 0.08:
             return None
+        bottom_width = (right_bottom - left_bottom) / width
+        top_width = (right_top - left_top) / width
+        if not 0.28 <= bottom_width <= 0.90 or not 0.04 <= top_width <= 0.34:
+            return None
         vanish = (left_top + right_top) * 0.5
+        support = min(len(left_points), len(right_points)) / 10.0
+        width_quality = 1.0 - min(1.0, abs(bottom_width - 0.55) / 0.40)
+        confidence = float(np.clip(support * (0.65 + width_quality * 0.35), 0.0, 1.0))
+        if confidence < 0.30:
+            return None
         return (
             float(np.clip(left_bottom / width, 0.02, 0.49)),
             float(np.clip(right_bottom / width, 0.51, 0.98)),
             float(np.clip(vanish / width, 0.30, 0.70)),
+            float(np.clip(left_top / width, 0.20, 0.49)),
+            float(np.clip(right_top / width, 0.51, 0.80)),
+            confidence,
         )
 
     def update(self, frame: np.ndarray, now: float) -> LaneEstimate:
@@ -662,18 +762,22 @@ class LowCostLaneDetector:
             detected = self._detect(frame)
             if detected is not None:
                 if self._last_values is not None:
-                    detected = tuple(previous * 0.68 + current * 0.32
-                                     for previous, current in zip(self._last_values, detected))
+                    geometry = tuple(previous * 0.72 + current * 0.28
+                                     for previous, current in zip(self._last_values[:5], detected[:5]))
+                    detected = (*geometry, detected[5])
                 self._last_values = detected
                 self._last_seen = now
         return self.current(now)
 
     def current(self, now: float) -> LaneEstimate:
         if self._last_values is None or now - self._last_seen > self._hold_s:
-            return LaneEstimate(0.25, 0.75, 0.50, False, float("inf"))
-        left, right, vanish = self._last_values
+            return LaneEstimate(0.25, 0.75, 0.50, False, float("inf"), 0.44, 0.56, 0.0)
+        left, right, vanish, left_top, right_top, confidence = self._last_values
         age = now - self._last_seen
-        return LaneEstimate(left, right, vanish, age < self._interval_s * 1.75, age)
+        return LaneEstimate(
+            left, right, vanish, age < self._interval_s * 1.85, age,
+            left_top, right_top, confidence,
+        )
 
 
 class Rates:
@@ -778,18 +882,33 @@ def _draw_ego_vehicle(panel: np.ndarray, centre_x: int, bottom_y: int, width: in
              (centre_x + int(width * 0.43), bottom_y - 3), (55, 68, 78), 2, cv2.LINE_AA)
 
 
-def _world_position(distance_m: float, bearing: float, width: int, horizon: int, ego_top: int) -> tuple[int, int, float]:
+def _world_position(distance_m: float, bearing: float, width: int, horizon: int, ego_top: int,
+                    lane_offset: float | None = None) -> tuple[int, int, float]:
     closeness = 1.0 - float(np.clip((distance_m - 2.0) / 80.0, 0.0, 1.0))
     y = int(horizon + (ego_top - horizon) * (0.16 + 0.80 * closeness))
-    lateral = np.clip(bearing / 35.0, -1.0, 1.0)
-    x = int(width * 0.5 + lateral * width * 0.36 * (0.35 + 0.65 * closeness))
+    if lane_offset is None:
+        lateral = float(np.clip(bearing / 35.0, -1.0, 1.0))
+        spread = 0.36
+    else:
+        # Lane-relative placement is much steadier than raw bearing when a
+        # detection moves around inside its camera box. One lane is roughly
+        # one road-width step from the ego-lane centre.
+        lateral = float(np.clip(lane_offset, -1.65, 1.65))
+        spread = 0.27
+    x = int(width * 0.5 + lateral * width * spread * (0.35 + 0.65 * closeness))
     return x, y, closeness
 
 
-def _draw_lead_vehicle(panel: np.ndarray, target: Target, width: int, horizon: int, ego_top: int) -> None:
-    x, y, closeness = _world_position(target.distance_m, target.bearing_deg, width, horizon, ego_top)
+def _draw_world_vehicle(panel: np.ndarray, target: Target, width: int, horizon: int,
+                        ego_top: int, is_lead: bool) -> None:
+    x, y, closeness = _world_position(
+        target.distance_m, target.bearing_deg, width, horizon, ego_top, target.lane_offset
+    )
     scale = max(9, int(10 + 29 * closeness))
-    colour = (64, 228, 95) if target.observed else (0, 170, 255)
+    if is_lead:
+        colour = (64, 228, 95) if target.observed else (0, 170, 255)
+    else:
+        colour = (220, 165, 70) if target.observed else (150, 120, 65)
     body = np.array([
         (x - scale, y), (x + scale, y),
         (x + int(scale * .72), y - scale), (x - int(scale * .72), y - scale),
@@ -826,8 +945,8 @@ def _draw_scene_object(panel: np.ndarray, item: SceneObject, width: int, horizon
         cv2.putText(panel, "STOP", (x - scale // 2, y - scale + 3), cv2.FONT_HERSHEY_SIMPLEX, 0.22, (245, 245, 245), 1, cv2.LINE_AA)
 
 
-def _world_panel(size: tuple[int, int], target: Target | None, scene_objects: list[SceneObject],
-                 lane: LaneEstimate, rates: Rates) -> np.ndarray:
+def _world_panel(size: tuple[int, int], target: Target | None, vehicles: list[Target],
+                 scene_objects: list[SceneObject], lane: LaneEstimate, rates: Rates) -> np.ndarray:
     width, height = size
     panel = _world_base(size).copy()
     control_top = touch_buttons(width, height)[0].rect[1]
@@ -846,8 +965,16 @@ def _world_panel(size: tuple[int, int], target: Target | None, scene_objects: li
     ego_width = max(88, int(width * 0.20))
     ego_bottom = control_top - 9
     ego_top = ego_bottom - ego_height
+    visible_vehicles = {item.track_id: item for item in vehicles}
     if target is not None:
-        _draw_lead_vehicle(panel, target, width, horizon, ego_top)
+        visible_vehicles[target.track_id] = target
+    # Far objects first keeps nearby vehicles visually in front. The lead is
+    # green; confirmed adjacent-lane vehicles are blue.
+    for vehicle in sorted(visible_vehicles.values(), key=lambda item: item.distance_m, reverse=True):
+        _draw_world_vehicle(
+            panel, vehicle, width, horizon, ego_top,
+            target is not None and vehicle.track_id == target.track_id,
+        )
     for item in scene_objects:
         _draw_scene_object(panel, item, width, horizon, ego_top)
     _draw_ego_vehicle(panel, width // 2, ego_bottom, ego_width, ego_height)
@@ -857,21 +984,30 @@ def _world_panel(size: tuple[int, int], target: Target | None, scene_objects: li
     if target is not None:
         cv2.putText(panel, f"LEAD {target.detection.label.upper()} {target.distance_m:.0f}m", (8, 61),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.38, (185, 225, 195), 1, cv2.LINE_AA)
+    adjacent = [item for item in vehicles if item.lane_slot != 0]
+    if adjacent:
+        adjacent_text = "  |  ".join(
+            f"{'LEFT' if item.lane_slot < 0 else 'RIGHT'} {item.distance_m:.0f}m"
+            for item in adjacent
+        )
+        cv2.putText(panel, adjacent_text, (8, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.34,
+                    (205, 183, 145), 1, cv2.LINE_AA)
     if scene_objects:
         scene_text = "  |  ".join(
             f"{DISPLAY_LABELS[item.detection.label]} {item.distance_m:.0f}m"
             for item in scene_objects
         )
-        cv2.putText(panel, scene_text, (8, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.34,
+        cv2.putText(panel, scene_text, (8, 98 if adjacent else 80), cv2.FONT_HERSHEY_SIMPLEX, 0.34,
                     (190, 205, 218), 1, cv2.LINE_AA)
     return panel
 
 
-def compose_view(frame: np.ndarray, target: Target | None, scene_objects: list[SceneObject], lane: LaneEstimate,
+def compose_view(frame: np.ndarray, target: Target | None, vehicles: list[Target],
+                 scene_objects: list[SceneObject], lane: LaneEstimate,
                  rates: Rates, view: str, error: str) -> np.ndarray:
     if view == "camera":
         return _camera_panel(frame, target, rates, error)
-    world = _world_panel((frame.shape[1], frame.shape[0]), target, scene_objects, lane, rates)
+    world = _world_panel((frame.shape[1], frame.shape[0]), target, vehicles, scene_objects, lane, rates)
     if view == "world":
         return world
     return np.hstack((world, _camera_panel(frame, target, rates, error)))
@@ -962,6 +1098,7 @@ def main() -> int:
     last_result_sequence = 0
     last_frame: np.ndarray | None = None
     target: Target | None = None
+    vehicles: list[Target] = []
     scene_objects: list[SceneObject] = []
     lane = lane_detector.current(time.perf_counter())
     view = args.view
@@ -986,9 +1123,18 @@ def main() -> int:
                 if sequence > last_camera_sequence:
                     worker.submit(sequence, frame, captured)
                     last_camera_sequence = sequence
+            # Lane geometry is required by lead selection, including while the
+            # camera-only view is shown. The detector itself is rate-limited to
+            # a small 256 px pass, so this call is cheap on intervening frames.
+            if last_frame is not None:
+                lane = lane_detector.update(last_frame, time.perf_counter())
             result = worker.latest_after(last_result_sequence)
             if result is not None and last_frame is not None:
-                target = selector.update(result.detections, last_frame.shape[1], result.completed_time)
+                target = selector.update(
+                    result.detections, last_frame.shape[1], result.completed_time,
+                    last_frame.shape[0], lane,
+                )
+                vehicles = selector.vehicles(result.completed_time)
                 scene_objects = scene_tracker.update(result.detections, last_frame.shape[1], result.completed_time)
                 last_result_sequence = result.sequence
                 rates.detections += 1
@@ -997,17 +1143,17 @@ def main() -> int:
             else:
                 now = time.perf_counter()
                 target = selector.current(now)
+                vehicles = selector.vehicles(now)
                 scene_objects = scene_tracker.current(now)
             if last_frame is None:
                 if camera.error:
                     raise RuntimeError(camera.error)
                 time.sleep(0.01)
                 continue
-            if not args.no_display and view != "camera":
-                lane = lane_detector.update(last_frame, time.perf_counter())
-            else:
-                lane = lane_detector.current(time.perf_counter())
-            rendered = compose_view(last_frame, target, scene_objects, lane, rates, view, worker.error or camera.error)
+            rendered = compose_view(
+                last_frame, target, vehicles, scene_objects, lane, rates,
+                view, worker.error or camera.error,
+            )
             if not args.no_display:
                 controls = draw_touch_controls(rendered)
             rates.display_frames += 1
@@ -1030,11 +1176,14 @@ def main() -> int:
                     cv2.imwrite(str(out), rendered)
             if deadline is not None and time.perf_counter() >= deadline:
                 break
-            next_tick += 1.0 / args.fps
+            frame_period = 1.0 / args.fps
+            next_tick += frame_period
             sleep = next_tick - time.perf_counter()
             if sleep > 0:
                 time.sleep(sleep)
-            elif sleep < -0.5:
+            else:
+                # Never burst-render several frames to catch up after a slow
+                # inference/draw cycle; that behaviour presents as stutter.
                 next_tick = time.perf_counter()
     finally:
         worker.close()

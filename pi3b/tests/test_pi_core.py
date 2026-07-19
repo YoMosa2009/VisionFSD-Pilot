@@ -11,12 +11,14 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from visionfsd_pi import (
     Detection,
+    LaneEstimate,
     LowCostLaneDetector,
     SceneObjectTracker,
     TFLiteVehicleDetector,
     TargetSelector,
     bearing_deg,
     estimate_car_range_m,
+    lane_position,
     nms,
     touch_action_at,
     touch_buttons,
@@ -45,12 +47,13 @@ class PiCoreTests(unittest.TestCase):
         first = selector.update([incumbent], 640, now)
         self.assertIsNotNone(first)
         first_id = first.track_id
-        # A closer, forward challenger needs six detector updates.
+        # A closer challenger still needs three detector updates, preventing a
+        # single noisy box from replacing a stable lead.
         challenger = Detection("car", 0.9, (210, 100, 430, 460))
-        for step in range(5):
+        for step in range(2):
             current = selector.update([incumbent, challenger], 640, now + (step + 1) * 0.03)
             self.assertEqual(current.track_id, first_id)
-        current = selector.update([incumbent, challenger], 640, now + 0.20)
+        current = selector.update([incumbent, challenger], 640, now + 0.09)
         self.assertNotEqual(current.track_id, first_id)
 
     def test_target_switches_to_a_new_forward_corridor_vehicle(self) -> None:
@@ -61,6 +64,48 @@ class PiCoreTests(unittest.TestCase):
         self.assertIsNotNone(first)
         current = selector.update([side_vehicle, forward_vehicle], 640, 1.1)
         self.assertEqual(current.detection.box, forward_vehicle.box)
+
+    def test_lane_position_classifies_ego_left_and_right_lanes(self) -> None:
+        lane = LaneEstimate(0.25, 0.75, 0.50, True, 0.0, 0.44, 0.56, 0.90)
+        ego = Detection("car", 0.9, (280, 180, 360, 430))
+        left = Detection("car", 0.9, (55, 180, 175, 430))
+        right = Detection("car", 0.9, (465, 180, 585, 430))
+        self.assertEqual(lane_position(ego, 640, 480, 70.0, lane)[0], 0)
+        self.assertEqual(lane_position(left, 640, 480, 70.0, lane)[0], -1)
+        self.assertEqual(lane_position(right, 640, 480, 70.0, lane)[0], 1)
+
+    def test_target_prefers_same_lane_over_closer_side_vehicle(self) -> None:
+        selector = TargetSelector(70.0)
+        lane = LaneEstimate(0.25, 0.75, 0.50, True, 0.0, 0.44, 0.56, 0.90)
+        close_left = Detection("car", 0.94, (25, 150, 215, 455))
+        farther_ego = Detection("car", 0.82, (285, 190, 355, 410))
+        target = selector.update([close_left, farther_ego], 640, 1.0, 480, lane)
+        self.assertIsNotNone(target)
+        self.assertEqual(target.detection.box, farther_ego.box)
+        self.assertEqual(target.lane_slot, 0)
+
+    def test_vehicle_label_voting_resists_one_frame_class_jitter(self) -> None:
+        selector = TargetSelector(70.0)
+        car = Detection("car", 0.84, (275, 160, 365, 420))
+        for step in range(3):
+            selector.update([car], 640, 1.0 + step * 0.05, 480)
+        noisy_bus = Detection("bus", 0.93, car.box)
+        target = selector.update([noisy_bus], 640, 1.2, 480)
+        self.assertIsNotNone(target)
+        self.assertEqual(target.detection.label, "car")
+
+    def test_world_vehicle_list_keeps_lead_and_adjacent_lanes(self) -> None:
+        selector = TargetSelector(70.0)
+        lane = LaneEstimate(0.25, 0.75, 0.50, True, 0.0, 0.44, 0.56, 0.90)
+        detections = [
+            Detection("car", 0.90, (55, 180, 175, 430)),
+            Detection("car", 0.92, (280, 180, 360, 430)),
+            Detection("truck", 0.88, (465, 180, 585, 430)),
+        ]
+        selector.update(detections, 640, 1.0, 480, lane)
+        selector.update(detections, 640, 1.1, 480, lane)
+        vehicles = selector.vehicles(1.1)
+        self.assertEqual({item.lane_slot for item in vehicles}, {-1, 0, 1})
 
     def test_raw_yolo_output_decodes_car_without_a_runtime(self) -> None:
         # Decode the actual Pi export layout [1, 84, candidate_count] without
