@@ -17,9 +17,12 @@ The included `models/vehicle_ssd_mobilenet_v1.tflite` is a 4.2 MB quantized
 SSD MobileNet V1 COCO detector. It keeps only one sticky **lead vehicle**
 (car, motorcycle, bus, or truck) in the camera view. Lead selection prefers a
 vehicle inside the detected ego lane, and short-term label voting reduces
-car/bus/truck classification flicker. The world view can also retain the
+car/bus/truck classification flicker. A vehicle requires two consecutive
+detections before it becomes the lead. The world view can also retain the
 nearest confirmed vehicle in each adjacent lane, plus confirmed pedestrians,
-traffic lights, and stop signs; those extras never clutter the camera view.
+traffic lights, and stop signs; those scene objects use class-specific
+confidence gates, require three or four consecutive hits, and disappear after
+two misses. Those extras never clutter the camera view.
 This immediately makes the Pi
 folder runnable. The desktop repository's OpenVINO/PyTorch artifacts are not
 Pi runtime artifacts. `tools/export_pi_tflite.py` remains available for a
@@ -44,7 +47,7 @@ To update an existing installation, preserving the release branch it was
 installed from:
 
 ```bash
-~/visionfsd-pi/pi3b/update.sh
+cd ~/visionfsd-pi && bash ./pi3b/update.sh
 ```
 
 ## Run from this checkout
@@ -61,6 +64,7 @@ The bottom of every visual screen has large touchscreen controls: **Quit**,
 They also work with a regular mouse. `1`, `2`, `3` select world, camera,
 split; `S` saves a screenshot; `Q`/`Esc` quits. The world panel is a low-cost
 OpenCV pseudo-3D view with a centred ego vehicle and two lane boundaries.
+Both visual panels show the version from `pi3b/VERSION`.
 The lanes glow bright white only when its low-rate, classical lane pass has a
 fresh, geometrically valid left-and-right pair; otherwise they stay dim. The
 same perspective lane geometry places vehicles into ego, left, or right lanes
@@ -69,18 +73,26 @@ measurement.
 
 ## Performance
 
-`--fps 25`/`30` pace the display. The HUD reports display and detection FPS
-separately: a 30 FPS display is not claimed as 30 FPS inference. Acceptance
+`--fps 20` is the Pi 3B preset; `25` and `30` remain available for faster
+hardware. The HUD reports display and detection FPS separately: a 20 FPS
+display is not claimed as 20 FPS inference. Acceptance
 requires a sustained Pi benchmark with no thermal throttling. If CPU inference
 does not sustain the goal after input/model tuning, add a USB accelerator.
 
-The default two LiteRT threads and one OpenCV thread leave headroom for camera
-capture and the desktop. All scene classes reuse the same single detector
-result, while the lane pass is bounded to 256 px at about 5.5 Hz. Missed
-display deadlines reset immediately instead of burst-rendering catch-up frames,
-which reduces visible stutter. Do not claim 25 FPS
-**detection** unless the HUD's `DETECT` rate reaches it on the physical Pi;
-25 FPS display alone is expected.
+The default three LiteRT threads are the first performance candidate on the
+Pi's four-core CPU, while OpenCV remains single-threaded. All scene classes
+reuse the same detector result. Input and output tensor access avoids redundant
+copies, the 256 px lane pass runs in a single-slot background worker, and split
+view renders 44% fewer pixels without changing the 640x480 detector input.
+Missed display deadlines reset immediately instead of burst-rendering catch-up
+frames. Do not claim 20 FPS **detection** unless the HUD's `DETECT` rate reaches
+it during a sustained physical-Pi run.
+
+Google's LiteRT guidance says thread count must be benchmarked with the whole
+application because additional inference threads can contend with other work.
+Raspberry Pi also documents CPU throttling near its thermal limit. Validate a
+10-minute run with adequate cooling and power before treating any result as
+sustained performance.
 
 ## Desktop provenance
 
@@ -99,6 +111,8 @@ python3 -m unittest discover -s tests -v
 ./run.sh --camera 0 --test-seconds 60 --benchmark-report logs/benchmark.json
 ```
 
-The synthetic tests cover lane-aware target selection, label stability,
-range/bearing, lane extraction, and detector output decoding. The benchmark
-records capture, display, detection, and latency.
+The synthetic tests cover consecutive confirmation, rapid false-object expiry,
+lane-aware target selection, label and box stability, lane extraction, version
+rendering, reduced split-view size, and detector output decoding. The benchmark
+records display/detection rates plus preprocess, invoke, postprocess, render,
+capture, and end-to-end timings.

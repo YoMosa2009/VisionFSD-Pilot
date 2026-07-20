@@ -4,22 +4,30 @@ import sys
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import cv2
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from visionfsd_pi import (
+    AsyncLaneDetector,
     Detection,
     LaneEstimate,
     LowCostLaneDetector,
+    RUNTIME_VERSION,
+    Rates,
     SceneObjectTracker,
     TFLiteVehicleDetector,
     TargetSelector,
+    _camera_panel,
+    _world_panel,
     bearing_deg,
+    compose_view,
     estimate_car_range_m,
     lane_position,
     nms,
+    parse_args,
     touch_action_at,
     touch_buttons,
 )
@@ -40,30 +48,44 @@ class PiCoreTests(unittest.TestCase):
         person = Detection("person", 0.75, (10, 10, 100, 100))
         self.assertEqual(nms([car, person]), [car, person])
 
+    def test_nms_suppresses_overlapping_vehicle_class_hypotheses(self) -> None:
+        car = Detection("car", 0.91, (10, 10, 100, 100))
+        truck = Detection("truck", 0.72, (10, 10, 100, 100))
+        self.assertEqual(nms([truck, car]), [car])
+
     def test_target_requires_persistent_materially_closer_challenger(self) -> None:
         selector = TargetSelector(70.0)
         now = time.perf_counter()
         incumbent = Detection("car", 0.9, (280, 250, 360, 420))
-        first = selector.update([incumbent], 640, now)
+        self.assertIsNone(selector.update([incumbent], 640, now))
+        first = selector.update([incumbent], 640, now + 0.03)
         self.assertIsNotNone(first)
         first_id = first.track_id
         # A closer challenger still needs three detector updates, preventing a
         # single noisy box from replacing a stable lead.
         challenger = Detection("car", 0.9, (210, 100, 430, 460))
-        for step in range(2):
-            current = selector.update([incumbent, challenger], 640, now + (step + 1) * 0.03)
+        for step in range(3):
+            current = selector.update([incumbent, challenger], 640, now + 0.06 + step * 0.03)
             self.assertEqual(current.track_id, first_id)
-        current = selector.update([incumbent, challenger], 640, now + 0.09)
+        current = selector.update([incumbent, challenger], 640, now + 0.15)
         self.assertNotEqual(current.track_id, first_id)
 
     def test_target_switches_to_a_new_forward_corridor_vehicle(self) -> None:
         selector = TargetSelector(70.0)
         side_vehicle = Detection("car", 0.9, (0, 120, 240, 460))
         forward_vehicle = Detection("car", 0.9, (290, 160, 350, 400))
-        first = selector.update([side_vehicle], 640, 1.0)
+        self.assertIsNone(selector.update([side_vehicle], 640, 1.0))
+        first = selector.update([side_vehicle], 640, 1.05)
         self.assertIsNotNone(first)
-        current = selector.update([side_vehicle, forward_vehicle], 640, 1.1)
+        self.assertEqual(selector.update([side_vehicle, forward_vehicle], 640, 1.1).track_id, first.track_id)
+        current = selector.update([side_vehicle, forward_vehicle], 640, 1.15)
         self.assertEqual(current.detection.box, forward_vehicle.box)
+
+    def test_one_frame_vehicle_false_positive_never_becomes_lead(self) -> None:
+        selector = TargetSelector(70.0)
+        false_car = Detection("car", 0.88, (280, 160, 360, 420))
+        self.assertIsNone(selector.update([false_car], 640, 1.0, 480))
+        self.assertIsNone(selector.update([], 640, 1.1, 480))
 
     def test_lane_position_classifies_ego_left_and_right_lanes(self) -> None:
         lane = LaneEstimate(0.25, 0.75, 0.50, True, 0.0, 0.44, 0.56, 0.90)
@@ -79,7 +101,8 @@ class PiCoreTests(unittest.TestCase):
         lane = LaneEstimate(0.25, 0.75, 0.50, True, 0.0, 0.44, 0.56, 0.90)
         close_left = Detection("car", 0.94, (25, 150, 215, 455))
         farther_ego = Detection("car", 0.82, (285, 190, 355, 410))
-        target = selector.update([close_left, farther_ego], 640, 1.0, 480, lane)
+        self.assertIsNone(selector.update([close_left, farther_ego], 640, 1.0, 480, lane))
+        target = selector.update([close_left, farther_ego], 640, 1.1, 480, lane)
         self.assertIsNotNone(target)
         self.assertEqual(target.detection.box, farther_ego.box)
         self.assertEqual(target.lane_slot, 0)
@@ -93,6 +116,16 @@ class PiCoreTests(unittest.TestCase):
         target = selector.update([noisy_bus], 640, 1.2, 480)
         self.assertIsNotNone(target)
         self.assertEqual(target.detection.label, "car")
+
+    def test_vehicle_box_is_smoothed_after_a_jittery_measurement(self) -> None:
+        selector = TargetSelector(70.0)
+        first = Detection("car", 0.9, (270, 160, 350, 420))
+        moved = Detection("car", 0.9, (290, 160, 370, 420))
+        selector.update([first], 640, 1.0, 480)
+        target = selector.update([moved], 640, 1.1, 480)
+        self.assertIsNotNone(target)
+        self.assertGreater(target.detection.box[0], first.box[0])
+        self.assertLess(target.detection.box[0], moved.box[0])
 
     def test_world_vehicle_list_keeps_lead_and_adjacent_lanes(self) -> None:
         selector = TargetSelector(70.0)
@@ -148,13 +181,45 @@ class PiCoreTests(unittest.TestCase):
         decoded = detector._decode_detection_postprocess([boxes, classes, scores, count], 640, 480)
         self.assertEqual([item.label for item in decoded], ["person", "traffic_light", "stop_sign"])
 
-    def test_world_objects_require_two_detections_before_display(self) -> None:
+    def test_world_objects_require_consecutive_evidence_before_display(self) -> None:
         tracker = SceneObjectTracker(70.0)
         person = Detection("person", 0.90, (280, 140, 330, 430))
         self.assertEqual(tracker.update([person], 640, 1.0), [])
+        self.assertEqual(tracker.update([person], 640, 1.1), [])
         confirmed = tracker.update([person], 640, 1.2)
         self.assertEqual(len(confirmed), 1)
         self.assertEqual(confirmed[0].detection.label, "person")
+
+    def test_scene_hit_miss_hit_does_not_confirm(self) -> None:
+        tracker = SceneObjectTracker(70.0)
+        person = Detection("person", 0.90, (280, 140, 330, 430))
+        self.assertEqual(tracker.update([person], 640, 1.0), [])
+        self.assertEqual(tracker.update([], 640, 1.1), [])
+        self.assertEqual(tracker.update([person], 640, 1.2), [])
+
+    def test_confirmed_scene_object_hides_after_two_misses(self) -> None:
+        tracker = SceneObjectTracker(70.0)
+        person = Detection("person", 0.90, (280, 140, 330, 430))
+        tracker.update([person], 640, 1.0)
+        tracker.update([person], 640, 1.1)
+        self.assertEqual(len(tracker.update([person], 640, 1.2)), 1)
+        self.assertEqual(len(tracker.update([], 640, 1.28)), 1)
+        self.assertEqual(tracker.update([], 640, 1.36), [])
+
+    def test_low_confidence_sign_never_confirms(self) -> None:
+        tracker = SceneObjectTracker(70.0)
+        sign = Detection("stop_sign", 0.51, (400, 120, 455, 220))
+        for step in range(6):
+            self.assertEqual(tracker.update([sign], 640, 1.0 + step * 0.05), [])
+
+    def test_moving_person_uses_centre_distance_match(self) -> None:
+        tracker = SceneObjectTracker(70.0)
+        boxes = ((260, 140, 310, 430), (275, 140, 325, 430), (290, 140, 340, 430))
+        result = []
+        for step, box in enumerate(boxes):
+            result = tracker.update([Detection("person", 0.90, box)], 640, 1.0 + step * 0.08)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].track_id, 1)
 
     def test_low_cost_lane_detector_requires_and_finds_a_pair(self) -> None:
         frame = np.zeros((480, 640, 3), dtype=np.uint8)
@@ -164,6 +229,22 @@ class PiCoreTests(unittest.TestCase):
         self.assertTrue(lane.observed)
         self.assertLess(lane.left_bottom_norm, 0.5)
         self.assertGreater(lane.right_bottom_norm, 0.5)
+
+    def test_async_lane_detector_publishes_without_main_loop_work(self) -> None:
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        cv2.line(frame, (80, 479), (270, 250), (255, 255, 255), 8, cv2.LINE_AA)
+        cv2.line(frame, (560, 479), (370, 250), (255, 255, 255), 8, cv2.LINE_AA)
+        worker = AsyncLaneDetector()
+        try:
+            worker.submit(1, frame)
+            deadline = time.perf_counter() + 1.0
+            lane = worker.latest(time.perf_counter())
+            while not lane.observed and time.perf_counter() < deadline:
+                time.sleep(0.01)
+                lane = worker.latest(time.perf_counter())
+            self.assertTrue(lane.observed)
+        finally:
+            worker.close()
 
     def test_uint8_ssd_input_keeps_raw_rgb_values(self) -> None:
         detector = object.__new__(TFLiteVehicleDetector)
@@ -182,6 +263,25 @@ class PiCoreTests(unittest.TestCase):
             x1, y1, x2, y2 = button.rect
             self.assertEqual(touch_action_at(buttons, (x1 + x2) // 2, (y1 + y2) // 2), button.action)
         self.assertIsNone(touch_action_at(buttons, 0, 0))
+
+    def test_split_view_reduces_rendered_pixel_work(self) -> None:
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        lane = LaneEstimate(0.25, 0.75, 0.50, False, float("inf"))
+        rendered = compose_view(frame, None, [], [], lane, Rates(), "split", "")
+        self.assertEqual(rendered.shape[:2], (360, 960))
+
+    def test_parser_accepts_20_fps_pi_preset(self) -> None:
+        with patch.object(sys, "argv", ["visionfsd_pi.py", "--fps", "20"]):
+            self.assertEqual(parse_args().fps, 20)
+
+    def test_version_is_drawn_in_camera_and_world_huds(self) -> None:
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        lane = LaneEstimate(0.25, 0.75, 0.50, False, float("inf"))
+        with patch("visionfsd_pi.cv2.putText", wraps=cv2.putText) as put_text:
+            _camera_panel(frame, None, Rates(), "")
+            _world_panel((640, 480), None, [], [], lane, Rates())
+        labels = [str(call.args[1]) for call in put_text.call_args_list]
+        self.assertTrue(any(RUNTIME_VERSION in label for label in labels))
 
 
 if __name__ == "__main__":

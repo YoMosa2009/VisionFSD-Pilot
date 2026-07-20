@@ -59,10 +59,12 @@ the desktop application depends on Intel OpenVINO GPU and several perception
 models that are intentionally not part of the Pi runtime.
 
 The Pi runtime uses a small quantized TFLite detector, keeps only the newest
-camera frame, and displays **one sticky selected lead vehicle** in its camera
-and low-cost world views. Its world view can also show confirmed pedestrians,
-traffic lights, and stop signs; these never appear in the camera view. It is
-still read-only visualization software and never controls a vehicle.
+camera frame, and displays **one confirmed, sticky lead vehicle** in its camera
+and low-cost world views. Consecutive-hit tracking and class-specific evidence
+gates suppress one-frame vehicles and ghost pedestrians/signs. Its world view
+can also show confirmed pedestrians, traffic lights, and stop signs; these
+never appear in the camera view. It is still read-only visualization software
+and never controls a vehicle.
 
 On a networked Raspberry Pi 3B running **64-bit** Raspberry Pi OS, install
 everything with:
@@ -75,19 +77,19 @@ The installer creates `~/visionfsd-pi`, installs the Pi-only dependencies,
 downloads the verified TFLite model, and verifies its SHA-256. Then start it:
 
 ```bash
-~/visionfsd-pi/pi3b/run.sh --camera 0 --fps 25
+~/visionfsd-pi/pi3b/run.sh --camera 0 --fps 20
 ```
 
 To update an existing Pi installation (it remembers the Pi release branch):
 
 ```bash
-~/visionfsd-pi/pi3b/update.sh
+cd ~/visionfsd-pi && bash ./pi3b/update.sh
 ```
 
-Use `--fps 30` only after the Pi's sustained benchmark proves it can maintain
-that rate without thermal throttling. The HUD reports display FPS and detector
-FPS separately. See [`pi3b/README.md`](pi3b/README.md) for camera, model, and
-benchmark details.
+The Pi 3B preset targets a 20 FPS display. The HUD reports display FPS and
+detector FPS separately; 20 FPS inference is not claimed without a sustained
+physical-Pi benchmark. The HUD also shows the installed Pi runtime version.
+See [`pi3b/README.md`](pi3b/README.md) for camera, model, and benchmark details.
 
 ### Controls
 

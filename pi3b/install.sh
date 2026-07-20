@@ -69,7 +69,9 @@ if [[ "$actual_hash" != "${MODEL_SHA256^^}" ]]; then
 fi
 mv -f "$PI_ROOT/models/vehicle_yolo11n_320_int8.tflite" "$PI_ROOT/models/vehicle_ssd_mobilenet_v1.tflite"
 
-chmod +x "$PI_ROOT/run.sh" "$PI_ROOT/update.sh"
+chmod +x "$PI_ROOT/install.sh" "$PI_ROOT/run.sh" "$PI_ROOT/update.sh"
+version="$(tr -d '\r\n' < "$PI_ROOT/VERSION")"
 echo "Installed at $PI_ROOT"
-echo "Run: $PI_ROOT/run.sh --camera 0 --fps 25"
-echo "Update later: $PI_ROOT/update.sh"
+echo "VisionFSD Pi version: $version"
+echo "Run: $PI_ROOT/run.sh --camera 0 --fps 20"
+echo "Update later: bash $PI_ROOT/update.sh"
