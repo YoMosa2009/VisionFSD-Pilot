@@ -86,6 +86,15 @@ To update an existing Pi installation (it remembers the Pi release branch):
 cd ~/visionfsd-pi && bash ./pi3b/update.sh
 ```
 
+If an older updater aborts because local changes would be overwritten, recover
+it once without deleting those edits:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/YoMosa2009/VisionFSD-Pilot/codex/pi3b-runtime/pi3b/recover-update.sh | bash
+```
+
+After recovery, the normal update command above works for later releases.
+
 The Pi 3B preset targets a 20 FPS display. The HUD reports display FPS and
 detector FPS separately; 20 FPS inference is not claimed without a sustained
 physical-Pi benchmark. The HUD also shows the installed Pi runtime version.

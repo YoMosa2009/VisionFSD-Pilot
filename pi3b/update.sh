@@ -34,7 +34,11 @@ fi
 
 git -C "$ROOT" fetch --depth 1 origin "$REF"
 git -C "$ROOT" checkout --detach FETCH_HEAD
-chmod +x "$PI_ROOT/install.sh" "$PI_ROOT/run.sh" "$PI_ROOT/update.sh"
+chmod +x \
+  "$PI_ROOT/install.sh" \
+  "$PI_ROOT/run.sh" \
+  "$PI_ROOT/update.sh" \
+  "$PI_ROOT/recover-update.sh"
 
 if [[ ! -x "$PI_ROOT/.venv/bin/python" ]]; then
   echo "Pi virtual environment is missing. Re-run pi3b/install.sh." >&2

@@ -50,6 +50,17 @@ installed from:
 cd ~/visionfsd-pi && bash ./pi3b/update.sh
 ```
 
+If an older updater aborts with `commit your changes or stash them`, use the
+checkout-independent recovery command once:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/YoMosa2009/VisionFSD-Pilot/codex/pi3b-runtime/pi3b/recover-update.sh | bash
+```
+
+It saves tracked local edits in a named Git stash, installs the current Pi
+release, and leaves the model and virtual environment in place. Normal future
+updates can then use `bash ~/visionfsd-pi/pi3b/update.sh`.
+
 ## Run from this checkout
 
 ```bash
