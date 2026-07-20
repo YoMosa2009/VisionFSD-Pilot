@@ -25,6 +25,7 @@ from visionfsd_pi import (
     bearing_deg,
     compose_view,
     estimate_car_range_m,
+    is_near_vehicle,
     lane_position,
     nms,
     parse_args,
@@ -127,7 +128,7 @@ class PiCoreTests(unittest.TestCase):
         self.assertGreater(target.detection.box[0], first.box[0])
         self.assertLess(target.detection.box[0], moved.box[0])
 
-    def test_world_vehicle_list_keeps_lead_and_adjacent_lanes(self) -> None:
+    def test_world_vehicle_list_contains_only_selected_target(self) -> None:
         selector = TargetSelector(70.0)
         lane = LaneEstimate(0.25, 0.75, 0.50, True, 0.0, 0.44, 0.56, 0.90)
         detections = [
@@ -136,9 +137,60 @@ class PiCoreTests(unittest.TestCase):
             Detection("truck", 0.88, (465, 180, 585, 430)),
         ]
         selector.update(detections, 640, 1.0, 480, lane)
-        selector.update(detections, 640, 1.1, 480, lane)
+        target = selector.update(detections, 640, 1.1, 480, lane)
         vehicles = selector.vehicles(1.1)
-        self.assertEqual({item.lane_slot for item in vehicles}, {-1, 0, 1})
+        self.assertIsNotNone(target)
+        self.assertEqual(len(vehicles), 1)
+        self.assertEqual(vehicles[0].track_id, target.track_id)
+        self.assertEqual(vehicles[0].lane_slot, 0)
+
+    def test_far_horizon_vehicle_never_becomes_target(self) -> None:
+        selector = TargetSelector(70.0)
+        far_car = Detection("car", 0.96, (309, 175, 331, 207))
+        self.assertFalse(is_near_vehicle(far_car, 640, 480))
+        for step in range(6):
+            self.assertIsNone(selector.update([far_car], 640, 1.0 + step * 0.1, 480))
+
+    def test_close_target_is_not_replaced_by_far_centre_detection(self) -> None:
+        selector = TargetSelector(70.0)
+        close_car = Detection("car", 0.88, (260, 170, 380, 440))
+        far_car = Detection("truck", 0.99, (309, 175, 331, 207))
+        selector.update([close_car], 640, 1.0, 480)
+        target = selector.update([close_car], 640, 1.1, 480)
+        self.assertIsNotNone(target)
+        target_id = target.track_id
+        for step in range(5):
+            target = selector.update([close_car, far_car], 640, 1.2 + step * 0.1, 480)
+            self.assertEqual(target.track_id, target_id)
+
+    def test_target_falls_back_to_nearest_adjacent_lane(self) -> None:
+        selector = TargetSelector(70.0)
+        lane = LaneEstimate(0.25, 0.75, 0.50, True, 0.0, 0.44, 0.56, 0.90)
+        close_left = Detection("car", 0.92, (35, 145, 225, 455))
+        farther_right = Detection("car", 0.94, (455, 180, 585, 420))
+        selector.update([close_left, farther_right], 640, 1.0, 480, lane)
+        target = selector.update([close_left, farther_right], 640, 1.1, 480, lane)
+        self.assertIsNotNone(target)
+        self.assertEqual(target.lane_slot, -1)
+
+    def test_world_renderer_draws_at_most_one_vehicle(self) -> None:
+        lane = LaneEstimate(0.25, 0.75, 0.50, True, 0.0, 0.44, 0.56, 0.90)
+        target = TargetSelector(70.0)
+        detections = [
+            Detection("car", 0.90, (55, 180, 175, 430)),
+            Detection("car", 0.92, (280, 180, 360, 430)),
+            Detection("truck", 0.88, (465, 180, 585, 430)),
+        ]
+        target.update(detections, 640, 1.0, 480, lane)
+        selected = target.update(detections, 640, 1.1, 480, lane)
+        all_tracks = [
+            target.current(1.1),
+            target.current(1.1),
+            target.current(1.1),
+        ]
+        with patch("visionfsd_pi._draw_world_vehicle") as draw_vehicle:
+            _world_panel((640, 480), selected, all_tracks, [], lane, Rates())
+        draw_vehicle.assert_called_once()
 
     def test_raw_yolo_output_decodes_car_without_a_runtime(self) -> None:
         # Decode the actual Pi export layout [1, 84, candidate_count] without
@@ -273,6 +325,10 @@ class PiCoreTests(unittest.TestCase):
     def test_parser_accepts_20_fps_pi_preset(self) -> None:
         with patch.object(sys, "argv", ["visionfsd_pi.py", "--fps", "20"]):
             self.assertEqual(parse_args().fps, 20)
+
+    def test_parser_defaults_to_25_fps_pi_preset(self) -> None:
+        with patch.object(sys, "argv", ["visionfsd_pi.py"]):
+            self.assertEqual(parse_args().fps, 25)
 
     def test_version_is_drawn_in_camera_and_world_huds(self) -> None:
         frame = np.zeros((480, 640, 3), dtype=np.uint8)

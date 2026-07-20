@@ -77,5 +77,5 @@ chmod +x \
 version="$(tr -d '\r\n' < "$PI_ROOT/VERSION")"
 echo "Installed at $PI_ROOT"
 echo "VisionFSD Pi version: $version"
-echo "Run: $PI_ROOT/run.sh --camera 0 --fps 20"
+echo "Run: $PI_ROOT/run.sh --camera 0 --fps 25 --threads 3"
 echo "Update later: bash $PI_ROOT/update.sh"

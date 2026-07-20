@@ -76,4 +76,4 @@ fi
 printf '%s\n' "$REF" > "$PI_ROOT/.install-ref"
 version="$(tr -d '\r\n' < "$PI_ROOT/VERSION")"
 echo "Recovered VisionFSD Pi to v$version from $REF"
-echo "Run: bash $PI_ROOT/run.sh --camera 0 --fps 20 --threads 3"
+echo "Run: bash $PI_ROOT/run.sh --camera 0 --fps 25 --threads 3"

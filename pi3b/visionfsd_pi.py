@@ -28,6 +28,9 @@ RUNTIME_VERSION = VERSION_FILE.read_text(encoding="utf-8").strip() if VERSION_FI
 CAR_WIDTH_M = 1.80
 WINDOW_TITLE = f"VisionFSD Pi 3B v{RUNTIME_VERSION} - read only"
 SPLIT_RENDER_SCALE = 0.75
+MIN_TARGET_WIDTH_NORM = 0.035
+MIN_TARGET_HEIGHT_NORM = 0.055
+MIN_TARGET_BOTTOM_NORM = 0.42
 
 # The bundled SSD MobileNet labelmap is zero-based.  Keep this intentionally
 # small: decoding these classes costs no extra model inference, while avoiding
@@ -148,6 +151,24 @@ def smooth_box(previous: tuple[int, int, int, int], current: tuple[int, int, int
     return tuple(
         int(round(old * history_weight + new * measurement_weight))
         for old, new in zip(previous, current)
+    )
+
+
+def is_near_vehicle(detection: Detection, frame_width: int, frame_height: int) -> bool:
+    """Reject tiny horizon detections before they can become visual targets.
+
+    Image geometry is used instead of class-dependent range because a one-frame
+    car/bus/truck label change must not make the same box appear suddenly near
+    or far. The thresholds retain visibly useful front and adjacent-lane cars.
+    """
+    x1, y1, x2, y2 = detection.box
+    width_norm = max(0, x2 - x1) / max(1.0, float(frame_width))
+    height_norm = max(0, y2 - y1) / max(1.0, float(frame_height))
+    bottom_norm = y2 / max(1.0, float(frame_height))
+    return (
+        width_norm >= MIN_TARGET_WIDTH_NORM
+        and height_norm >= MIN_TARGET_HEIGHT_NORM
+        and bottom_norm >= MIN_TARGET_BOTTOM_NORM
     )
 
 
@@ -509,7 +530,7 @@ class TargetSelector:
     detector updates.
     """
 
-    def __init__(self, fov_deg: float, hold_s: float = 0.55) -> None:
+    def __init__(self, fov_deg: float, hold_s: float = 0.90) -> None:
         self._fov_deg = fov_deg
         self._hold_s = hold_s
         self._tracks: dict[int, _Track] = {}
@@ -530,8 +551,18 @@ class TargetSelector:
             scale = max(24.0, math.hypot(tx2 - tx1, ty2 - ty1))
             centre_distance = math.hypot(centre_x - track_x, centre_y - track_y) / scale
             overlap = box_iou(detection.box, track.detection.box)
+            detection_scale = max(1.0, math.hypot(x2 - x1, y2 - y1))
+            track_scale = max(1.0, math.hypot(tx2 - tx1, ty2 - ty1))
+            scale_ratio = min(detection_scale, track_scale) / max(detection_scale, track_scale)
+            # A tiny centred horizon car and a large close car are different
+            # objects. This gate prevents an ID from jumping between them.
+            if overlap < 0.05 and scale_ratio < 0.48:
+                continue
             if overlap >= 0.12 or centre_distance <= 0.38:
-                choices.append((overlap * 2.0 + max(0.0, 1.0 - centre_distance), track_id))
+                choices.append((
+                    overlap * 2.0 + max(0.0, 1.0 - centre_distance) + scale_ratio * 0.35,
+                    track_id,
+                ))
         if not choices:
             return None
         score, track_id = max(choices)
@@ -542,7 +573,9 @@ class TargetSelector:
         frame_height = frame_height or int(frame_width * 0.75)
         seen: set[int] = set()
         for detection in detections:
-            if detection.label not in VEHICLE_LABELS:
+            if detection.label not in VEHICLE_LABELS or not is_near_vehicle(
+                detection, frame_width, frame_height
+            ):
                 continue
             track_id = self._match(detection, seen)
             heading = bearing_deg(detection.box, frame_width, self._fov_deg)
@@ -562,11 +595,20 @@ class TargetSelector:
             else:
                 previous = self._tracks[track_id]
                 label_scores = {
-                    label: score * 0.82 for label, score in previous.label_scores.items()
-                    if score * 0.82 >= 0.05
+                    label: score * 0.88 for label, score in previous.label_scores.items()
+                    if score * 0.88 >= 0.05
                 }
                 label_scores[detection.label] = label_scores.get(detection.label, 0.0) + detection.confidence
-                stable_label = max(label_scores, key=label_scores.get)
+                best_label = max(label_scores, key=label_scores.get)
+                previous_label = previous.detection.label
+                # Retain a stable subtype until another class has materially
+                # more accumulated evidence. This is temporal evidence fusion,
+                # not an extra inference pass.
+                stable_label = (
+                    previous_label
+                    if label_scores.get(previous_label, 0.0) >= label_scores[best_label] * 0.72
+                    else best_label
+                )
                 confidence_ema = previous.confidence_ema * 0.70 + detection.confidence * 0.30
                 hit_streak = previous.hit_streak + 1
                 stable_detection = Detection(
@@ -621,7 +663,12 @@ class TargetSelector:
         candidates = [
             (priority(track), track_id)
             for track_id, track in self._tracks.items()
-            if track_id in seen and track.confirmed and track.confidence_ema >= 0.34
+            if (
+                track_id in seen
+                and track.confirmed
+                and track.confidence_ema >= 0.34
+                and track.lane_slot in (-1, 0, 1)
+            )
         ]
         # Prefer vehicles inside the detected ego lane. Bearing is only the
         # fallback when fresh lane geometry is unavailable.
@@ -643,7 +690,7 @@ class TargetSelector:
             # immediately; handoffs within one lane retain hysteresis.
             if challenger.lane_slot == 0 and incumbent.lane_slot != 0:
                 self._target_id, self._challenger_id, self._challenge_hits = best_id, None, 0
-            elif incumbent.misses >= 2 and challenger.confirmed:
+            elif incumbent.misses >= 3 and challenger.confirmed:
                 self._target_id, self._challenger_id, self._challenge_hits = best_id, None, 0
             elif best_score < priority(incumbent) - 0.55:
                 self._challenge_hits = self._challenge_hits + 1 if self._challenger_id == best_id else 1
@@ -670,24 +717,10 @@ class TargetSelector:
             track.misses == 0 and age < 0.20, age, track.lane_slot, track.lane_offset,
         )
 
-    def vehicles(self, now: float, max_vehicles: int = 3) -> list[Target]:
-        """Return the lead plus at most one nearby vehicle per adjacent lane."""
-        live = [
-            Target(track_id, track.detection, track.distance_m, track.bearing,
-                   track.misses == 0 and now - track.last_seen < 0.20, now - track.last_seen,
-                   track.lane_slot, track.lane_offset)
-            for track_id, track in self._tracks.items()
-            if now - track.last_seen <= self._hold_s and track.confirmed and track.misses <= 2
-        ]
-        chosen: list[Target] = []
-        lead = next((item for item in live if item.track_id == self._target_id), None)
-        if lead is not None:
-            chosen.append(lead)
-        for slot in (-1, 1):
-            side = [item for item in live if item.lane_slot == slot]
-            if side:
-                chosen.append(min(side, key=lambda item: item.distance_m))
-        return chosen[:max_vehicles]
+    def vehicles(self, now: float, max_vehicles: int = 1) -> list[Target]:
+        """Return exactly the selected target or nothing; never adjacent extras."""
+        target = self.current(now)
+        return [target] if target is not None and max_vehicles > 0 else []
 
 
 @dataclass(frozen=True)
@@ -1055,7 +1088,10 @@ def _camera_panel(frame: np.ndarray, target: Target | None, rates: Rates, error:
         colour = (50, 220, 70) if target.observed else (0, 170, 255)
         cv2.rectangle(panel, (x1, y1), (x2, y2), colour, 2)
         state = "LIVE" if target.observed else f"HOLD {target.age_s:.1f}s"
-        text = f"TARGET {target.detection.label.upper()} {target.distance_m:.1f}m {target.bearing_deg:+.1f}deg {state}"
+        text = (
+            f"TARGET #{target.track_id} {target.detection.label.upper()} "
+            f"{target.distance_m:.1f}m {target.bearing_deg:+.1f}deg {state}"
+        )
         cv2.putText(panel, text, (max(6, x1), max(22, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.48, colour, 2, cv2.LINE_AA)
     stats = rates.report()
     cv2.rectangle(panel, (0, 0), (min(panel.shape[1], 370), 67), (15, 18, 22), -1)
@@ -1170,6 +1206,11 @@ def _draw_world_vehicle(panel: np.ndarray, target: Target, width: int, horizon: 
     ], dtype=np.int32)
     cv2.fillConvexPoly(panel, body, colour)
     cv2.fillConvexPoly(panel, roof, tuple(int(value * 0.70) for value in colour))
+    cv2.putText(
+        panel, f"#{target.track_id} {target.detection.label.upper()}",
+        (max(3, x - scale), max(14, y - int(scale * 1.70))),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.30, colour, 1, cv2.LINE_AA,
+    )
 
 
 def _draw_scene_object(panel: np.ndarray, item: SceneObject, width: int, horizon: int, ego_top: int) -> None:
@@ -1218,9 +1259,9 @@ def _world_panel(size: tuple[int, int], target: Target | None, vehicles: list[Ta
     ego_width = max(88, int(width * 0.20))
     ego_bottom = control_top - 9
     ego_top = ego_bottom - ego_height
-    visible_vehicles = {item.track_id: item for item in vehicles}
-    if target is not None:
-        visible_vehicles[target.track_id] = target
+    # Defence in depth: the world renderer only accepts the selected target.
+    # Even stale callers that pass several vehicles cannot render more than one.
+    visible_vehicles = {target.track_id: target} if target is not None else {}
     # Merge every world object into one depth sort so nearer pedestrians/signs
     # cannot be overpainted by farther vehicles, or vice versa.
     drawables: list[tuple[float, str, Target | SceneObject]] = [
@@ -1247,22 +1288,14 @@ def _world_panel(size: tuple[int, int], target: Target | None, vehicles: list[Ta
     cv2.putText(panel, f"DISPLAY {stats['display_fps']:.1f}  DETECT {stats['detect_fps']:.1f}", (8, 42),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.40, (155, 175, 190), 1, cv2.LINE_AA)
     if target is not None:
-        cv2.putText(panel, f"LEAD {target.detection.label.upper()} {target.distance_m:.0f}m", (8, 61),
+        cv2.putText(panel, f"LEAD #{target.track_id} {target.detection.label.upper()} {target.distance_m:.0f}m", (8, 61),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.38, (185, 225, 195), 1, cv2.LINE_AA)
-    adjacent = [item for item in vehicles if item.lane_slot != 0]
-    if adjacent:
-        adjacent_text = "  |  ".join(
-            f"{'LEFT' if item.lane_slot < 0 else 'RIGHT'} {item.distance_m:.0f}m"
-            for item in adjacent
-        )
-        cv2.putText(panel, adjacent_text, (8, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.34,
-                    (205, 183, 145), 1, cv2.LINE_AA)
     if scene_objects:
         scene_text = "  |  ".join(
             f"{DISPLAY_LABELS[item.detection.label]} {item.distance_m:.0f}m"
             for item in scene_objects
         )
-        cv2.putText(panel, scene_text, (8, 98 if adjacent else 80), cv2.FONT_HERSHEY_SIMPLEX, 0.34,
+        cv2.putText(panel, scene_text, (8, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.34,
                     (190, 205, 218), 1, cv2.LINE_AA)
     return panel
 
@@ -1337,7 +1370,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", type=Path, default=PROJECT_ROOT / "models/vehicle_ssd_mobilenet_v1.tflite")
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=480)
-    parser.add_argument("--fps", type=int, choices=(20, 25, 30), default=20)
+    parser.add_argument("--fps", type=int, choices=(20, 25, 30), default=25)
     parser.add_argument("--imgsz", type=int, default=320, help="Documented model input size; model metadata is authoritative")
     parser.add_argument("--threads", type=int, choices=(1, 2, 3, 4), default=3,
                         help="LiteRT CPU threads; benchmark 2 vs 3 on the physical Pi 3B")

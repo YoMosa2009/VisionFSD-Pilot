@@ -15,14 +15,16 @@ for modern Pi OS/Python 3.13; the obsolete `tflite-runtime` package does not.
 
 The included `models/vehicle_ssd_mobilenet_v1.tflite` is a 4.2 MB quantized
 SSD MobileNet V1 COCO detector. It keeps only one sticky **lead vehicle**
-(car, motorcycle, bus, or truck) in the camera view. Lead selection prefers a
-vehicle inside the detected ego lane, and short-term label voting reduces
-car/bus/truck classification flicker. A vehicle requires two consecutive
-detections before it becomes the lead. The world view can also retain the
-nearest confirmed vehicle in each adjacent lane, plus confirmed pedestrians,
-traffic lights, and stop signs; those scene objects use class-specific
-confidence gates, require three or four consecutive hits, and disappear after
-two misses. Those extras never clutter the camera view.
+(car, motorcycle, bus, or truck) in both the camera and world views. Lead
+selection prefers a visibly near vehicle inside the detected ego lane; only
+when no such vehicle exists can one near left/right-lane vehicle become the
+target. Tiny horizon vehicles are rejected before tracking. Semantic vehicle
+NMS, scale-aware ID association, and temporal class evidence reduce duplicate
+cars, ID jumps, and car/bus/truck classification flicker. A vehicle requires
+two consecutive detections before it becomes the lead. The world view can also
+show confirmed pedestrians, traffic lights, and stop signs; those scene objects
+use class-specific confidence gates, require three or four consecutive hits,
+and disappear after two misses. Those extras never clutter the camera view.
 This immediately makes the Pi
 folder runnable. The desktop repository's OpenVINO/PyTorch artifacts are not
 Pi runtime artifacts. `tools/export_pi_tflite.py` remains available for a
@@ -84,9 +86,9 @@ measurement.
 
 ## Performance
 
-`--fps 20` is the Pi 3B preset; `25` and `30` remain available for faster
-hardware. The HUD reports display and detection FPS separately: a 20 FPS
-display is not claimed as 20 FPS inference. Acceptance
+`--fps 25` is the Pi 3B display target; `20` remains available for thermally or
+power-limited installations. The HUD reports display and detection FPS
+separately: a 25 FPS display is not claimed as 25 FPS inference. Acceptance
 requires a sustained Pi benchmark with no thermal throttling. If CPU inference
 does not sustain the goal after input/model tuning, add a USB accelerator.
 
@@ -96,7 +98,7 @@ reuse the same detector result. Input and output tensor access avoids redundant
 copies, the 256 px lane pass runs in a single-slot background worker, and split
 view renders 44% fewer pixels without changing the 640x480 detector input.
 Missed display deadlines reset immediately instead of burst-rendering catch-up
-frames. Do not claim 20 FPS **detection** unless the HUD's `DETECT` rate reaches
+frames. Do not claim 25 FPS **detection** unless the HUD's `DETECT` rate reaches
 it during a sustained physical-Pi run.
 
 Google's LiteRT guidance says thread count must be benchmarked with the whole
@@ -111,7 +113,7 @@ sustained performance.
 |---|---|---|
 | `LatestCamera` | `src/webcam_capture_proc.py` | Linux V4L2, newest frame only |
 | `AsyncDetector` | `src/object_perception.py` | LiteRT, one pending frame |
-| `TargetSelector` | `src/visionfsd_3d.py` | small tracker, lane-aware lead plus adjacent-lane world vehicles |
+| `TargetSelector` | `src/visionfsd_3d.py` | small tracker, scale-aware stable IDs, temporal class fusion, strict one-vehicle lead policy |
 | range/bearing | `src/visionfsd.py` | car-width pinhole estimate only |
 | split display | `src/visionfsd_3d.py` | OpenCV pseudo-3D, no OpenGL |
 
