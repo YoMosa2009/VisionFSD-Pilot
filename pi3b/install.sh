@@ -54,6 +54,7 @@ PI_ROOT="$INSTALL_ROOT/pi3b"
 python3 -m venv --system-site-packages "$PI_ROOT/.venv"
 "$PI_ROOT/.venv/bin/python" -m pip install --upgrade pip
 "$PI_ROOT/.venv/bin/python" -m pip install -r "$PI_ROOT/requirements.txt"
+printf '%s\n' "$REF" > "$PI_ROOT/.install-ref"
 
 mkdir -p "$PI_ROOT/models" "$PI_ROOT/logs"
 TMP_MODEL="$PI_ROOT/models/.vehicle_model.download"
@@ -68,7 +69,15 @@ if [[ "$actual_hash" != "${MODEL_SHA256^^}" ]]; then
 fi
 mv -f "$PI_ROOT/models/vehicle_yolo11n_320_int8.tflite" "$PI_ROOT/models/vehicle_ssd_mobilenet_v1.tflite"
 
-chmod +x "$PI_ROOT/run.sh" "$PI_ROOT/update.sh"
+chmod +x \
+  "$PI_ROOT/install.sh" \
+  "$PI_ROOT/run.sh" \
+  "$PI_ROOT/update.sh" \
+  "$PI_ROOT/recover-update.sh" \
+  "$PI_ROOT/sync_primary_model.sh"
+bash "$PI_ROOT/sync_primary_model.sh" "$PI_ROOT"
+version="$(tr -d '\r\n' < "$PI_ROOT/VERSION")"
 echo "Installed at $PI_ROOT"
-echo "Run: $PI_ROOT/run.sh --camera 0 --fps 25"
-echo "Update later: $PI_ROOT/update.sh"
+echo "VisionFSD Pi version: $version"
+echo "Run: $PI_ROOT/run.sh --camera 0 --fps 25 --threads 3"
+echo "Update later: bash $PI_ROOT/update.sh"

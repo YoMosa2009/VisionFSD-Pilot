@@ -58,10 +58,18 @@ The Raspberry Pi version is a **separate, low-resource installation** in
 the desktop application depends on Intel OpenVINO GPU and several perception
 models that are intentionally not part of the Pi runtime.
 
-The Pi runtime uses a small quantized TFLite detector, keeps only the newest
-camera frame, and displays **one sticky selected car** in its camera and
-low-cost world views. It is still read-only visualization software and never
-controls a vehicle.
+The Pi runtime uses a hash-verified **EfficientDet-Lite0 INT8** TFLite detector
+with automatic SSD-MobileNetV1 fallback, keeps only the newest camera frame,
+and displays **one confirmed, sticky lead vehicle maximum** in
+both its camera and low-cost world views. It prefers a visibly near ego-lane
+vehicle, then falls back to one near adjacent-lane vehicle. Tiny horizon boxes,
+duplicate vehicle-class hypotheses, and unstable ID/class changes are filtered
+with lightweight temporal evidence. Front/left/right placement uses sticky
+lane voting. Its world view can also show confirmed pedestrians, traffic
+lights, and stop signs; pedestrians must pass stricter confidence, shape,
+vehicle-overlap, and four-frame confirmation gates. These never appear in the
+camera view. It is still read-only visualization software and never controls
+a vehicle.
 
 On a networked Raspberry Pi 3B running **64-bit** Raspberry Pi OS, install
 everything with:
@@ -71,22 +79,34 @@ curl -fsSL https://raw.githubusercontent.com/YoMosa2009/VisionFSD-Pilot/main/pi3
 ```
 
 The installer creates `~/visionfsd-pi`, installs the Pi-only dependencies,
-downloads the verified TFLite model, and verifies its SHA-256. Then start it:
+downloads the verified neural models, and verifies their SHA-256 values. Then
+start it:
 
 ```bash
-~/visionfsd-pi/pi3b/run.sh --camera 0 --fps 25
+~/visionfsd-pi/pi3b/run.sh --camera 0 --fps 25 --threads 3
 ```
 
-To update an existing Pi installation after later releases:
+To update an existing Pi installation (it remembers the Pi release branch):
 
 ```bash
-~/visionfsd-pi/pi3b/update.sh
+cd ~/visionfsd-pi && bash ./pi3b/update.sh
 ```
 
-Use `--fps 30` only after the Pi's sustained benchmark proves it can maintain
-that rate without thermal throttling. The HUD reports display FPS and detector
-FPS separately. See [`pi3b/README.md`](pi3b/README.md) for camera, model, and
-benchmark details.
+If an older updater aborts because local changes would be overwritten, recover
+it once without deleting those edits:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/YoMosa2009/VisionFSD-Pilot/codex/pi3b-runtime/pi3b/recover-update.sh | bash
+```
+
+After recovery, the normal update command above works for later releases.
+
+The Pi 3B preset targets a 25 FPS display using newest-frame asynchronous
+inference, one OpenCV worker, and three LiteRT threads. The HUD reports display
+FPS and detector FPS separately; 25 FPS inference is not claimed without a
+sustained physical-Pi benchmark. The HUD also shows the installed Pi runtime
+version and active detector.
+See [`pi3b/README.md`](pi3b/README.md) for camera, model, and benchmark details.
 
 ### Controls
 
