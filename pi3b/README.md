@@ -13,18 +13,27 @@ for modern Pi OS/Python 3.13; the obsolete `tflite-runtime` package does not.
 
 ## Runtime contract
 
-The included `models/vehicle_ssd_mobilenet_v1.tflite` is a 4.2 MB quantized
-SSD MobileNet V1 COCO detector. It keeps only one sticky **lead vehicle**
+The primary neural detector is the official 4.6 MB quantized
+**EfficientDet-Lite0 INT8** COCO model. The installer/updater downloads it from
+TensorFlow Hub, verifies its pinned SHA-256, and keeps the included 4.2 MB
+SSD-MobileNetV1 INT8 model as an automatic startup fallback. The active model
+is named in the camera HUD and benchmark report.
+
+The shared detector pass handles vehicles, pedestrians, traffic lights, and
+stop signs without adding a second inference model. It keeps only one sticky
+**lead vehicle**
 (car, motorcycle, bus, or truck) in both the camera and world views. Lead
 selection prefers a visibly near vehicle inside the detected ego lane; only
 when no such vehicle exists can one near left/right-lane vehicle become the
 target. Tiny horizon vehicles are rejected before tracking. Semantic vehicle
 NMS, scale-aware ID association, and temporal class evidence reduce duplicate
-cars, ID jumps, and car/bus/truck classification flicker. A vehicle requires
-two consecutive detections before it becomes the lead. The world view can also
-show confirmed pedestrians, traffic lights, and stop signs; those scene objects
-use class-specific confidence gates, require three or four consecutive hits,
-and disappear after two misses. Those extras never clutter the camera view.
+cars, ID jumps, and car/bus/truck classification flicker. Temporal lane voting
+requires sustained evidence before an existing target moves between front,
+left, and right. A vehicle requires two consecutive detections before it
+becomes the lead. The world view can also show confirmed pedestrians, traffic
+lights, and stop signs. Pedestrians require four consecutive high-confidence,
+human-shaped boxes; boxes mostly contained inside vehicles are rejected. Scene
+objects disappear after two misses. Those extras never clutter the camera view.
 This immediately makes the Pi
 folder runnable. The desktop repository's OpenVINO/PyTorch artifacts are not
 Pi runtime artifacts. `tools/export_pi_tflite.py` remains available for a
@@ -40,8 +49,10 @@ The one-command deployment shape is:
 curl -fsSL https://raw.githubusercontent.com/YoMosa2009/VisionFSD-Pilot/main/pi3b/install.sh | bash
 ```
 
-The installer downloads the same model from TensorFlow's storage and verifies
-its SHA-256. A custom HTTPS model can be supplied only with its SHA-256.
+The installer verifies both model downloads by SHA-256. The optional
+`--model-url`/`--model-sha256` pair customizes only the SSD fallback; the
+EfficientDet primary stays pinned unless its dedicated environment variables
+are explicitly changed.
 It intentionally does not require the optional `libatlas-base-dev` package,
 which is unavailable on some current Raspberry Pi OS package sources.
 
@@ -69,7 +80,9 @@ updates can then use `bash ~/visionfsd-pi/pi3b/update.sh`.
 cd pi3b
 python3 -m venv --system-site-packages .venv
 .venv/bin/pip install -r requirements.txt
-.venv/bin/python visionfsd_pi.py --camera 0 --model models/vehicle_ssd_mobilenet_v1.tflite
+bash ./sync_primary_model.sh
+.venv/bin/python visionfsd_pi.py --camera 0 --model models/vehicle_efficientdet_lite0_int8.tflite \
+  --fallback-model models/vehicle_ssd_mobilenet_v1.tflite
 ```
 
 The bottom of every visual screen has large touchscreen controls: **Quit**,
@@ -87,16 +100,19 @@ measurement.
 ## Performance
 
 `--fps 25` is the Pi 3B display target; `20` remains available for thermally or
-power-limited installations. The HUD reports display and detection FPS
+power-limited installations. Detector work stays in a newest-frame background
+worker, so a slower neural pass cannot queue old frames or deliberately lower
+camera/display resolution. The HUD reports display and detection FPS
 separately: a 25 FPS display is not claimed as 25 FPS inference. Acceptance
 requires a sustained Pi benchmark with no thermal throttling. If CPU inference
 does not sustain the goal after input/model tuning, add a USB accelerator.
 
 The default three LiteRT threads are the first performance candidate on the
 Pi's four-core CPU, while OpenCV remains single-threaded. All scene classes
-reuse the same detector result. Input and output tensor access avoids redundant
-copies, the 256 px lane pass runs in a single-slot background worker, and split
-view renders 44% fewer pixels without changing the 640x480 detector input.
+reuse the same EfficientDet result. Input and output tensor access avoids
+redundant copies, the 25-result EfficientDet postprocessor is bounded, the
+256 px lane pass runs in a single-slot background worker, and split view
+renders 44% fewer pixels without changing the 640x480 camera input.
 Missed display deadlines reset immediately instead of burst-rendering catch-up
 frames. Do not claim 25 FPS **detection** unless the HUD's `DETECT` rate reaches
 it during a sustained physical-Pi run.

@@ -108,6 +108,21 @@ class PiCoreTests(unittest.TestCase):
         self.assertEqual(target.detection.box, farther_ego.box)
         self.assertEqual(target.lane_slot, 0)
 
+    def test_lane_slot_resists_short_boundary_jitter(self) -> None:
+        selector = TargetSelector(70.0)
+        lane = LaneEstimate(0.25, 0.75, 0.50, True, 0.0, 0.44, 0.56, 0.90)
+        ego = Detection("car", 0.90, (350, 170, 490, 440))
+        noisy_right = Detection("car", 0.90, (430, 170, 570, 440))
+        for step in range(3):
+            target = selector.update([ego], 640, 1.0 + step * 0.05, 480, lane)
+        self.assertIsNotNone(target)
+        self.assertEqual(target.lane_slot, 0)
+        for step in range(2):
+            target = selector.update([noisy_right], 640, 1.2 + step * 0.05, 480, lane)
+            self.assertEqual(target.lane_slot, 0)
+        target = selector.update([noisy_right], 640, 1.3, 480, lane)
+        self.assertEqual(target.lane_slot, 1)
+
     def test_vehicle_label_voting_resists_one_frame_class_jitter(self) -> None:
         selector = TargetSelector(70.0)
         car = Detection("car", 0.84, (275, 160, 365, 420))
@@ -238,7 +253,8 @@ class PiCoreTests(unittest.TestCase):
         person = Detection("person", 0.90, (280, 140, 330, 430))
         self.assertEqual(tracker.update([person], 640, 1.0), [])
         self.assertEqual(tracker.update([person], 640, 1.1), [])
-        confirmed = tracker.update([person], 640, 1.2)
+        self.assertEqual(tracker.update([person], 640, 1.2), [])
+        confirmed = tracker.update([person], 640, 1.3)
         self.assertEqual(len(confirmed), 1)
         self.assertEqual(confirmed[0].detection.label, "person")
 
@@ -254,9 +270,10 @@ class PiCoreTests(unittest.TestCase):
         person = Detection("person", 0.90, (280, 140, 330, 430))
         tracker.update([person], 640, 1.0)
         tracker.update([person], 640, 1.1)
-        self.assertEqual(len(tracker.update([person], 640, 1.2)), 1)
-        self.assertEqual(len(tracker.update([], 640, 1.28)), 1)
-        self.assertEqual(tracker.update([], 640, 1.36), [])
+        tracker.update([person], 640, 1.2)
+        self.assertEqual(len(tracker.update([person], 640, 1.3)), 1)
+        self.assertEqual(len(tracker.update([], 640, 1.38)), 1)
+        self.assertEqual(tracker.update([], 640, 1.46), [])
 
     def test_low_confidence_sign_never_confirms(self) -> None:
         tracker = SceneObjectTracker(70.0)
@@ -266,12 +283,32 @@ class PiCoreTests(unittest.TestCase):
 
     def test_moving_person_uses_centre_distance_match(self) -> None:
         tracker = SceneObjectTracker(70.0)
-        boxes = ((260, 140, 310, 430), (275, 140, 325, 430), (290, 140, 340, 430))
+        boxes = (
+            (250, 140, 300, 430), (265, 140, 315, 430),
+            (280, 140, 330, 430), (295, 140, 345, 430),
+        )
         result = []
         for step, box in enumerate(boxes):
             result = tracker.update([Detection("person", 0.90, box)], 640, 1.0 + step * 0.08)
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0].track_id, 1)
+
+    def test_wide_person_false_positive_never_confirms(self) -> None:
+        tracker = SceneObjectTracker(70.0)
+        false_person = Detection("person", 0.96, (190, 260, 450, 410))
+        for step in range(6):
+            self.assertEqual(
+                tracker.update([false_person], 640, 1.0 + step * 0.05, 480), []
+            )
+
+    def test_person_box_mostly_inside_vehicle_is_suppressed(self) -> None:
+        tracker = SceneObjectTracker(70.0)
+        vehicle = Detection("car", 0.88, (190, 180, 470, 450))
+        false_person = Detection("person", 0.92, (270, 210, 350, 430))
+        for step in range(6):
+            self.assertEqual(
+                tracker.update([vehicle, false_person], 640, 1.0 + step * 0.05, 480), []
+            )
 
     def test_low_cost_lane_detector_requires_and_finds_a_pair(self) -> None:
         frame = np.zeros((480, 640, 3), dtype=np.uint8)

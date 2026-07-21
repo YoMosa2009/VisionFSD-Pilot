@@ -38,7 +38,8 @@ chmod +x \
   "$PI_ROOT/install.sh" \
   "$PI_ROOT/run.sh" \
   "$PI_ROOT/update.sh" \
-  "$PI_ROOT/recover-update.sh"
+  "$PI_ROOT/recover-update.sh" \
+  "$PI_ROOT/sync_primary_model.sh"
 
 if [[ ! -x "$PI_ROOT/.venv/bin/python" ]]; then
   echo "Pi virtual environment is missing. Re-run pi3b/install.sh." >&2
@@ -56,6 +57,7 @@ if [[ "$old_requirements" != "$new_requirements" || "$dependencies_ok" != true ]
 else
   echo "Python requirements unchanged; skipping package download."
 fi
+bash "$PI_ROOT/sync_primary_model.sh" "$PI_ROOT"
 printf '%s\n' "$REF" > "$REF_FILE"
 version="$(tr -d '\r\n' < "$PI_ROOT/VERSION")"
 echo "Updated VisionFSD Pi to v$version from $REF"

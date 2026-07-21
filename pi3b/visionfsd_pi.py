@@ -13,6 +13,7 @@ import math
 import platform
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -32,9 +33,9 @@ MIN_TARGET_WIDTH_NORM = 0.035
 MIN_TARGET_HEIGHT_NORM = 0.055
 MIN_TARGET_BOTTOM_NORM = 0.42
 
-# The bundled SSD MobileNet labelmap is zero-based.  Keep this intentionally
-# small: decoding these classes costs no extra model inference, while avoiding
-# clutter and false visual objects from the full 90-class COCO labelmap.
+# Both pinned LiteRT detectors use the zero-based COCO label map. Keep this
+# intentionally small: decoding these classes costs no extra model inference,
+# while avoiding clutter from the full 90-class label map.
 SUPPORTED_COCO_LABELS = {
     0: "person",
     2: "car",
@@ -61,12 +62,12 @@ DISPLAY_LABELS = {
     "stop_sign": "STOP",
 }
 SCENE_MIN_CONFIDENCE = {
-    "person": 0.48,
+    "person": 0.64,
     "traffic_light": 0.56,
     "stop_sign": 0.60,
 }
 SCENE_CONFIRM_HITS = {
-    "person": 3,
+    "person": 4,
     "traffic_light": 4,
     "stop_sign": 4,
 }
@@ -144,6 +145,33 @@ def box_iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float
     return inter / float(area_a + area_b - inter)
 
 
+def box_coverage(inner: tuple[int, int, int, int], outer: tuple[int, int, int, int]) -> float:
+    """Return how much of ``inner`` is covered by ``outer``."""
+    left, top = max(inner[0], outer[0]), max(inner[1], outer[1])
+    right, bottom = min(inner[2], outer[2]), min(inner[3], outer[3])
+    intersection = max(0, right - left) * max(0, bottom - top)
+    inner_area = max(1, inner[2] - inner[0]) * max(1, inner[3] - inner[1])
+    return intersection / float(inner_area)
+
+
+def is_plausible_person(detection: Detection, frame_width: int, frame_height: int,
+                        vehicles: list[Detection]) -> bool:
+    """Reject common COCO person false positives before temporal tracking."""
+    x1, y1, x2, y2 = detection.box
+    width = max(0, x2 - x1)
+    height = max(0, y2 - y1)
+    if width < 3 or height < 3:
+        return False
+    aspect = width / float(height)
+    height_norm = height / max(1.0, float(frame_height))
+    bottom_norm = y2 / max(1.0, float(frame_height))
+    if not (0.16 <= aspect <= 0.95 and height_norm >= 0.12 and bottom_norm >= 0.40):
+        return False
+    # COCO detectors sometimes classify a window, grille, or reflection inside
+    # a vehicle as a person. A majority-contained person box is suppressed.
+    return all(box_coverage(detection.box, vehicle.box) < 0.55 for vehicle in vehicles)
+
+
 def smooth_box(previous: tuple[int, int, int, int], current: tuple[int, int, int, int],
                measurement_weight: float = 0.62) -> tuple[int, int, int, int]:
     """Low-cost box smoothing that reduces detector jitter without prediction."""
@@ -216,6 +244,14 @@ class TFLiteVehicleDetector:
         self._output_accessors = [self._interpreter.tensor(item["index"]) for item in self._outputs]
         self._resize_scratch = np.empty((self._input_h, self._input_w, 3), dtype=np.uint8)
         self.last_timing_ms = (0.0, 0.0, 0.0)
+        lowered_name = model_path.stem.lower()
+        if "efficientdet" in lowered_name:
+            self.model_name = "EfficientDet-Lite0 INT8"
+        elif "ssd_mobilenet" in lowered_name:
+            self.model_name = "SSD-MobileNetV1 INT8"
+        else:
+            self.model_name = model_path.stem
+        self.model_path = model_path
 
     @staticmethod
     def _dequantize(array: np.ndarray, detail: dict) -> np.ndarray:
@@ -498,7 +534,7 @@ def lane_position(detection: Detection, frame_width: int, frame_height: int,
         lane_width = right - left
         if lane_width >= 0.08:
             offset = (centre_x - (left + right) * 0.5) / lane_width
-            slot = 0 if abs(offset) <= 0.58 else int(np.clip(round(offset), -2, 2))
+            slot = 0 if abs(offset) <= 0.58 else (-1 if offset < 0 else 1)
             return slot, float(np.clip(offset, -2.0, 2.0)), True
     heading = bearing_deg(detection.box, frame_width, fov_deg)
     offset = heading / 16.0
@@ -515,6 +551,7 @@ class _Track:
     hits: int
     lane_slot: int
     lane_offset: float
+    lane_scores: dict[int, float]
     label_scores: dict[str, float]
     hit_streak: int
     misses: int
@@ -579,7 +616,7 @@ class TargetSelector:
                 continue
             track_id = self._match(detection, seen)
             heading = bearing_deg(detection.box, frame_width, self._fov_deg)
-            lane_slot, lane_offset, _lane_based = lane_position(
+            lane_slot, lane_offset, lane_based = lane_position(
                 detection, frame_width, frame_height, self._fov_deg, lane
             )
             if track_id is None:
@@ -590,7 +627,8 @@ class TargetSelector:
                                             OBJECT_WIDTH_M[detection.label])
                 self._tracks[track_id] = _Track(
                     detection, distance, heading, now, 1, lane_slot, lane_offset,
-                    label_scores, 1, 0, detection.confidence, False,
+                    {lane_slot: detection.confidence}, label_scores,
+                    1, 0, detection.confidence, False,
                 )
             else:
                 previous = self._tracks[track_id]
@@ -618,15 +656,28 @@ class TargetSelector:
                 distance = estimate_range_m(stable_detection.box, frame_width, self._fov_deg,
                                             OBJECT_WIDTH_M[stable_label])
                 smoothed_offset = previous.lane_offset * 0.68 + lane_offset * 0.32
-                if previous.lane_slot == 0:
-                    smoothed_slot = (
-                        0 if abs(smoothed_offset) <= 0.68
-                        else int(np.clip(round(smoothed_offset), -2, 2))
-                    )
-                elif abs(smoothed_offset) <= 0.46:
-                    smoothed_slot = 0
+                lane_scores = {
+                    slot: score * 0.72 for slot, score in previous.lane_scores.items()
+                    if score * 0.72 >= 0.05
+                }
+                evidence_weight = 1.0 if lane_based else 0.65
+                lane_scores[lane_slot] = (
+                    lane_scores.get(lane_slot, 0.0) + detection.confidence * evidence_weight
+                )
+                best_slot = max(lane_scores, key=lane_scores.get)
+                current_score = lane_scores.get(previous.lane_slot, 0.0)
+                # Require accumulated lane evidence to beat the incumbent by a
+                # clear margin. One noisy lane boundary cannot move a car from
+                # front to side (or back) in the world view.
+                smoothed_slot = previous.lane_slot
+                if lane_scores[best_slot] >= current_score + 0.55:
+                    smoothed_slot = best_slot
+                if smoothed_slot == 0:
+                    smoothed_offset = float(np.clip(smoothed_offset, -0.55, 0.55))
+                elif smoothed_slot < 0:
+                    smoothed_offset = min(smoothed_offset, -0.62)
                 else:
-                    smoothed_slot = int(np.clip(round(smoothed_offset), -2, 2))
+                    smoothed_offset = max(smoothed_offset, 0.62)
                 self._tracks[track_id] = _Track(
                     stable_detection,
                     previous.distance_m * 0.70 + distance * 0.30,
@@ -635,6 +686,7 @@ class TargetSelector:
                     previous.hits + 1,
                     smoothed_slot,
                     smoothed_offset,
+                    lane_scores,
                     label_scores,
                     hit_streak,
                     0,
@@ -779,12 +831,19 @@ class SceneObjectTracker:
         score, track_id = max(choices)
         return track_id if score >= 0.45 else None
 
-    def update(self, detections: list[Detection], frame_width: int, now: float) -> list[SceneObject]:
+    def update(self, detections: list[Detection], frame_width: int, now: float,
+               frame_height: int | None = None) -> list[SceneObject]:
+        frame_height = frame_height or int(frame_width * 0.75)
+        vehicles = [item for item in detections if item.label in VEHICLE_LABELS]
         seen: set[int] = set()
         for detection in detections:
             if detection.label not in WORLD_ONLY_LABELS:
                 continue
             if detection.confidence < SCENE_MIN_CONFIDENCE[detection.label]:
+                continue
+            if detection.label == "person" and not is_plausible_person(
+                detection, frame_width, frame_height, vehicles
+            ):
                 continue
             track_id = self._match(detection, seen)
             distance = estimate_range_m(detection.box, frame_width, self._fov_deg,
@@ -1016,8 +1075,9 @@ class AsyncLaneDetector:
 
 
 class Rates:
-    def __init__(self) -> None:
+    def __init__(self, detector_name: str = "detector") -> None:
         self.started = time.perf_counter()
+        self.detector_name = detector_name
         self.display_frames = 0
         self.detections = 0
         self.capture_latency_ms = 0.0
@@ -1099,7 +1159,7 @@ def _camera_panel(frame: np.ndarray, target: Target | None, rates: Rates, error:
                 cv2.FONT_HERSHEY_SIMPLEX, 0.48, (230, 235, 240), 1, cv2.LINE_AA)
     cv2.putText(panel, f"latency {stats['end_to_end_latency_ms']:.0f}ms  infer {stats['last_inference_ms']:.0f}ms", (8, 39),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.42, (175, 190, 205), 1, cv2.LINE_AA)
-    cv2.putText(panel, f"VERSION {RUNTIME_VERSION}", (8, 59),
+    cv2.putText(panel, f"VERSION {RUNTIME_VERSION}  |  {rates.detector_name}", (8, 59),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.38, (135, 195, 225), 1, cv2.LINE_AA)
     if error:
         cv2.putText(panel, error[:75], (8, panel.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (40, 70, 255), 1, cv2.LINE_AA)
@@ -1367,7 +1427,10 @@ def draw_touch_controls(panel: np.ndarray) -> list[TouchButton]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Read-only, single-target Pi 3B vehicle visualizer")
     parser.add_argument("--camera", default="0", help="V4L2 camera index or local video path")
-    parser.add_argument("--model", type=Path, default=PROJECT_ROOT / "models/vehicle_ssd_mobilenet_v1.tflite")
+    parser.add_argument("--model", type=Path,
+                        default=PROJECT_ROOT / "models/vehicle_efficientdet_lite0_int8.tflite")
+    parser.add_argument("--fallback-model", type=Path,
+                        default=PROJECT_ROOT / "models/vehicle_ssd_mobilenet_v1.tflite")
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--fps", type=int, choices=(20, 25, 30), default=25)
@@ -1391,13 +1454,22 @@ def main() -> int:
     # tiny at 640x480, but unrestricted worker pools can still starve inference.
     cv2.setNumThreads(1)
     cv2.setUseOptimized(True)
-    detector = TFLiteVehicleDetector(args.model, args.confidence, args.threads)
+    try:
+        detector = TFLiteVehicleDetector(args.model, args.confidence, args.threads)
+    except Exception as primary_error:
+        if args.fallback_model == args.model or not args.fallback_model.is_file():
+            raise
+        print(
+            f"Primary detector unavailable ({primary_error}); using verified SSD fallback.",
+            file=sys.stderr,
+        )
+        detector = TFLiteVehicleDetector(args.fallback_model, args.confidence, args.threads)
     camera = LatestCamera(args.camera, args.width, args.height, args.fps)
     worker = AsyncDetector(detector)
     selector = TargetSelector(args.fov)
     scene_tracker = SceneObjectTracker(args.fov)
     lane_worker = AsyncLaneDetector()
-    rates = Rates()
+    rates = Rates(detector.model_name)
     last_camera_sequence = 0
     last_result_sequence = 0
     last_frame: np.ndarray | None = None
@@ -1436,7 +1508,10 @@ def main() -> int:
                     last_frame.shape[0], lane,
                 )
                 vehicles = selector.vehicles(result.completed_time)
-                scene_objects = scene_tracker.update(result.detections, last_frame.shape[1], result.completed_time)
+                scene_objects = scene_tracker.update(
+                    result.detections, last_frame.shape[1], result.completed_time,
+                    last_frame.shape[0],
+                )
                 last_result_sequence = result.sequence
                 rates.detections += 1
                 rates.inference_ms = result.inference_ms
@@ -1501,6 +1576,8 @@ def main() -> int:
         "requested_fps": args.fps,
         "litert_threads": args.threads,
         "detector_input": [detector._input_w, detector._input_h],
+        "detector_model": detector.model_name,
+        "detector_path": str(detector.model_path),
     }
     report["camera"] = camera.negotiated
     report["runtime"] = runtime_diagnostics()

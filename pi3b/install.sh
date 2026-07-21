@@ -73,7 +73,9 @@ chmod +x \
   "$PI_ROOT/install.sh" \
   "$PI_ROOT/run.sh" \
   "$PI_ROOT/update.sh" \
-  "$PI_ROOT/recover-update.sh"
+  "$PI_ROOT/recover-update.sh" \
+  "$PI_ROOT/sync_primary_model.sh"
+bash "$PI_ROOT/sync_primary_model.sh" "$PI_ROOT"
 version="$(tr -d '\r\n' < "$PI_ROOT/VERSION")"
 echo "Installed at $PI_ROOT"
 echo "VisionFSD Pi version: $version"
