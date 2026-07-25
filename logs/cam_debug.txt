@@ -1,0 +1,2 @@
+started ffmpeg pid=14560 device='icspring camera' 1280x720
+first frame published (2764800 bytes)

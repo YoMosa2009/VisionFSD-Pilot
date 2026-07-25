@@ -6,9 +6,8 @@ tracker_type: bytetrack
 track_high_thresh: 0.22
 track_low_thresh: 0.05
 new_track_thresh: 0.20
-# 24 (~3s @ ~7.5 Hz detect) is enough for re-id; longer buffers only grow
-# lost_stracks and were a contributor to the ~25–30s stutter kick.
+# Short buffer: longer values grow lost_stracks and cause 1–2 min stutter cliffs.
 # TrackStabilizer already holds display coast separately.
-track_buffer: 24
+track_buffer: 12
 match_thresh: 0.78
 fuse_score: true

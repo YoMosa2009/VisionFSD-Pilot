@@ -186,8 +186,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--imgsz", type=int, default=512,
                         help="Must match the exported OpenVINO model (yolo11n_openvino_model is 512)")
     parser.add_argument("--detect-interval", type=int, default=3,
-                        help="Run object tracking every N display frames (3 targets ~20+ display FPS)")
-    parser.add_argument("--road-interval", type=int, default=3,
+                        help="Run object tracking every N display frames (3 targets ≥25 display FPS)")
+    parser.add_argument("--road-interval", type=int, default=5,
                         help="Submit a road-inference frame every N display frames (async keeps newest)")
     parser.add_argument("--learned-road", action=argparse.BooleanOptionalAction, default=True,
                         help="Use YOLOPv2 learned drivable-area and lane segmentation")
@@ -199,16 +199,16 @@ def parse_args() -> argparse.Namespace:
                         help="OpenVINO IR for Depth Anything V2 Small")
     parser.add_argument("--depth-device", default="GPU",
                         help="OpenVINO device for depth (same iGPU as road/detect)")
-    parser.add_argument("--depth-interval", type=int, default=6,
-                        help="Submit a depth frame every N display frames (6 keeps ≥25 FPS on iGPU)")
+    parser.add_argument("--depth-interval", type=int, default=10,
+                        help="Submit a depth frame every N display frames (10 keeps ≥25 FPS on iGPU)")
     parser.add_argument("--ufld", action=argparse.BooleanOptionalAction, default=True,
                         help="Ultra-Fast Lane Detection for ego-path triangle (OpenVINO, throttled)")
     parser.add_argument("--ufld-model", default=str(DEFAULT_UFLD_MODEL),
                         help="OpenVINO IR for UFLD Tusimple ResNet18")
     parser.add_argument("--ufld-device", default="CPU",
                         help="OpenVINO device for UFLD (CPU default avoids iGPU lock thrash)")
-    parser.add_argument("--ufld-interval", type=int, default=20,
-                        help="Submit a UFLD frame every N display frames (20 keeps ≥25 FPS)")
+    parser.add_argument("--ufld-interval", type=int, default=22,
+                        help="Submit a UFLD frame every N display frames (22 keeps ≥25 FPS)")
     parser.add_argument("--cpu-threads", type=int, default=4)
     parser.add_argument("--fov", type=float, default=70.0)
     parser.add_argument("--camera-height", type=float, default=1.25,
@@ -324,6 +324,424 @@ class LatestVideoFrameReader:
         self._thread.join(timeout=3.0)
 
 
+def _list_dshow_video_devices() -> list[str]:
+    """Return DirectShow video device names in ffmpeg enumeration order."""
+    import re
+    import shutil
+    import subprocess
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return []
+    try:
+        proc = subprocess.run(
+            [ffmpeg, "-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=12, check=False,
+        )
+    except Exception:
+        return []
+    text = (proc.stderr or "") + "\n" + (proc.stdout or "")
+    names: list[str] = []
+    # "  \"icspring camera\" (video)"
+    for match in re.finditer(r'\"([^\"]+)\"\s*\(video\)', text, flags=re.IGNORECASE):
+        name = match.group(1).strip()
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def _resolve_dshow_camera_name(camera_index: int) -> str | None:
+    """Map OpenCV camera index → DirectShow friendly name when possible."""
+    names = _list_dshow_video_devices()
+    if not names:
+        return None
+    # Prefer known USB pilot webcam by name when index points at an external cam.
+    for name in names:
+        if "icspring" in name.lower():
+            if camera_index >= 1:
+                return name
+            break
+    if 0 <= camera_index < len(names):
+        return names[camera_index]
+    # Prefer an external USB-looking name if index is out of range.
+    for name in names:
+        lowered = name.lower()
+        if "surface" in lowered or "ir camera" in lowered:
+            continue
+        return name
+    return names[0]
+
+
+from webcam_capture_proc import LiveWebcamCapture
+
+
+def _open_live_webcam(
+    args: argparse.Namespace,
+    device_name: str | None,
+) -> tuple[object, str]:
+    """Open the USB webcam immediately before the live UI (not during model load)."""
+    print(
+        f"  Opening live webcam index {args.camera}"
+        + (f" ({device_name})" if device_name else "")
+        + f" @ {args.width}x{args.height}…",
+        flush=True,
+    )
+    try:
+        cap = LiveWebcamCapture(
+            camera_index=int(args.camera),
+            width=int(args.width),
+            height=int(args.height),
+            fps=int(args.fps),
+            device_name=device_name,
+        )
+        backend = getattr(cap, "backend", "live-opencv")
+        print(
+            f"  Live webcam ready: {cap.width}x{cap.height} backend={backend} "
+            f"(drop-to-newest thread).",
+            flush=True,
+        )
+        return cap, str(backend)
+    except Exception as exc:
+        print(f"  LiveWebcamCapture failed ({exc}); raw OpenCV fallback.", flush=True)
+    cap = cv2.VideoCapture(int(args.camera), cv2.CAP_DSHOW)
+    if not cap.isOpened():
+        cap = cv2.VideoCapture(int(args.camera))
+    try:
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    except Exception:
+        pass
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+    cap.set(cv2.CAP_PROP_FPS, args.fps)
+    try:
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    except Exception:
+        pass
+    return cap, "opencv-dshow-fallback"
+
+
+class FFmpegWebcamCapture:
+    """USB webcam via ffmpeg dshow + MJPEG with hard real-time frame dropping.
+
+    Critical latency rules:
+      * stderr must NOT be a pipe (unread stderr fills and freezes ffmpeg).
+      * Every read() drains the OS pipe and keeps only the newest full frame.
+      * Device-side buffer is tiny so dshow cannot queue "the past".
+    """
+
+    def __init__(self, device_name: str, width: int = 1280, height: int = 720,
+                 fps: int = 30) -> None:
+        import shutil
+        import subprocess
+
+        self.device_name = device_name
+        self.width = int(width)
+        self.height = int(height)
+        self.fps = max(1, int(fps))
+        self._frame_bytes = self.width * self.height * 3
+        self._proc: subprocess.Popen[bytes] | None = None
+        self._dropped_frames = 0
+        self._rx = bytearray()  # partial-frame reassembly buffer
+        self._primed: np.ndarray | None = None
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            raise FileNotFoundError("ffmpeg not found on PATH (required for MJPEG webcam capture)")
+        # Low-latency dshow MJPEG. Keep rtbuf tiny — large buffers = multi-second lag.
+        cmd = [
+            ffmpeg, "-hide_banner", "-loglevel", "quiet",
+            "-fflags", "nobuffer+discardcorrupt",
+            "-flags", "low_delay",
+            "-strict", "experimental",
+            "-probesize", "32",
+            "-analyzeduration", "0",
+            "-f", "dshow",
+            "-rtbufsize", "1024k",
+            "-thread_queue_size", "1",
+            "-video_size", f"{self.width}x{self.height}",
+            "-framerate", str(self.fps),
+            "-vcodec", "mjpeg",
+            "-i", f"video={device_name}",
+            "-an",
+            "-f", "rawvideo",
+            "-pix_fmt", "bgr24",
+            "-vsync", "0",
+            "-flush_packets", "1",
+            "-",
+        ]
+        creationflags = 0
+        if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW"):
+            creationflags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
+        self._proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            # CRITICAL: never PIPE stderr — an unread stderr buffer freezes ffmpeg
+            # and the video falls seconds behind real life.
+            stderr=subprocess.DEVNULL,
+            bufsize=0,
+            creationflags=creationflags,
+        )
+        if self._proc.stdout is None:
+            raise RuntimeError("ffmpeg webcam stdout pipe missing")
+        raw = self._read_one_frame(block=True)
+        if raw is None:
+            self.release()
+            raise RuntimeError(
+                f"ffmpeg did not produce frames from '{device_name}' "
+                f"at {self.width}x{self.height} MJPEG"
+            )
+        self._primed = self._bytes_to_bgr(raw)
+
+    def isOpened(self) -> bool:
+        return self._proc is not None and self._proc.poll() is None
+
+    def _stdout(self):
+        if self._proc is None:
+            return None
+        return self._proc.stdout
+
+    def _read_into_rx(self, *, block: bool, max_bytes: int) -> bool:
+        """Read from stdout into ``_rx``. Returns False on EOF/death."""
+        stream = self._stdout()
+        if stream is None:
+            return False
+        fd = stream.fileno()
+        if not block:
+            try:
+                os.set_blocking(fd, False)
+            except Exception:
+                pass
+        try:
+            chunk = stream.read(max_bytes)
+        except BlockingIOError:
+            chunk = b""
+        except Exception:
+            return False
+        finally:
+            if not block:
+                try:
+                    os.set_blocking(fd, True)
+                except Exception:
+                    pass
+        if chunk is None:
+            return False
+        if len(chunk) == 0:
+            # Non-blocking empty != EOF; blocking empty == EOF.
+            if block:
+                return False
+            return True
+        self._rx.extend(chunk)
+        return True
+
+    def _pop_newest_frame_from_rx(self) -> bytes | None:
+        """If ≥1 full frame is buffered, return the newest and drop older ones."""
+        fb = self._frame_bytes
+        if len(self._rx) < fb:
+            return None
+        full = len(self._rx) // fb
+        if full > 1:
+            # Drop all but the last complete frame (this is the live image).
+            self._dropped_frames += full - 1
+            del self._rx[: (full - 1) * fb]
+        raw = bytes(self._rx[:fb])
+        del self._rx[:fb]
+        return raw
+
+    def _read_one_frame(self, *, block: bool) -> bytes | None:
+        """Assemble one frame; if more arrived, keep only the newest."""
+        fb = self._frame_bytes
+        # First: non-blocking suck of anything already in the OS pipe.
+        self._read_into_rx(block=False, max_bytes=fb * 12)
+        newest = self._pop_newest_frame_from_rx()
+        if newest is not None:
+            # Drain any further data that arrived during reassembly.
+            for _ in range(8):
+                self._read_into_rx(block=False, max_bytes=fb * 12)
+                newer = self._pop_newest_frame_from_rx()
+                if newer is None:
+                    break
+                newest = newer
+            return newest
+        if not block:
+            return None
+        # Blocking path: wait until one full frame exists, then drain extras.
+        while len(self._rx) < fb:
+            if not self._read_into_rx(block=True, max_bytes=fb - len(self._rx)):
+                return None
+            if self._proc is not None and self._proc.poll() is not None and len(self._rx) < fb:
+                return None
+        # After the blocking fill, non-blocking drain may yield newer frames.
+        self._read_into_rx(block=False, max_bytes=fb * 16)
+        return self._pop_newest_frame_from_rx()
+
+    def _bytes_to_bgr(self, raw: bytes) -> np.ndarray:
+        return np.frombuffer(raw, dtype=np.uint8).reshape(
+            (self.height, self.width, 3)
+        ).copy()
+
+    def read(self) -> tuple[bool, np.ndarray | None]:
+        """Return the *newest* complete frame; drop any pipe backlog."""
+        if self._primed is not None:
+            # Prefer a newer frame if the pipe already moved on during startup.
+            raw = self._read_one_frame(block=False)
+            if raw is not None:
+                self._primed = None
+                return True, self._bytes_to_bgr(raw)
+            frame = self._primed
+            self._primed = None
+            return True, frame
+        if self._proc is None or self._proc.poll() is not None:
+            raw = self._read_one_frame(block=False)
+            if raw is None:
+                return False, None
+            return True, self._bytes_to_bgr(raw)
+        raw = self._read_one_frame(block=True)
+        if raw is None:
+            return False, None
+        return True, self._bytes_to_bgr(raw)
+
+    def get(self, prop: int) -> float:
+        if prop == cv2.CAP_PROP_FRAME_WIDTH:
+            return float(self.width)
+        if prop == cv2.CAP_PROP_FRAME_HEIGHT:
+            return float(self.height)
+        if prop == cv2.CAP_PROP_FPS:
+            return float(self.fps)
+        if prop == cv2.CAP_PROP_FOURCC:
+            return float(cv2.VideoWriter_fourcc(*"MJPG"))
+        return 0.0
+
+    def set(self, _prop: int, _value: float) -> bool:
+        return False
+
+    def release(self) -> None:
+        proc = self._proc
+        self._proc = None
+        self._primed = None
+        self._rx.clear()
+        if proc is None:
+            return
+        try:
+            if proc.stdout is not None:
+                proc.stdout.close()
+        except Exception:
+            pass
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=1.0)
+        except Exception:
+            pass
+
+
+def _boost_current_thread_priority() -> None:
+    """Raise Windows thread priority so capture is not starved by OpenGL/YOLO."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        # THREAD_PRIORITY_HIGHEST = 2
+        kernel32.SetThreadPriority(kernel32.GetCurrentThread(), 2)
+    except Exception:
+        pass
+
+
+class LatestWebcamFrameReader:
+    """Capture USB webcam frames on a high-priority thread; expose only newest.
+
+    Never queues frames for the UI. If the main loop is busy, intermediate
+    camera frames are dropped so the next display sample is always live.
+    """
+
+    def __init__(
+        self,
+        cap: "cv2.VideoCapture | FFmpegWebcamCapture | ProcessWebcamCapture",
+    ) -> None:
+        self.cap = cap
+        self._condition = threading.Condition()
+        self._stop = False
+        self._failed = False
+        self._frame: np.ndarray | None = None
+        self._sequence = 0
+        self._capture_time = 0.0
+        self._drops = 0
+        self._thread = threading.Thread(target=self._run, name="visionfsd-webcam", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def _run(self) -> None:
+        _boost_current_thread_priority()
+        consecutive_fail = 0
+        while True:
+            with self._condition:
+                if self._stop:
+                    return
+            ok, frame = self.cap.read()
+            if not ok or frame is None:
+                consecutive_fail += 1
+                if consecutive_fail >= 30:
+                    with self._condition:
+                        self._failed = True
+                        self._condition.notify_all()
+                    return
+                time.sleep(0.0005)
+                continue
+            consecutive_fail = 0
+            now = time.perf_counter()
+            with self._condition:
+                # Overwrite only — if UI has not consumed the previous frame,
+                # it is discarded (live priority over completeness).
+                if self._frame is not None and self._sequence > 0:
+                    self._drops += 1
+                self._frame = frame
+                self._sequence += 1
+                self._capture_time = now
+                self._condition.notify_all()
+
+    def latest(
+        self,
+        after_sequence: int,
+        timeout: float = 0.0,
+    ) -> tuple[bool, np.ndarray | None, int, float]:
+        """Return the newest webcam frame immediately (timeout default 0).
+
+        Returns ``(ok, frame, sequence, capture_time)``. Never waits for "the
+        next" frame when one is already available — that wait was pure lag.
+        """
+        with self._condition:
+            if self._frame is not None:
+                # Always hand out absolute newest, even if sequence unchanged.
+                if self._sequence > after_sequence or timeout <= 0.0:
+                    return True, self._frame, self._sequence, self._capture_time
+            if timeout <= 0.0:
+                if self._frame is not None:
+                    return True, self._frame, self._sequence, self._capture_time
+                return False, None, after_sequence, 0.0
+            self._condition.wait_for(
+                lambda: self._sequence > after_sequence or self._failed or self._stop,
+                timeout=timeout,
+            )
+            if self._frame is not None:
+                return True, self._frame, self._sequence, self._capture_time
+            return False, None, after_sequence, 0.0
+
+    def stop(self) -> None:
+        with self._condition:
+            self._stop = True
+            self._condition.notify_all()
+        # Unblock a thread stuck in cap.read() by closing the device first.
+        try:
+            if hasattr(self.cap, "release"):
+                self.cap.release()
+        except Exception:
+            pass
+        self._thread.join(timeout=2.0)
+
+
 def _open_input(
     args: argparse.Namespace,
     status_cb: Callable[[str], None] | None = None,
@@ -339,13 +757,25 @@ def _open_input(
                 pass
 
     if not args.source:
-        cap = cv2.VideoCapture(args.camera, cv2.CAP_DSHOW)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
-        cap.set(cv2.CAP_PROP_FPS, args.fps)
-        # Keep a 1-frame buffer so we always grab the freshest webcam image.
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        return cap, False, {"kind": "camera", "camera": args.camera}
+        # CRITICAL: do NOT open the USB camera here. Models take 10–30s to load
+        # after this step; a live capture started early fills buffers and the UI
+        # can freeze on the first published frame. Camera opens just before the
+        # render loop (see main() deferred open).
+        device_name = _resolve_dshow_camera_name(int(args.camera))
+        _status(
+            f"Webcam deferred until UI ready "
+            f"(index={args.camera}, device={device_name!r})."
+        )
+        return None, False, {
+            "kind": "camera",
+            "camera": args.camera,
+            "device_name": device_name,
+            "backend": "deferred",
+            "deferred": True,
+            "width": int(args.width),
+            "height": int(args.height),
+            "fps": int(args.fps),
+        }
 
     original_source = args.source
     resolved_source = original_source
@@ -2613,7 +3043,7 @@ def _draw_stage_hud(viewport: tuple[int, int, int, int],
         f"STAGE ms  src {stage_ms.get('src', 0.0):.1f}  "
         f"ovl {stage_ms.get('ovl', 0.0):.1f}  "
         f"gl {stage_ms.get('gl', 0.0):.1f}  "
-        f"flip {stage_ms.get('flip', 0.0):.1f}  "
+        f"lag {stage_ms.get('lag', 0.0):.0f}  "
         f"road {stage_ms.get('road', 0.0):.1f}  "
         f"| sum {total:.0f}  |  {display_fps:.0f} FPS  det {detection_fps:.0f}"
     )
@@ -2912,6 +3342,13 @@ def main() -> int:
     SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
     cv2.setUseOptimized(True)
     cv2.setNumThreads(1)
+    # Raise GC thresholds so long sessions do not thrash every few seconds as
+    # detection churns temporary arrays (was a 1–2 minute stutter cliff).
+    try:
+        import gc
+        gc.set_threshold(2500, 20, 20)
+    except Exception:
+        pass
     # Leave spare cores for OpenVINO CPU UFLD + the render loop.
     cpu_budget = int(np.clip(args.cpu_threads, 1, 8))
     if args.ufld and str(args.ufld_device).upper() == "CPU":
@@ -2994,16 +3431,26 @@ def main() -> int:
         pygame.quit()
         return 2
     cap, video_mode, source_metadata = load_status["result"]  # type: ignore[misc]
-    if not cap.isOpened():
+    deferred_webcam = bool(source_metadata.get("deferred")) and not video_mode
+    if (not deferred_webcam) and (cap is None or not cap.isOpened()):
         print(f"Unable to open input source: {args.source if args.source else args.camera}.")
         pygame.quit()
         return 2
-    source_fps = float(cap.get(cv2.CAP_PROP_FPS)) if video_mode else 0.0
+    source_fps = float(cap.get(cv2.CAP_PROP_FPS)) if (video_mode and cap is not None) else 0.0
     if not np.isfinite(source_fps) or source_fps <= 0.0:
         source_fps = float(args.fps)
-    if video_mode:
+    if video_mode and cap is not None:
         actual_start = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
         print(f"  Video ready at {actual_start:.2f}s; source rate {source_fps:.2f} FPS.")
+    if deferred_webcam:
+        print("  Webcam will open after models load (keeps the live feed current).")
+
+    def _safe_release_cap() -> None:
+        if cap is not None:
+            try:
+                cap.release()
+            except Exception:
+                pass
 
     print("  2/3 Object model...")
     ok, model, model_err = _run_while_loading(
@@ -3015,14 +3462,43 @@ def main() -> int:
         phases=4,
     )
     if not ok:
-        cap.release()
+        _safe_release_cap()
         pygame.quit()
         return 0
     if model_err is not None:
-        cap.release()
+        _safe_release_cap()
         print(f"Unable to load model '{args.model}': {model_err}")
         pygame.quit()
         return 3
+
+    # Warm OpenVINO/YOLO compile during the loading screen so the first real
+    # track() in the main loop does not stall detection for tens of seconds.
+    def _warm_object_model() -> None:
+        dummy = np.zeros((max(64, args.height), max(64, args.width), 3), dtype=np.uint8)
+        try:
+            model.predict(
+                dummy, imgsz=args.imgsz, device=args.device,
+                verbose=False, conf=0.25,
+            )
+        except Exception:
+            # Warmup is best-effort; live track() will still compile if needed.
+            pass
+
+    ok, _, warm_err = _run_while_loading(
+        load_display,
+        "2/4 Warming object model…",
+        "OpenVINO first-compile",
+        _warm_object_model,
+        phase=2,
+        phases=4,
+    )
+    if not ok:
+        _safe_release_cap()
+        pygame.quit()
+        return 0
+    if warm_err is not None:
+        print(f"  Object model warmup skipped: {warm_err}")
+
     object_perception = AsyncObjectPerception(
         model, args.confidence, args.imgsz, args.device, args.fov,
         args.camera_height, args.horizon_ratio,
@@ -3050,7 +3526,7 @@ def main() -> int:
             phases=4,
         )
         if not ok:
-            cap.release()
+            _safe_release_cap()
             pygame.quit()
             return 0
         if road_err is not None:
@@ -3077,7 +3553,7 @@ def main() -> int:
             phases=4,
         )
         if not ok:
-            cap.release()
+            _safe_release_cap()
             pygame.quit()
             return 0
         if depth_err is not None:
@@ -3105,7 +3581,7 @@ def main() -> int:
             phases=4,
         )
         if not ok:
-            cap.release()
+            _safe_release_cap()
             pygame.quit()
             return 0
         if ufld_err is not None:
@@ -3116,7 +3592,7 @@ def main() -> int:
             print("  UFLD ego-path lanes ready.")
 
     if not _pump_loading(load_display, "3/4 Starting 3D renderer…", "OpenGL init", phase=3, phases=4):
-        cap.release()
+        _safe_release_cap()
         pygame.quit()
         return 0
     print("  3/3 Opening OpenGL display...")
@@ -3197,9 +3673,11 @@ def main() -> int:
     _maint_phase = 0
     _last_gc1 = 0.0
     video_reader: LatestVideoFrameReader | None = None
+    webcam_reader: LatestWebcamFrameReader | None = None
     initial_video_frame: np.ndarray | None = None
     last_display_frame: np.ndarray | None = None
     video_sequence = 0
+    webcam_sequence = 0
     test_started: float | None = None
     test_frame_start = 0
     last_time = time.perf_counter()
@@ -3212,13 +3690,53 @@ def main() -> int:
     # Live EMA stage budget (ms) — always on for the STAGE HUD strip.
     stage_ms: dict[str, float] = {
         "src": 0.0, "ovl": 0.0, "gl": 0.0, "flip": 0.0, "road": 0.0,
-        "depth": 0.0, "ufld": 0.0, "tick": 0.0,
+        "depth": 0.0, "ufld": 0.0, "tick": 0.0, "lag": 0.0,
     }
     clock = pygame.time.Clock()
     running = True
     cached_camera_overlay: np.ndarray | None = None
+    last_webcam_seq = -1
+    webcam_stall_frames = 0
+    # Open webcam ONLY now — after models + GL — so the first displayed frame
+    # is current real life, not a frame buffered during a 20s load.
+    if not video_mode:
+        device_name = source_metadata.get("device_name")
+        if isinstance(device_name, str) or device_name is None:
+            pass
+        else:
+            device_name = str(device_name) if device_name else None
+        try:
+            cap, backend_label = _open_live_webcam(
+                args,
+                str(source_metadata["device_name"])
+                if source_metadata.get("device_name") else None,
+            )
+            source_metadata["backend"] = backend_label
+            source_metadata["deferred"] = False
+        except Exception as exc:
+            print(f"Unable to open live webcam: {exc}")
+            pygame.quit()
+            return 2
+        if cap is None or not cap.isOpened():
+            print(f"Unable to open camera {args.camera}.")
+            pygame.quit()
+            return 2
+        # Warm a couple of frames so MJPEG settles, then take the newest.
+        for _ in range(5):
+            ok0, fr0 = cap.read()
+            if ok0 and fr0 is not None:
+                last_display_frame = fr0.copy()
+        if last_display_frame is None:
+            print("Webcam produced no frames.")
+            try:
+                cap.release()
+            except Exception:
+                pass
+            pygame.quit()
+            return 2
+        print("  Live webcam online — display will upload a fresh frame every tick.")
     print("Ready. 1 world; 2 camera; 3 split; V cycle; L lanes; S screenshot; F fullscreen; Q/Esc quits.")
-    print("Stage HUD: src/ovl/gl/flip/road ms (top bar).")
+    print("Stage HUD: src/ovl/gl/lag/road ms (top bar). Target ≥25 FPS + live video.")
     while running:
         measure_stages = test_started is not None
         # Always pump the event queue first so Windows never marks us hung.
@@ -3249,7 +3767,68 @@ def main() -> int:
         if not running:
             break
         source_started = time.perf_counter()
-        if video_reader is not None:
+        capture_stamp = 0.0
+        if not video_mode and cap is not None:
+            # Newest frame only; LiveWebcamCapture never blocks on USB here.
+            ok, frame = cap.read()
+            if ok and frame is not None:
+                frame = np.ascontiguousarray(frame)
+                last_display_frame = frame
+                capture_stamp = time.perf_counter()
+                cur_seq = int(getattr(cap, "sequence", getattr(cap, "_last_seq", -1)))
+                if cur_seq >= 0:
+                    if cur_seq == last_webcam_seq:
+                        webcam_stall_frames += 1
+                    else:
+                        webcam_stall_frames = 0
+                        last_webcam_seq = cur_seq
+                    # ~1s with no new camera sequence → hard restart capture.
+                    if webcam_stall_frames >= 30:
+                        print(
+                            f"Webcam frozen at seq={cur_seq} — restarting capture…",
+                            flush=True,
+                        )
+                        try:
+                            cap.release()
+                        except Exception:
+                            pass
+                        try:
+                            cap, backend_label = _open_live_webcam(
+                                args,
+                                str(source_metadata.get("device_name") or "") or None,
+                            )
+                            source_metadata["backend"] = backend_label
+                            webcam_stall_frames = 0
+                            last_webcam_seq = -1
+                            ok2, frame2 = cap.read()
+                            if ok2 and frame2 is not None:
+                                frame = np.ascontiguousarray(frame2)
+                                last_display_frame = frame
+                        except Exception as exc:
+                            print(f"Webcam restart failed: {exc}", flush=True)
+            elif last_display_frame is not None:
+                # Do not hold a dead frame forever — count as stall too.
+                webcam_stall_frames += 1
+                ok, frame = True, last_display_frame
+                if webcam_stall_frames >= 30:
+                    print("Webcam read failed repeatedly — restarting capture…", flush=True)
+                    try:
+                        cap.release()
+                    except Exception:
+                        pass
+                    try:
+                        cap, backend_label = _open_live_webcam(
+                            args,
+                            str(source_metadata.get("device_name") or "") or None,
+                        )
+                        source_metadata["backend"] = backend_label
+                        webcam_stall_frames = 0
+                        last_webcam_seq = -1
+                    except Exception as exc:
+                        print(f"Webcam restart failed: {exc}", flush=True)
+            else:
+                ok, frame = False, None
+        elif video_reader is not None:
             # Short wait (~1 source frame). On timeout re-show last decoded frame
             # instead of stalling the whole UI (was up to 2.0 s).
             ok, frame, video_sequence = video_reader.latest(video_sequence, timeout=0.038)
@@ -3260,13 +3839,7 @@ def main() -> int:
         elif video_mode and args.realtime_video and initial_video_frame is not None:
             ok, frame = True, initial_video_frame
         else:
-            # Webcam / direct capture: drop stale buffered frames for freshest image.
-            if not video_mode:
-                # BUFFERSIZE=1 still occasionally queues; one grab peels a stale frame.
-                try:
-                    cap.grab()
-                except Exception:
-                    pass
+            # Fallback direct capture (should be rare; webcam uses its reader).
             ok, frame = cap.read()
             if ok and video_mode and args.realtime_video and initial_video_frame is None:
                 initial_video_frame = frame
@@ -3284,48 +3857,66 @@ def main() -> int:
         frame_number += 1
         frame_height, frame_width = frame.shape[:2]
         objects_refreshed = False
-        capture_stamp = now  # frame capture time for stale-result rejection
+        # Prefer the capture-thread timestamp so perception staleness matches reality.
+        if capture_stamp <= 0.0:
+            capture_stamp = now
+        # Live glass-to-glass lag (ms). If this climbs, capture is falling behind.
+        capture_lag_ms = max(0.0, (now - capture_stamp) * 1000.0)
+        stage_ms["lag"] = (
+            capture_lag_ms if stage_ms.get("lag", 0.0) <= 1e-6
+            else stage_ms["lag"] * 0.75 + capture_lag_ms * 0.25
+        )
+        # When the displayed frame is already old, shed secondary nets harder so
+        # the capture thread (and detect) can catch up to real life.
+        live_behind = capture_lag_ms > 80.0 and not video_mode
         # --- Adaptive intervals: snappy when FPS high; protect ≥25 floor ---
-        # Priority when stressed: stretch UFLD first, then road, never kill detect.
+        # Priority when stressed: stretch UFLD/depth first, then road, keep detect.
         if display_fps < 1.0 or frame_number < 30:
             effective_detect = detection_interval
             effective_road = road_interval
             effective_ufld_interval = ufld_interval
-        elif display_fps >= 29.0:
+        elif display_fps >= 30.0:
             effective_detect = max(2, detection_interval - 1)
-            effective_road = max(5, road_interval - 1) if ufld_perception else max(3, road_interval - 1)
+            effective_road = max(4, road_interval - 1) if ufld_perception else max(3, road_interval - 1)
             effective_ufld_interval = max(12, ufld_interval - 4)
         elif display_fps >= 27.0:
             effective_detect = detection_interval
             effective_road = road_interval
             effective_ufld_interval = ufld_interval
-        elif display_fps >= 25.2:
+        elif display_fps >= 25.0:
             effective_detect = max(detection_interval, 3)
-            effective_road = max(road_interval, 8)
-            effective_ufld_interval = max(ufld_interval, 28)
+            effective_road = max(road_interval, 6)
+            effective_ufld_interval = max(ufld_interval, 24)
         else:
             # Below target: shed secondary nets first; keep detect alive.
             effective_detect = max(detection_interval, 4)
-            effective_road = max(road_interval, 12)
-            effective_ufld_interval = max(ufld_interval, 40)
+            effective_road = max(road_interval, 10)
+            effective_ufld_interval = max(ufld_interval, 36)
+        if live_behind:
+            # Real-world catch-up mode: detect more often on the live frame,
+            # push road/UFLD out so they do not monopolize the GPU lock.
+            effective_detect = max(2, min(effective_detect, 3))
+            effective_road = max(effective_road, 14)
+            effective_ufld_interval = max(effective_ufld_interval, 48)
 
         detect_phase = (frame_number - 1) % max(1, effective_detect)
-        # Submit on schedule, or fill pipeline when worker is idle.
+        # Always bind inference to the *current* live frame. When the worker is
+        # idle, refill immediately so results track the present, not the past.
         if detect_phase == 0 or (
                 object_perception.idle()
-                and (frame_number - last_detect_submit) >= max(2, effective_detect // 2)
-                and display_fps >= 25.0
+                and (frame_number - last_detect_submit) >= 1
+                and (display_fps >= 24.0 or live_behind)
         ):
             object_perception.submit(frame, frame_number, capture_time=capture_stamp)
             last_detect_submit = frame_number
-        # Latest-only + stale reject: drop results older than ~1.25s or lagging
-        # more than ~48 display frames behind the current sequence.
+        # Tight staleness: reject detections older than ~0.40s / ~12 frames so
+        # 3D boxes stay near the live camera, not a second in the past.
         object_result = object_perception.latest_after(
-            object_result_sequence, max_age_s=1.25,
+            object_result_sequence, max_age_s=0.40,
         )
         if object_result is not None:
             lag = frame_number - int(object_result.sequence)
-            if lag <= 48:
+            if lag <= 12:
                 object_result_sequence = object_result.sequence
                 latest_objects = object_result.objects
                 objects_refreshed = True
@@ -3349,7 +3940,8 @@ def main() -> int:
         road_got_fresh = False
         if show_lanes:
             if road_perception is not None:
-                # Mid-cycle road submit. Prefer not to share a frame with detect.
+                # Mid-cycle road submit. Prefer not to share a *submit frame*
+                # with detect; the GPU lock serializes actual inference.
                 road_due = (frame_number - 1) % max(1, effective_road) == (
                     max(1, effective_road) // 2
                 )
@@ -3362,9 +3954,9 @@ def main() -> int:
                     road_perception.submit(frame, frame_number, capture_time=capture_stamp)
                     _road_defer_submit = False
                 road_update = road_perception.latest_after(
-                    road_result_sequence, max_age_s=2.0,
+                    road_result_sequence, max_age_s=0.90,
                 )
-                if road_update is not None and (frame_number - int(road_update.sequence)) <= 60:
+                if road_update is not None and (frame_number - int(road_update.sequence)) <= 28:
                     road_result_sequence = road_update.sequence
                     latest_road_geometry = road_update.geometry
                     road_inference_ms = (road_update.inference_ms if road_inference_ms == 0.0 else
@@ -3381,9 +3973,11 @@ def main() -> int:
                 topology_counts[latest_road_geometry.topology] += 1
                 road_got_fresh = True
             # Skip predict() when UFLD is driving the path (saves CPU every frame).
+            # Predict more often so the path coasts toward the live view between
+            # sparse YOLOPv2 updates (reduces "stuck in the past" path lag).
             if (ufld_perception is None and not road_got_fresh and
                     latest_road_geometry is not None and
-                    (time.perf_counter() - getattr(road_tracker, "_last_update_time", 0.0)) > 0.12):
+                    (time.perf_counter() - getattr(road_tracker, "_last_update_time", 0.0)) > 0.06):
                 predicted = road_tracker.predict()
                 if predicted is not None:
                     latest_road_geometry = predicted
@@ -3393,21 +3987,28 @@ def main() -> int:
             # Stagger vs road submits so the iGPU lock is not triple-hitched.
             # Stretch depth first when FPS is near the floor.
             eff_depth = depth_interval
-            if 1.0 <= display_fps < 25.5:
-                eff_depth = max(depth_interval, 10)
+            if 1.0 <= display_fps < 26.0:
+                eff_depth = max(depth_interval, 12)
+            elif display_fps < 28.0:
+                eff_depth = max(depth_interval, 8)
             depth_phase = (frame_number + eff_depth // 2) % eff_depth
-            if depth_phase == 0:
+            # Stagger submit vs detect; lock serializes the actual GPU work.
+            if depth_phase == 0 and detect_phase != 0:
                 depth_perception.submit(frame, frame_number)
             depth_update = depth_perception.latest_after(depth_result_sequence)
             if depth_update is not None:
-                depth_result_sequence = depth_update.sequence
-                latest_depth_map = depth_update.depth_map
-                depth_inference_ms = (
-                    depth_update.inference_ms if depth_inference_ms == 0.0 else
-                    depth_inference_ms * 0.75 + depth_update.inference_ms * 0.25
-                )
-                depth_updates += 1
-                depth_refreshed = True
+                # Drop depth maps that are many frames behind the live camera.
+                if (frame_number - int(depth_update.sequence)) <= 36:
+                    depth_result_sequence = depth_update.sequence
+                    latest_depth_map = depth_update.depth_map
+                    depth_inference_ms = (
+                        depth_update.inference_ms if depth_inference_ms == 0.0 else
+                        depth_inference_ms * 0.75 + depth_update.inference_ms * 0.25
+                    )
+                    depth_updates += 1
+                    depth_refreshed = True
+                else:
+                    depth_result_sequence = depth_update.sequence  # consume late result
             depth_err = depth_perception.error
             if depth_err is not None and frame_number % 60 == 0:
                 print(f"Depth warning (monocular fallback): {depth_err}")
@@ -3423,6 +4024,7 @@ def main() -> int:
                     horizon_ratio=args.horizon_ratio,
                     depth_weight=0.40,
                     prev_scale=depth_scale,
+                    frame_width=frame_width,
                 )
         display_road_geometry = latest_road_geometry if show_lanes else None
         # UFLD — throttled; ego left/right polylines feed the yellow path triangle.
@@ -3435,9 +4037,9 @@ def main() -> int:
             if ufld_phase == 0 and detect_phase != 0 and fps_ok_for_ufld:
                 ufld_perception.submit(frame, frame_number, capture_time=capture_stamp)
             ufld_update = ufld_perception.latest_after(
-                ufld_result_sequence, max_age_s=2.5,
+                ufld_result_sequence, max_age_s=1.10,
             )
-            if ufld_update is not None and (frame_number - int(ufld_update.sequence)) <= 90:
+            if ufld_update is not None and (frame_number - int(ufld_update.sequence)) <= 36:
                 ufld_result_sequence = ufld_update.sequence
                 latest_ufld = ufld_update
                 ufld_inference_ms = (
@@ -3514,25 +4116,33 @@ def main() -> int:
         overlay_dirty = False
         overlay_started = time.perf_counter()
         if view_mode != "world":
-            # Split pane: lite overlay, native GL stretch. Slightly leaner widths
-            # cut resize+upload cost while keeping the video pane live every frame.
+            # Webcam must rebuild + re-upload EVERY frame or the pane freezes on
+            # the first texture. Video files may still cache on perception ticks.
             split_cam = view_mode == "split"
-            overlay_width = min(frame_width, 416 if view_mode == "camera" else 288)
-            # Always rebuild on split (live video). Camera-only: every frame when
-            # perception moved, else every other frame to save CPU.
+            live_webcam = not video_mode
+            if split_cam:
+                ov_cap = 288
+            else:
+                ov_cap = 416
+            overlay_width = min(frame_width, ov_cap)
             rebuild_overlay = (
-                split_cam or
-                perception_dirty or
-                frame_number % 2 == 0 or
-                cached_camera_overlay is None
+                live_webcam
+                or cached_camera_overlay is None
+                or perception_dirty
+                or frame_number % 2 == 0
             )
             if rebuild_overlay or cached_camera_overlay is None:
-                # TL colour — rare (not a hitch source).
                 if frame_number % (12 if split_cam else 6) == 0:
                     annotate_signal_states(frame, filtered_objects)
                 overlay_frame, overlay_objects, overlay_road = _camera_overlay_inputs(
                     frame, filtered_objects, display_road_geometry, overlay_width,
                 )
+                # Never draw in-place on the capture buffer (causes frozen panes
+                # when the same array is re-shown with old pixels painted over).
+                if not overlay_frame.flags["OWNDATA"]:
+                    overlay_frame = overlay_frame.copy()
+                else:
+                    overlay_frame = np.ascontiguousarray(overlay_frame)
                 camera_overlay = draw_camera_view(
                     overlay_frame, overlay_objects, show_lanes, cached_lanes,
                     display_fps, detection_fps, overlay_road,
@@ -3543,13 +4153,30 @@ def main() -> int:
                     annotate_signals=False,
                     env_summary=None if split_cam else env_snap.summary,
                     controlling_light_id=control_tl_id,
-                    lite=split_cam or view_mode == "camera",
+                    lite=True if (split_cam or view_mode == "camera") else False,
                     lead_track_id=frame_lead_id,
                 )
+                # Live proof on the pane: sequence must tick if the camera is live.
+                if live_webcam:
+                    seq_show = int(getattr(cap, "sequence", last_webcam_seq) or 0)
+                    cv2.putText(
+                        camera_overlay,
+                        f"LIVE seq={seq_show}",
+                        (8, camera_overlay.shape[0] - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.45,
+                        (40, 255, 120),
+                        1,
+                        cv2.LINE_8,
+                    )
+                camera_overlay = np.ascontiguousarray(camera_overlay)
                 cached_camera_overlay = camera_overlay
                 overlay_dirty = True
             else:
                 camera_overlay = cached_camera_overlay
+            # Live webcam: always push pixels to the GPU (no stale texture hold).
+            if live_webcam:
+                overlay_dirty = True
         overlay_elapsed = time.perf_counter() - overlay_started
         render_started = time.perf_counter()
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
@@ -3563,12 +4190,12 @@ def main() -> int:
             assert camera_overlay is not None
             render_camera_texture(
                 texture_id, camera_overlay, (0, 0, target_width, target_height),
-                upload=overlay_dirty,
+                upload=True if not video_mode else overlay_dirty,
             )
         else:
             assert camera_overlay is not None
             left_width = target_width // 2
-            # Split: lite 3D (no free-space chips / paint / most badges) + cached cam.
+            # Split: lite 3D + always-fresh camera pane for webcam.
             render_world(
                 filtered_objects, (0, 0, left_width, target_height),
                 display_road_geometry, prefiltered=True, lite=True,
@@ -3577,19 +4204,18 @@ def main() -> int:
             render_camera_texture(
                 texture_id, camera_overlay,
                 (left_width, 0, target_width - left_width, target_height),
-                upload=overlay_dirty,
+                upload=True if not video_mode else overlay_dirty,
             )
         # Stage HUD sparsely (GLUT strings are pure main-thread latency).
-        if (not split_mode and frame_number % 3 == 0) or (split_mode and frame_number % 8 == 0):
+        if (not split_mode and frame_number % 4 == 0) or (split_mode and frame_number % 10 == 0):
             _draw_stage_hud((0, 0, target_width, target_height), stage_ms, display_fps, detection_fps)
         render_elapsed = time.perf_counter() - render_started
         flip_started = time.perf_counter()
         pygame.display.flip()
         flip_elapsed = time.perf_counter() - flip_started
-        # Periodic housekeeping: prune long-lived maps / soft GC so FPS does not
-        # cliff after ~25–40s (ByteTrack removed_stracks + dict + gen1 GC).
-        # Stagger work across ticks so one frame never pays the full bill.
-        if now - _last_maintenance >= 1.5:
+        # Periodic housekeeping. Keep this CHEAP on the render thread — gen1/2
+        # collections here were a multi-frame hitch after ~1–2 minutes.
+        if now - _last_maintenance >= 2.0:
             _last_maintenance = now
             phase = _maint_phase % 3
             _maint_phase += 1
@@ -3597,35 +4223,42 @@ def main() -> int:
                 object_perception.maintenance()
             elif phase == 1:
                 prune_environment_caches()
-                if len(_VEHICLE_PRESENCE) > 20:
+                if len(_VEHICLE_PRESENCE) > 16:
                     ordered = sorted(
                         _VEHICLE_PRESENCE.items(),
                         key=lambda item: item[1][3],  # last_up
                     )
-                    for tid, _mem in ordered[: max(0, len(_VEHICLE_PRESENCE) - 14)]:
+                    for tid, _mem in ordered[: max(0, len(_VEHICLE_PRESENCE) - 12)]:
                         _VEHICLE_PRESENCE.pop(tid, None)
-                # Orphan pose keys that never reappear (belt-and-braces).
-                if len(WORLD_POSES) > 24:
-                    now_p = time.perf_counter()
-                    for key, value in list(WORLD_POSES.items()):
-                        if now_p - value[3] > 2.5:
-                            WORLD_POSES.pop(key, None)
-                            WORLD_TRAJECTORY.pop(key, None)
-                            WORLD_ONCOMING_LOCK.pop(key, None)
-                            WORLD_TURN_HITS.pop(key, None)
-                            WORLD_CRUISE_YAW.pop(key, None)
-                            DISPLAY_SLOT_GRACE.pop(key, None)
+                now_p = time.perf_counter()
+                # Always sweep pose / trajectory orphans (not only when oversized).
+                for key, value in list(WORLD_POSES.items()):
+                    if now_p - value[3] > 2.0:
+                        WORLD_POSES.pop(key, None)
+                        WORLD_TRAJECTORY.pop(key, None)
+                        WORLD_ONCOMING_LOCK.pop(key, None)
+                        WORLD_TURN_HITS.pop(key, None)
+                        WORLD_CRUISE_YAW.pop(key, None)
+                        DISPLAY_SLOT_GRACE.pop(key, None)
+                        WORLD_LANE_SLOT.pop(key, None)
+                # Bound trajectory map even if poses were cleared differently.
+                if len(WORLD_TRAJECTORY) > 32:
+                    for key in list(WORLD_TRAJECTORY.keys())[:-24]:
+                        WORLD_TRAJECTORY.pop(key, None)
             else:
-                # gen0 often; gen1 every ~8s. Avoid gen2 on the render thread —
-                # a full collection is a multi-frame hitch that looks like the
-                # "sudden stutter kick" users report around 25–30s.
+                # Rare gen0 only. Never gen1/gen2 on the render thread — those
+                # freezes feel exactly like the "gets laggy after a minute" report.
                 try:
                     import gc
-                    if now - _last_gc1 >= 8.0:
-                        gc.collect(1)
-                        _last_gc1 = now
-                    else:
+                    if now - _last_gc1 >= 45.0:
+                        # Disable automatic GC storms; do one shallow collect.
+                        was_enabled = gc.isenabled()
+                        if was_enabled:
+                            gc.disable()
                         gc.collect(0)
+                        if was_enabled:
+                            gc.enable()
+                        _last_gc1 = now
                 except Exception:
                     pass
         # Live EMA of stage timings (ms) for the HUD — cheap and always updated.
@@ -3694,7 +4327,10 @@ def main() -> int:
         video_reader.stop()
         final_position_seconds = video_reader.position_seconds
     else:
-        final_position_seconds = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0 if video_mode else None
+        final_position_seconds = (
+            cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+            if video_mode and cap is not None and hasattr(cap, "get") else None
+        )
     if road_perception is not None:
         road_perception.close()
     if depth_perception is not None:
@@ -3750,17 +4386,33 @@ def main() -> int:
     if detection_passes:
         print(f"Observed classes: {dict(class_counts.most_common())}")
         print(f"Road topology: {dict(topology_counts.most_common())}")
-    cap.release()
-    delete_mesh_cache()
-    glDeleteTextures([texture_id])
-    pygame.quit()
+    # Webcam path already released inside webcam_reader.stop(); still safe to call.
+    try:
+        cap.release()
+    except Exception:
+        pass
+    try:
+        delete_mesh_cache()
+    except Exception:
+        pass
+    try:
+        glDeleteTextures([texture_id])
+    except Exception:
+        pass
+    try:
+        pygame.quit()
+    except Exception:
+        pass
     return 0
 
 
 if __name__ == "__main__":
+    import multiprocessing as _mp
     import traceback
     from pathlib import Path as _Path
 
+    # Required on Windows so the out-of-process webcam capture can spawn.
+    _mp.freeze_support()
     try:
         raise SystemExit(main())
     except SystemExit:

@@ -107,6 +107,19 @@ class AsyncObjectPerception:
                     sequence, frame, capture_time = self._pending
                     self._pending = None
                     self._busy = True
+                # If this frame is already ancient (UI moved on) and a newer
+                # pending already arrived, skip to the fresh one — cuts lag when
+                # GPU lock made us wait.
+                if capture_time > 0.0 and (time.perf_counter() - capture_time) > 0.45:
+                    with self._condition:
+                        if self._pending is not None:
+                            sequence, frame, capture_time = self._pending
+                            self._pending = None
+                        elif (time.perf_counter() - capture_time) > 0.80:
+                            # Too old and nothing newer — drop rather than
+                            # publish a multi-second-late 3D update.
+                            self._busy = False
+                            continue
                 started = time.perf_counter()
                 try:
                     # Serialize with YOLOPv2 when both use the Intel iGPU.
@@ -115,11 +128,14 @@ class AsyncObjectPerception:
                         # truck, traffic light, fire hydrant, stop sign, parking meter.
                         # conf floor is low so lights/signs survive into ByteTrack's
                         # second association stage (per-class floors re-filter later).
+                        # max_det keeps NMS/postprocess bounded for busy multi-lane
+                        # scenes without hiding the nearest relevant traffic.
                         result = self._model.track(
                             frame, persist=True, verbose=False,
                             conf=min(0.08, self._confidence),
                             imgsz=self._imgsz, device=self._device,
                             classes=[0, 1, 2, 3, 5, 6, 7, 9, 10, 11, 12],
+                            max_det=40,
                             tracker=str(PROJECT_ROOT / "config" / "visionfsd_bytetrack.yaml"),
                         )[0]
                     now = time.perf_counter()
@@ -135,20 +151,32 @@ class AsyncObjectPerception:
                     # Temporal EMA fusion after stabilizer (anti-flicker, cheap).
                     objects = self._fusion.update(objects, now)
                     # All tracker/motion/stabilizer maintenance stays on THIS
-                    # worker thread (never the render thread) to avoid races
-                    # and main-thread hitches. ByteTrack removed_stracks grows
-                    # toward 1000 by default and was the ~25–30s stutter kick.
-                    # Use detect-pass counter — display frame_number is not a
-                    # multiple of N when detect_interval is 4 (1,5,9,...).
+                    # worker thread (never the render thread). ByteTrack
+                    # removed_stracks growth was a classic ~1–2 min stutter cliff.
                     self._detect_passes += 1
                     force = self._force_housekeep
                     if force:
                         self._force_housekeep = False
-                    if force or self._detect_passes % 4 == 0:
-                        self._housekeep_tracker(
-                            now,
-                            aggressive=force or (self._detect_passes % 16 == 0),
-                        )
+                    # Housekeep every pass (cheap list trims); aggressive more often.
+                    self._housekeep_tracker(
+                        now,
+                        aggressive=force or (self._detect_passes % 8 == 0),
+                    )
+                    # Drop large Ultralytics/OpenVINO leftovers that pin RAM.
+                    try:
+                        predictor = getattr(self._model, "predictor", None)
+                        if predictor is not None:
+                            if hasattr(predictor, "results"):
+                                predictor.results = None
+                            # Batch tensors from the last forward.
+                            for attr in ("im", "im0", "imgs", "batch"):
+                                if hasattr(predictor, attr):
+                                    try:
+                                        setattr(predictor, attr, None)
+                                    except Exception:
+                                        pass
+                    except Exception:
+                        pass
                     pipeline_ms = (time.perf_counter() - started) * 1000.0
                     completed = time.perf_counter()
                     with self._condition:
@@ -171,9 +199,9 @@ class AsyncObjectPerception:
 
     def _housekeep_tracker(self, now: float, *, aggressive: bool = False) -> None:
         """Bound ByteTrack / motion / stabilizer state (worker-thread only)."""
-        self._motion.prune(now, max_age_s=3.5)
+        self._motion.prune(now, max_age_s=2.5 if aggressive else 3.5)
         try:
-            self._fusion._prune(now, set())  # drop idle fusion state
+            self._fusion._prune(now, set())
         except Exception:
             pass
         try:
@@ -181,12 +209,12 @@ class AsyncObjectPerception:
             if isinstance(tracks, dict) and tracks:
                 stale = [
                     tid for tid, state in tracks.items()
-                    if (now - float(getattr(state, "last_update", now))) > 3.0
-                    or int(getattr(state, "misses", 0)) > 20
+                    if (now - float(getattr(state, "last_update", now))) > 2.5
+                    or int(getattr(state, "misses", 0)) > 16
                 ]
                 for tid in stale:
                     tracks.pop(tid, None)
-                cap = 28 if aggressive else 36
+                cap = 20 if aggressive else 28
                 if len(tracks) > cap:
                     ranked = sorted(
                         tracks.items(),
@@ -200,8 +228,10 @@ class AsyncObjectPerception:
                         tracks.pop(tid, None)
         except Exception:
             pass
-        removed_cap = 32 if aggressive else 64
-        lost_cap = 12 if aggressive else 20
+        # Tight caps: long sessions otherwise accumulate hundreds of STrack
+        # objects and hitch every few seconds when GC finally runs.
+        removed_cap = 16 if aggressive else 24
+        lost_cap = 8 if aggressive else 12
         try:
             predictor = getattr(self._model, "predictor", None)
             if predictor is None:
@@ -217,14 +247,14 @@ class AsyncObjectPerception:
                 if isinstance(lost, list) and len(lost) > lost_cap:
                     del lost[:-lost_cap]
                 tracked = getattr(tracker, "tracked_stracks", None)
-                if isinstance(tracked, list) and len(tracked) > 64:
-                    del tracked[:-48]
-            # Nuclear: clear removed entirely if still huge (should be rare).
-            if aggressive:
-                for tracker in trackers:
-                    removed = getattr(tracker, "removed_stracks", None)
-                    if isinstance(removed, list) and len(removed) > 120:
-                        removed.clear()
+                if isinstance(tracked, list) and len(tracked) > 40:
+                    del tracked[:-32]
+                # Some ultralytics builds keep frame_id / score history on tracks.
+                if aggressive:
+                    for attr_name in ("removed_stracks", "lost_stracks"):
+                        bucket = getattr(tracker, attr_name, None)
+                        if isinstance(bucket, list) and len(bucket) > removed_cap:
+                            bucket.clear()
         except Exception:
             pass
 
