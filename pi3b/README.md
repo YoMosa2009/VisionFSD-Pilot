@@ -152,6 +152,15 @@ The optional LD19 tool is a separate, **read-only** 360-degree point-cloud
 viewer. It reads the LD19's documented 230400-baud UART stream through its USB
 serial adapter and never sends motor or configuration commands.
 
+It keeps only the latest return for each one-degree direction and expires it
+after **300 ms** by default, rather than drawing a long history trail. New
+obstacles therefore appear on the next physical scan and removed obstacles
+clear quickly. The LD19 itself rotates at about 10 Hz, so its physical scan
+period still sets a lower latency limit of roughly 100 ms. Conservative nearby
+return clusters suppress isolated speckle and mark geometric obstacles with a
+range estimate. They are not car, pedestrian, or sign classifications: one
+horizontal 2D LiDAR cannot make that distinction.
+
 Connect the LD19's supplied communication cable to its supplied USB serial
 adapter, then connect that adapter to a Raspberry Pi USB port. Run:
 
@@ -166,6 +175,13 @@ adapters are connected, specify the Pi port explicitly, normally
 
 ```bash
 bash ./run_lidar.sh --port /dev/ttyUSB0
+```
+
+For unusual reflective, dark, or close-range environments, tune the viewer
+without changing code:
+
+```bash
+bash ./run_lidar.sh --persistence 0.25 --min-confidence 5 --min-range-mm 60
 ```
 
 Press `Q` or `Esc` to close the viewer. The coloured dots are recent range

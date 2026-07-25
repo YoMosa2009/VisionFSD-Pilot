@@ -13,7 +13,6 @@ import argparse
 import math
 import sys
 import time
-from collections import deque
 from dataclasses import dataclass
 
 import cv2
@@ -38,6 +37,81 @@ class LidarPoint:
     captured_at: float
 
 
+@dataclass(frozen=True)
+class ObstacleCluster:
+    """A contiguous group of fresh range returns, not an object class."""
+
+    angle_deg: float
+    distance_mm: int
+    point_count: int
+
+
+class LivePolarMap:
+    """Newest measurement per one-degree direction, with no slow history trail."""
+
+    def __init__(self, bin_count: int = 360) -> None:
+        self._bin_count = bin_count
+        self._points: list[LidarPoint | None] = [None] * bin_count
+
+    def update(self, points: list[LidarPoint], min_confidence: int,
+               min_range_mm: int, max_range_mm: int) -> int:
+        accepted = 0
+        for point in points:
+            if not (min_range_mm <= point.distance_mm <= max_range_mm) or point.confidence < min_confidence:
+                continue
+            index = int(round(point.angle_deg * self._bin_count / 360.0)) % self._bin_count
+            previous = self._points[index]
+            if previous is None or point.captured_at > previous.captured_at or point.confidence >= previous.confidence:
+                self._points[index] = point
+            accepted += 1
+        return accepted
+
+    def fresh(self, now: float, persistence_s: float) -> list[tuple[int, LidarPoint]]:
+        return [
+            (index, point)
+            for index, point in enumerate(self._points)
+            if point is not None and now - point.captured_at <= persistence_s
+        ]
+
+
+def obstacle_clusters(fresh: list[tuple[int, LidarPoint]], bin_count: int,
+                      minimum_points: int = 3) -> list[ObstacleCluster]:
+    """Group adjacent fresh returns and reject isolated speckle for display."""
+    if not fresh:
+        return []
+    by_index = dict(fresh)
+    groups: list[list[tuple[int, LidarPoint]]] = []
+    current: list[tuple[int, LidarPoint]] = []
+    previous_index: int | None = None
+    previous_distance: int | None = None
+    for index in sorted(by_index):
+        point = by_index[index]
+        adjacent = previous_index is not None and index - previous_index <= 2
+        similar_range = previous_distance is not None and abs(point.distance_mm - previous_distance) <= max(
+            250, int(min(point.distance_mm, previous_distance) * 0.28)
+        )
+        if current and not (adjacent and similar_range):
+            groups.append(current)
+            current = []
+        current.append((index, point))
+        previous_index, previous_distance = index, point.distance_mm
+    if current:
+        groups.append(current)
+    if len(groups) > 1 and groups[0][0][0] <= 1 and groups[-1][-1][0] >= bin_count - 2:
+        edge_a, edge_b = groups[-1][-1][1], groups[0][0][1]
+        if abs(edge_a.distance_mm - edge_b.distance_mm) <= max(250, int(min(edge_a.distance_mm, edge_b.distance_mm) * 0.28)):
+            groups[0] = groups[-1] + groups[0]
+            groups.pop()
+    result: list[ObstacleCluster] = []
+    for group in groups:
+        if len(group) < minimum_points:
+            continue
+        distances = sorted(point.distance_mm for _, point in group)
+        middle = group[len(group) // 2][1]
+        result.append(ObstacleCluster(middle.angle_deg, distances[len(distances) // 2], len(group)))
+    return sorted(result, key=lambda item: item.distance_mm)
+
+
 class LD19Parser:
     """Incremental parser for the documented 47-byte LD19 UART packet."""
 
@@ -45,6 +119,7 @@ class LD19Parser:
         self._buffer = bytearray()
         self.packets = 0
         self.crc_errors = 0
+        self.speed_dps = 0
 
     @staticmethod
     def crc8(payload: bytes) -> int:
@@ -115,7 +190,7 @@ def open_serial(port_name: str, baud: int):
         import serial
     except ImportError as exc:
         raise RuntimeError("pyserial is missing. Install pi3b/requirements.txt first.") from exc
-    return serial.Serial(port_name, baudrate=baud, timeout=0.05)
+    return serial.Serial(port_name, baudrate=baud, timeout=0.01)
 
 
 def _draw_grid(panel: np.ndarray, center: tuple[int, int], radius: int, max_range_m: float) -> None:
@@ -136,21 +211,17 @@ def _draw_grid(panel: np.ndarray, center: tuple[int, int], radius: int, max_rang
     cv2.arrowedLine(panel, (cx, cy), (cx, cy - min(radius, 42)), (235, 245, 250), 2, cv2.LINE_AA, tipLength=0.28)
 
 
-def render(points: list[LidarPoint], parser: LD19Parser, max_range_m: float, size: int) -> np.ndarray:
+def render(fresh: list[tuple[int, LidarPoint]], clusters: list[ObstacleCluster],
+           parser: LD19Parser, max_range_m: float, persistence_s: float, size: int) -> np.ndarray:
     panel = np.zeros((size, size, 3), dtype=np.uint8)
     panel[:] = (12, 21, 29)
     margin = 54
     center = (size // 2, size // 2 + 18)
     radius = max(80, min(center[0] - margin, center[1] - margin, size - center[1] - margin))
     _draw_grid(panel, center, radius, max_range_m)
-    now = time.monotonic()
     visible = 0
-    for point in points:
-        if now - point.captured_at > 1.2 or point.distance_mm <= 0:
-            continue
+    for _index, point in fresh:
         distance_m = point.distance_mm / 1000.0
-        if distance_m > max_range_m:
-            continue
         radians = math.radians(point.angle_deg)
         scale = distance_m / max_range_m
         x = int(center[0] + math.sin(radians) * radius * scale)
@@ -160,10 +231,19 @@ def render(points: list[LidarPoint], parser: LD19Parser, max_range_m: float, siz
         colour = (min(255, 60 + point.confidence), 90 + proximity // 2, proximity)
         cv2.circle(panel, (x, y), 2 if point.confidence > 80 else 1, colour, -1, cv2.LINE_AA)
         visible += 1
+    for cluster in clusters[:6]:
+        distance_m = cluster.distance_mm / 1000.0
+        radians = math.radians(cluster.angle_deg)
+        x = int(center[0] + math.sin(radians) * radius * (distance_m / max_range_m))
+        y = int(center[1] - math.cos(radians) * radius * (distance_m / max_range_m))
+        cv2.circle(panel, (x, y), 8, (235, 235, 90), 1, cv2.LINE_AA)
+        cv2.putText(panel, f"{distance_m:.1f}m", (x + 7, y - 7), cv2.FONT_HERSHEY_SIMPLEX, 0.35,
+                    (225, 235, 145), 1, cv2.LINE_AA)
     cv2.circle(panel, center, 10, (210, 230, 242), -1, cv2.LINE_AA)
     cv2.putText(panel, "VisionFSD LD19 360-degree point cloud", (14, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
                 (225, 235, 242), 1, cv2.LINE_AA)
-    status = f"POINTS {visible}  PACKETS {parser.packets}  CRC ERRORS {parser.crc_errors}"
+    status = (f"LIVE {visible}  CLUSTERS {len(clusters)}  SCAN {parser.speed_dps / 360.0:.1f}Hz  "
+              f"HOLD {persistence_s * 1000:.0f}ms  CRC {parser.crc_errors}")
     cv2.putText(panel, status, (14, size - 18), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (155, 184, 201), 1, cv2.LINE_AA)
     return panel
 
@@ -174,13 +254,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--baud", type=int, default=DEFAULT_BAUD)
     parser.add_argument("--max-range", type=float, default=12.0, help="Radar display radius in metres")
     parser.add_argument("--size", type=int, default=720, help="Square window size in pixels")
+    parser.add_argument("--persistence", type=float, default=0.30,
+                        help="Seconds a direction remains visible after its latest return")
+    parser.add_argument("--min-confidence", type=int, default=8,
+                        help="Drop very weak intensity returns below this 0-255 value")
+    parser.add_argument("--min-range-mm", type=int, default=80,
+                        help="Drop near-sensor noise closer than this distance")
+    parser.add_argument("--cluster-min-points", type=int, default=3,
+                        help="Minimum nearby returns required for a displayed obstacle cluster")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    if args.max_range <= 0 or args.size < 240:
-        raise ValueError("--max-range must be positive and --size must be at least 240")
+    if args.max_range <= 0 or args.size < 240 or args.persistence <= 0:
+        raise ValueError("--max-range and --persistence must be positive and --size must be at least 240")
+    if not (0 <= args.min_confidence <= 255) or args.min_range_mm < 0 or args.cluster_min_points < 1:
+        raise ValueError("Invalid LiDAR quality-filter setting")
     port_name = discover_port() if args.port.lower() == "auto" else args.port
     if not port_name:
         print("No usable USB serial port found. Check the LD19 USB-UART driver and run with --port COMx.", file=sys.stderr)
@@ -192,13 +282,16 @@ def main() -> int:
         return 2
     print(f"Reading LD19 from {port_name} at {args.baud} baud. Press Q or Esc to quit.")
     parser = LD19Parser()
-    points: deque[LidarPoint] = deque(maxlen=5400)
+    polar_map = LivePolarMap()
     cv2.namedWindow(WINDOW_TITLE, cv2.WINDOW_AUTOSIZE)
     try:
         while True:
             chunk = device.read(max(1, device.in_waiting))
-            points.extend(parser.feed(chunk))
-            image = render(list(points), parser, args.max_range, args.size)
+            polar_map.update(parser.feed(chunk), args.min_confidence, args.min_range_mm, int(args.max_range * 1000.0))
+            now = time.monotonic()
+            fresh = polar_map.fresh(now, args.persistence)
+            clusters = obstacle_clusters(fresh, 360, args.cluster_min_points)
+            image = render(fresh, clusters, parser, args.max_range, args.persistence, args.size)
             cv2.imshow(WINDOW_TITLE, image)
             key = cv2.waitKey(1) & 0xFF
             if key in (27, ord("q"), ord("Q")):
