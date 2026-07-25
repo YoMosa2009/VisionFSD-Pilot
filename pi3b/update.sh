@@ -39,7 +39,8 @@ chmod +x \
   "$PI_ROOT/run.sh" \
   "$PI_ROOT/update.sh" \
   "$PI_ROOT/recover-update.sh" \
-  "$PI_ROOT/sync_primary_model.sh"
+  "$PI_ROOT/sync_primary_model.sh" \
+  "$PI_ROOT/run_lidar.sh"
 
 if [[ ! -x "$PI_ROOT/.venv/bin/python" ]]; then
   echo "Pi virtual environment is missing. Re-run pi3b/install.sh." >&2
@@ -48,7 +49,7 @@ fi
 
 new_requirements="$(sha256sum "$PI_ROOT/requirements.txt" | awk '{print $1}')"
 dependencies_ok=true
-if ! "$PI_ROOT/.venv/bin/python" -c 'import cv2, numpy; from ai_edge_litert.interpreter import Interpreter' >/dev/null 2>&1; then
+if ! "$PI_ROOT/.venv/bin/python" -c 'import cv2, numpy, serial; from ai_edge_litert.interpreter import Interpreter' >/dev/null 2>&1; then
   dependencies_ok=false
 fi
 if [[ "$old_requirements" != "$new_requirements" || "$dependencies_ok" != true ]]; then

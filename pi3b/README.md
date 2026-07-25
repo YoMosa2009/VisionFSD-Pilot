@@ -145,3 +145,31 @@ lane-aware target selection, label and box stability, lane extraction, version
 rendering, reduced split-view size, and detector output decoding. The benchmark
 records display/detection rates plus preprocess, invoke, postprocess, render,
 capture, and end-to-end timings.
+
+## LD19 LiDAR visualizer
+
+The optional LD19 tool is a separate, **read-only** 360-degree point-cloud
+viewer. It reads the LD19's documented 230400-baud UART stream through its USB
+serial adapter and never sends motor or configuration commands.
+
+Connect the LD19's supplied communication cable to its supplied USB serial
+adapter, then connect that adapter to a Raspberry Pi USB port. Run:
+
+```bash
+cd ~/visionfsd-pi/pi3b
+bash ./run_lidar.sh
+```
+
+It automatically selects a single USB serial adapter. If several serial
+adapters are connected, specify the Pi port explicitly, normally
+`/dev/ttyUSB0`:
+
+```bash
+bash ./run_lidar.sh --port /dev/ttyUSB0
+```
+
+Press `Q` or `Esc` to close the viewer. The coloured dots are recent range
+returns in the horizontal scan plane; `FRONT` is the LD19 zero-angle direction.
+`CRC ERRORS` should remain at zero or very low. A missing serial port means
+the USB-UART adapter or its operating-system driver needs attention, not that
+the visualizer needs a different baud rate.
