@@ -69,11 +69,21 @@ class YOLOPv2RoadEngine:
 
     def infer(self, frame: np.ndarray, sequence: int) -> RoadSegmentation:
         height, width = frame.shape[:2]
-        scale = min(self.INPUT_WIDTH / max(1, width), self.INPUT_HEIGHT / max(1, height))
-        content_width = max(1, min(self.INPUT_WIDTH, int(round(width * scale))))
-        content_height = max(1, min(self.INPUT_HEIGHT, int(round(height * scale))))
-        interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
-        resized = cv2.resize(frame, (content_width, content_height), interpolation=interpolation)
+        # Geometry fitting only needs ~960-wide maps; full 1280+ masks burn
+        # CPU on EMA/morphology without improving lane fit quality.
+        work_width = width
+        work_height = height
+        work_frame = frame
+        if width > 960:
+            work_width = 960
+            work_height = max(1, int(round(height * (960.0 / width))))
+            work_frame = cv2.resize(frame, (work_width, work_height), interpolation=cv2.INTER_LINEAR)
+        scale = min(self.INPUT_WIDTH / max(1, work_width), self.INPUT_HEIGHT / max(1, work_height))
+        content_width = max(1, min(self.INPUT_WIDTH, int(round(work_width * scale))))
+        content_height = max(1, min(self.INPUT_HEIGHT, int(round(work_height * scale))))
+        # LINEAR is much cheaper than AREA for this intermediate step; net
+        # input is fixed 640x384 either way.
+        resized = cv2.resize(work_frame, (content_width, content_height), interpolation=cv2.INTER_LINEAR)
         pad_left = (self.INPUT_WIDTH - content_width) // 2
         pad_right = self.INPUT_WIDTH - content_width - pad_left
         pad_top = (self.INPUT_HEIGHT - content_height) // 2
@@ -83,7 +93,7 @@ class YOLOPv2RoadEngine:
             cv2.BORDER_CONSTANT, value=(114, 114, 114),
         )
         tensor = np.ascontiguousarray(padded[:, :, ::-1].transpose(2, 0, 1))[None]
-        tensor = tensor.astype(np.float32) / 255.0
+        tensor = tensor.astype(np.float32) * (1.0 / 255.0)
         started = time.perf_counter()
         # Share the process GPU lock with YOLO11 so OpenVINO iGPU is never
         # invoked from two threads at once (that hard-crashed the process).
@@ -98,11 +108,12 @@ class YOLOPv2RoadEngine:
             lane_probability = 1.0 / (1.0 + np.exp(-lane_probability))
         crop_y = slice(pad_top, pad_top + content_height)
         crop_x = slice(pad_left, pad_left + content_width)
+        # Keep masks at work resolution for EMA/morph; upscale once at the end.
         lane_probability = cv2.resize(
-            lane_probability[crop_y, crop_x], (width, height), interpolation=cv2.INTER_LINEAR,
+            lane_probability[crop_y, crop_x], (work_width, work_height), interpolation=cv2.INTER_LINEAR,
         )
         drivable_probability = cv2.resize(
-            drivable_probability[crop_y, crop_x], (width, height), interpolation=cv2.INTER_LINEAR,
+            drivable_probability[crop_y, crop_x], (work_width, work_height), interpolation=cv2.INTER_LINEAR,
         )
         if self._ema_lane is None or self._ema_lane.shape != lane_probability.shape:
             self._ema_lane = lane_probability
@@ -115,17 +126,21 @@ class YOLOPv2RoadEngine:
         drivable = np.asarray(self._ema_drivable >= 0.52, dtype=np.uint8)
         # Preserve lower-confidence but spatially coherent paint. A fixed 0.48
         # gate erased every lane response on some cameras before geometry fitting.
-        lower_roi = lane[int(height * 0.40):]
+        lower_roi = lane[int(work_height * 0.40):]
         strong_level = float(np.percentile(lower_roi, 99.2)) if lower_roi.size else 0.0
         cleanup_threshold = float(np.clip(strong_level * 0.45, 0.12, 0.48))
         binary = np.asarray(lane >= cleanup_threshold, dtype=np.uint8)
         binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
         components, labels, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
         cleaned = np.zeros_like(binary)
+        min_area = max(20, work_height * work_width // 24000)
         for component in range(1, components):
-            if stats[component, cv2.CC_STAT_AREA] >= max(20, height * width // 24000):
+            if stats[component, cv2.CC_STAT_AREA] >= min_area:
                 cleaned[labels == component] = 1
         lane *= cleaned.astype(np.float32)
+        if work_width != width or work_height != height:
+            lane = cv2.resize(lane, (width, height), interpolation=cv2.INTER_LINEAR)
+            drivable = cv2.resize(drivable, (width, height), interpolation=cv2.INTER_NEAREST)
         return RoadSegmentation(sequence, lane, drivable, inference_ms)
 
     def close(self) -> None:

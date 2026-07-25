@@ -1,5 +1,6 @@
 .venv/
 logs/
+.install-ref
 models/*.tflite
 !models/.gitkeep
 !models/vehicle_ssd_mobilenet_v1.tflite

@@ -1,4 +1,4 @@
-﻿"""Read-only webcam driving-scene visualizer; never controls a vehicle."""
+"""Read-only webcam driving-scene visualizer; never controls a vehicle."""
 
 from __future__ import annotations
 
@@ -2513,11 +2513,12 @@ def draw_camera_view(frame: np.ndarray, objects: list[DetectedObject], show_lane
     cam_height = float(camera_height_m)
     cam_fov = float(fov_deg)
     cam_horizon = float(horizon_ratio)
-    # Split/lite overlays already own a resized buffer — skip the extra copy.
-    if lite and frame.flags["OWNDATA"] and frame.flags["WRITEABLE"]:
-        canvas = frame
-    else:
-        canvas = frame.copy()
+    # Always copy for the camera canvas. Reusing a writeable capture buffer
+    # in-place was freezing the live pane on the first painted frame when the
+    # same array was re-uploaded without new pixels.
+    canvas = np.ascontiguousarray(frame)
+    if not canvas.flags["OWNDATA"]:
+        canvas = canvas.copy()
     height, width = canvas.shape[:2]
     line_type = cv2.LINE_AA if not lite else cv2.LINE_8
 

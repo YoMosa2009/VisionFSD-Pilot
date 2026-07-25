@@ -80,7 +80,12 @@ class DepthAnythingEngine:
         return np.ascontiguousarray(tensor.transpose(2, 0, 1)[None])
 
     def infer(self, frame_bgr: np.ndarray) -> tuple[np.ndarray, float]:
-        """Return full-resolution relative depth (float32) and inference ms."""
+        """Return relative depth (float32) and inference ms.
+
+        Depth is kept near model resolution (~half of 720p max) so EMA and
+        fusion stay cheap; ``_sample_box_depth`` only needs local medians, so
+        full 1280x720 maps were pure overhead.
+        """
         height, width = frame_bgr.shape[:2]
         tensor = self._preprocess(frame_bgr)
         started = time.perf_counter()
@@ -93,7 +98,10 @@ class DepthAnythingEngine:
             depth = depth[0]
         if depth.ndim != 2:
             raise RuntimeError(f"Unexpected depth output shape: {np.asarray(raw).shape}")
-        depth = cv2.resize(depth, (width, height), interpolation=cv2.INTER_LINEAR)
+        # Cap map size for fusion sampling (still plenty for box medians).
+        out_w = min(width, 640)
+        out_h = max(1, int(round(height * (out_w / max(1, width)))))
+        depth = cv2.resize(depth, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
         # Temporal EMA on the map (cheap, cuts flicker before object fusion).
         if self._ema_depth is None or self._ema_depth.shape != depth.shape:
             self._ema_depth = depth
@@ -171,19 +179,33 @@ class AsyncDepthPerception:
         self._thread.join(timeout=5.0)
 
 
-def _sample_box_depth(depth_map: np.ndarray, box: tuple[int, int, int, int]) -> float | None:
-    """Median relative depth in the lower third of the box (ground-ish)."""
+def _sample_box_depth(
+    depth_map: np.ndarray,
+    box: tuple[int, int, int, int],
+    *,
+    frame_width: int | None = None,
+    frame_height: int | None = None,
+) -> float | None:
+    """Median relative depth in the lower third of the box (ground-ish).
+
+    Boxes are in full-frame pixel coords; the depth map may be lower-res, so
+    coordinates are scaled when shapes differ.
+    """
     h, w = depth_map.shape[:2]
+    src_w = int(frame_width) if frame_width and frame_width > 0 else w
+    src_h = int(frame_height) if frame_height and frame_height > 0 else h
+    sx = w / max(1, src_w)
+    sy = h / max(1, src_h)
     x1, y1, x2, y2 = box
-    x1 = int(np.clip(x1, 0, w - 1))
-    x2 = int(np.clip(x2, 0, w))
-    y1 = int(np.clip(y1, 0, h - 1))
-    y2 = int(np.clip(y2, 0, h))
-    if x2 - x1 < 4 or y2 - y1 < 4:
+    x1 = int(np.clip(round(x1 * sx), 0, w - 1))
+    x2 = int(np.clip(round(x2 * sx), 0, w))
+    y1 = int(np.clip(round(y1 * sy), 0, h - 1))
+    y2 = int(np.clip(round(y2 * sy), 0, h))
+    if x2 - x1 < 2 or y2 - y1 < 2:
         return None
     y_lo = y1 + int((y2 - y1) * 0.55)
     roi = depth_map[y_lo:y2, x1:x2]
-    if roi.size < 8:
+    if roi.size < 4:
         roi = depth_map[y1:y2, x1:x2]
     if roi.size == 0:
         return None
@@ -201,6 +223,7 @@ def align_depth_scale(
     frame_height: int,
     camera_height_m: float,
     horizon_ratio: float,
+    frame_width: int | None = None,
 ) -> float:
     """Estimate relative→metres scale from monocular ranges of solid vehicles."""
     ratios: list[float] = []
@@ -209,7 +232,9 @@ def align_depth_scale(
             continue
         if not obj.observed:
             continue
-        d_rel = _sample_box_depth(depth_map, obj.box)
+        d_rel = _sample_box_depth(
+            depth_map, obj.box, frame_width=frame_width, frame_height=frame_height,
+        )
         if d_rel is None or d_rel < 1e-4:
             continue
         mono = estimate_monocular_distance_m(
@@ -235,6 +260,7 @@ def fuse_objects_with_depth(
     horizon_ratio: float = 0.52,
     depth_weight: float = 0.42,
     prev_scale: float = 1.0,
+    frame_width: int | None = None,
 ) -> tuple[list[DetectedObject], float]:
     """Blend monocular track range with depth-aligned range (vehicles/VRUs).
 
@@ -244,12 +270,18 @@ def fuse_objects_with_depth(
     if depth_map is None or not objects:
         return objects, prev_scale
 
+    # Infer source width from the first box / map when caller omits it.
+    if frame_width is None or frame_width <= 0:
+        frame_width = max((obj.box[2] for obj in objects), default=depth_map.shape[1])
+        frame_width = max(int(frame_width), depth_map.shape[1])
+
     scale = align_depth_scale(
         depth_map, objects,
         focal_px=focal_px,
         frame_height=frame_height,
         camera_height_m=camera_height_m,
         horizon_ratio=horizon_ratio,
+        frame_width=frame_width,
     )
     # EMA scale across frames so alignment does not thrash.
     if prev_scale > 1e-4 and np.isfinite(prev_scale):
@@ -262,7 +294,9 @@ def fuse_objects_with_depth(
         if obj.label not in ROAD_CLASSES | VEHICLE_CLASSES | {"person", "bicycle", "motorcycle"}:
             fused.append(obj)
             continue
-        d_rel = _sample_box_depth(depth_map, obj.box)
+        d_rel = _sample_box_depth(
+            depth_map, obj.box, frame_width=frame_width, frame_height=frame_height,
+        )
         if d_rel is None:
             fused.append(obj)
             continue
