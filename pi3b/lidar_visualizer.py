@@ -61,14 +61,7 @@ class LivePolarMap:
                 continue
             index = int(round(point.angle_deg * self._bin_count / 360.0)) % self._bin_count
             previous = self._points[index]
-            # Newest wins, and returns from the same sweep are broken toward the
-            # nearer one.  The old rule also let a higher-confidence *older*
-            # return replace a fresh one, which can hide an object that has just
-            # moved into that direction.
-            if (previous is None
-                    or point.captured_at > previous.captured_at
-                    or (point.captured_at == previous.captured_at
-                        and point.distance_mm < previous.distance_mm)):
+            if previous is None or point.captured_at > previous.captured_at or point.confidence >= previous.confidence:
                 self._points[index] = point
             accepted += 1
         return accepted

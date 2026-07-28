@@ -134,9 +134,10 @@ uses the LD19 as 360-degree measured range, the front static ultrasonic sensor
 as an independent near-field stop, and the webcam as both a live-frame safety
 gate and a confirmed-person veto. The Pi sends bounded differential motor
 commands/status over the Uno's normal USB cable. It starts with a 25-second
-no-motion standby, makes gentle LiDAR-guided arcs around obstacles, and uses a
-short LiDAR-cleared pivot only for close escape manoeuvres. Its local LiDAR map
-uses commanded-motion dead reckoning and is explicitly approximate.
+no-motion standby, uses hysteresis and direction locking for stable LiDAR-guided
+arcs, and uses a short LiDAR-cleared pivot only for close escape manoeuvres.
+Its rolling local map has a lightweight scan-to-scan heading correction, but
+remains advisory rather than true SLAM because the kit has no encoders or IMU.
 
 It is not vehicle autonomy and is not robust room-scale SLAM: the kit has no
 wheel encoders or IMU. Do not run it unsupervised, near stairs, pets, people,
