@@ -49,15 +49,31 @@ configure_sparse_checkout() {
   git -C "$INSTALL_ROOT" sparse-checkout set pi3b robot/firmware/visionfsd_pi_autonomy
 }
 
+clone_sparse_checkout() {
+  git clone --depth 1 --filter=blob:none --sparse --branch "$REF" "$REPO_URL" "$INSTALL_ROOT"
+}
+
+preserve_and_reclone() {
+  local backup_root="${INSTALL_ROOT}.git-recovery-$(date +%Y%m%d-%H%M%S)"
+  # Never delete a user's models, logs, virtual environment, or local edits.
+  # A damaged shallow/partial Git database cannot safely be repaired in place.
+  mv "$INSTALL_ROOT" "$backup_root"
+  echo "Preserved the incomplete Pi checkout at: $backup_root"
+  clone_sparse_checkout
+}
+
 sudo apt-get update
 sudo apt-get install -y --no-install-recommends \
   git python3 python3-venv python3-pip python3-opencv curl
 
 if [[ -e "$INSTALL_ROOT/.git" ]]; then
-  git -C "$INSTALL_ROOT" fetch --depth 1 origin "$REF"
-  git -C "$INSTALL_ROOT" checkout --detach FETCH_HEAD
+  if ! git -C "$INSTALL_ROOT" fetch --depth 1 origin "$REF" \
+    || ! git -C "$INSTALL_ROOT" checkout --detach FETCH_HEAD; then
+    echo "Existing Pi checkout has incomplete Git objects; rebuilding a clean Pi-only checkout."
+    preserve_and_reclone
+  fi
 else
-  git clone --depth 1 --filter=blob:none --sparse --branch "$REF" "$REPO_URL" "$INSTALL_ROOT"
+  clone_sparse_checkout
 fi
 configure_sparse_checkout
 
