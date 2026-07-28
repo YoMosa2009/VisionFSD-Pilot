@@ -67,11 +67,9 @@ else
 fi
 bash "$PI_ROOT/sync_primary_model.sh" "$PI_ROOT"
 autostart_dir="$HOME/.config/autostart"
-if [[ -f "$autostart_dir/visionfsd-robot.desktop" ]]; then
-  mkdir -p "$autostart_dir"
-  sed "s|__VISIONFSD_RUN_ROBOT__|$PI_ROOT/run_robot.sh|" \
-    "$PI_ROOT/visionfsd-robot.desktop" > "$autostart_dir/visionfsd-robot.desktop"
-fi
+mkdir -p "$autostart_dir"
+sed "s|__VISIONFSD_RUN_ROBOT__|$PI_ROOT/run_robot.sh|" \
+  "$PI_ROOT/visionfsd-robot.desktop" > "$autostart_dir/visionfsd-robot.desktop"
 printf '%s\n' "$REF" > "$REF_FILE"
 version="$(tr -d '\r\n' < "$PI_ROOT/VERSION")"
 echo "Updated VisionFSD Pi to v$version from $REF"
