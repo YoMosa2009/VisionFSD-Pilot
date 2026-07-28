@@ -73,3 +73,4 @@ sed "s|__VISIONFSD_RUN_ROBOT__|$PI_ROOT/run_robot.sh|" \
 printf '%s\n' "$REF" > "$REF_FILE"
 version="$(tr -d '\r\n' < "$PI_ROOT/VERSION")"
 echo "Updated VisionFSD Pi to v$version from $REF"
+echo "Robot mode: re-flash $ROOT/robot/firmware/visionfsd_pi_autonomy/visionfsd_pi_autonomy.ino to the Uno before testing."
