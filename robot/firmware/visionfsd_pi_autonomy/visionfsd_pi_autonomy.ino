@@ -3,6 +3,8 @@
 // The Arduino is deliberately small and deterministic:
 // - motion expires after 350 ms unless the Pi refreshes it;
 // - a static, forward ultrasonic sensor blocks forward travel under 18 cm;
+// - target PWM is ramped in small steps, avoiding abrupt current spikes and
+//   the stop-start feel caused by immediate motor-output changes;
 // - only the Pi performs LiDAR/camera planning;
 // - no Servo scan is attached, reducing continuous battery draw.
 //
@@ -21,19 +23,28 @@ const byte ULTRASONIC_ECHO = 2;
 
 const unsigned long COMMAND_TIMEOUT_MS = 350UL;
 const unsigned long STATUS_PERIOD_MS = 250UL;
+const unsigned long ULTRASONIC_PERIOD_MS = 60UL;
+const unsigned long RAMP_PERIOD_MS = 20UL;
 const unsigned long ECHO_TIMEOUT_US = 26000UL;
 const int FORWARD_STOP_DISTANCE_CM = 18;
 const int DEFAULT_SPEED = 70;
 const int MAX_SAFE_SPEED = 105;
+const int PWM_RAMP_STEP = 7;
 
 char commandBuffer[24];
 byte commandLength = 0;
 char activeMotion = 'S';
 int driveSpeed = DEFAULT_SPEED;
-int leftOutput = 0;
+int leftOutput = 0;       // actual PWM currently applied to the motors
 int rightOutput = 0;
+int targetLeftOutput = 0;
+int targetRightOutput = 0;
+long latestFrontCm = -1;
+bool frontBlocked = false;
 unsigned long lastMotionCommandAt = 0;
 unsigned long lastStatusAt = 0;
+unsigned long lastUltrasonicAt = 0;
+unsigned long lastRampAt = 0;
 
 void setMotor(byte pinA, byte pinB, byte enablePin, int direction, int speed) {
   if (direction == 0 || speed == 0) {
@@ -53,6 +64,8 @@ void stopMotors() {
   activeMotion = 'S';
   leftOutput = 0;
   rightOutput = 0;
+  targetLeftOutput = 0;
+  targetRightOutput = 0;
 }
 
 long frontDistanceCentimetres() {
@@ -65,9 +78,11 @@ long frontDistanceCentimetres() {
   return pulse == 0 ? -1 : static_cast<long>(pulse / 58UL);
 }
 
-bool forwardIsBlocked() {
-  long distance = frontDistanceCentimetres();
-  return distance > 0 && distance < FORWARD_STOP_DISTANCE_CM;
+void sampleUltrasonic() {
+  latestFrontCm = frontDistanceCentimetres();
+  // A close valid echo stops immediately.  No echo is deliberately not
+  // treated as a false obstacle; the Pi's LD19 remains the wider safety view.
+  frontBlocked = latestFrontCm > 0 && latestFrontCm < FORWARD_STOP_DISTANCE_CM;
 }
 
 char describeMotion(int left, int right) {
@@ -80,17 +95,39 @@ char describeMotion(int left, int right) {
 void driveDifferential(int left, int right) {
   left = constrain(left, -MAX_SAFE_SPEED, MAX_SAFE_SPEED);
   right = constrain(right, -MAX_SAFE_SPEED, MAX_SAFE_SPEED);
-  if (left > 0 && right > 0 && forwardIsBlocked()) {
+  if (left > 0 && right > 0 && frontBlocked) {
     stopMotors();
     Serial.println(F("BLOCKED:FRONT_ULTRASONIC"));
     return;
   }
-  setMotor(M1_A, M1_B, M1_ENABLE, left > 0 ? +1 : (left < 0 ? -1 : 0), abs(left));
-  setMotor(M2_A, M2_B, M2_ENABLE, right > 0 ? +1 : (right < 0 ? -1 : 0), abs(right));
-  leftOutput = left;
-  rightOutput = right;
+  targetLeftOutput = left;
+  targetRightOutput = right;
   activeMotion = describeMotion(left, right);
   lastMotionCommandAt = millis();
+}
+
+int rampTowards(int current, int target) {
+  if (current == target) return current;
+  // Finish braking before changing direction, protecting the gearbox and
+  // avoiding the sharp current reversal that made this chassis feel jerky.
+  if ((current > 0 && target < 0) || (current < 0 && target > 0)) {
+    target = 0;
+  }
+  if (current < target) return min(current + PWM_RAMP_STEP, target);
+  return max(current - PWM_RAMP_STEP, target);
+}
+
+void applyMotorOutputs() {
+  setMotor(M1_A, M1_B, M1_ENABLE, leftOutput > 0 ? +1 : (leftOutput < 0 ? -1 : 0), abs(leftOutput));
+  setMotor(M2_A, M2_B, M2_ENABLE, rightOutput > 0 ? +1 : (rightOutput < 0 ? -1 : 0), abs(rightOutput));
+}
+
+void updateMotorRamp() {
+  if (millis() - lastRampAt < RAMP_PERIOD_MS) return;
+  lastRampAt = millis();
+  leftOutput = rampTowards(leftOutput, targetLeftOutput);
+  rightOutput = rampTowards(rightOutput, targetRightOutput);
+  applyMotorOutputs();
 }
 
 void drive(char motion) {
@@ -161,13 +198,12 @@ void readSerial() {
 }
 
 void reportStatus() {
-  long distance = frontDistanceCentimetres();
   Serial.print(F("STATUS motion="));
   Serial.print(activeMotion);
   Serial.print(F(" front_cm="));
-  if (distance < 0) Serial.println(F("NO_ECHO"));
+  if (latestFrontCm < 0) Serial.println(F("NO_ECHO"));
   else {
-    Serial.print(distance);
+    Serial.print(latestFrontCm);
     Serial.print(F(" left_pwm="));
     Serial.print(leftOutput);
     Serial.print(F(" right_pwm="));
@@ -182,16 +218,26 @@ void setup() {
   digitalWrite(ULTRASONIC_TRIGGER, LOW);
   stopMotors();
   Serial.begin(115200);
+  sampleUltrasonic();
   Serial.println(F("VISIONFSD_PI_AUTONOMY_READY"));
   Serial.println(F("SAFETY:350MS_TIMEOUT,STATIC_FRONT_STOP_18CM,DIFFERENTIAL_DRIVE,MAX_PWM_105"));
 }
 
 void loop() {
   readSerial();
+  if (millis() - lastUltrasonicAt >= ULTRASONIC_PERIOD_MS) {
+    lastUltrasonicAt = millis();
+    sampleUltrasonic();
+  }
+  if (frontBlocked && targetLeftOutput > 0 && targetRightOutput > 0) {
+    stopMotors();
+    Serial.println(F("BLOCKED:FRONT_ULTRASONIC"));
+  }
   if (activeMotion != 'S' && millis() - lastMotionCommandAt > COMMAND_TIMEOUT_MS) {
     stopMotors();
     Serial.println(F("STOP:COMMAND_TIMEOUT"));
   }
+  updateMotorRamp();
   if (millis() - lastStatusAt >= STATUS_PERIOD_MS) {
     lastStatusAt = millis();
     reportStatus();

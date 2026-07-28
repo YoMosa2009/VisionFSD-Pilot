@@ -105,10 +105,11 @@ Flash this separate sketch to the Uno first:
 It is intentionally different from the earlier manual-drive sketch: the
 ultrasonic sensor is static and front-facing, the servo is unused/detached to
 avoid its continuous battery draw, motor PWM is capped at 105, and every
-motion command expires after 350 ms. The Pi sends bounded differential motor
-commands, allowing gentle forward arcs instead of only straight/pivot motion.
-The Uno blocks forward travel below 18 cm even if the Pi crashes or sends a
-bad command. **Re-flash this sketch after each robot-firmware update.**
+motion command expires after 350 ms. The Uno ramps each target PWM gradually
+instead of making abrupt motor-power jumps, while the Pi sends bounded
+differential commands for measured forward arcs. The Uno blocks forward travel
+below 18 cm even if the Pi crashes or sends a bad command. **Re-flash this
+sketch after each robot-firmware update.**
 
 Run a supervised first test on blocks, wheels free, then on an empty floor:
 
@@ -122,10 +123,12 @@ move during that interval. Afterwards its authority order is fixed:
 1. A stale Uno, LD19, or webcam stops the robot; it will not drive blind.
 2. A confirmed person in the camera's forward path stops it. The camera draws
    its confirmed-person boxes in the robot display.
-3. The LD19 begins a gentle, direction-locked arc away from a central obstacle
-   below 86 cm. The arc has separate enter/exit thresholds, so a noisy range
-   measurement does not make it weave between straight and turning. Both motor
-   PWM values stay above the practical low-speed stall region.
+3. The LD19 forms a 17-heading, 10-degree directional clearance profile and
+   locks one measured open path for a short interval. It begins a gentle arc
+   away from a central obstacle below 86 cm. The short commitment and separate
+   arc enter/exit thresholds prevent scan-to-scan weaving, while the Uno PWM
+   ramp removes abrupt power steps. Both motor PWM values stay above the
+   practical low-speed stall region.
 4. At 42 cm (or an ultrasonic return below 22 cm), it uses a short
    LiDAR-cleared pivot escape instead of remaining stopped in front of the
    obstacle. It keeps that escape direction briefly unless it becomes unsafe.
@@ -138,11 +141,13 @@ close-range stop. A camera classification never overrides measured range data.
 
 ### LiDAR SLAM-lite local map
 
-The LD19 panel now uses a small rolling **SLAM-lite** local map. It integrates
-the current LiDAR scan into a 5 m local occupancy sketch and compares the
-latest scan with the previous one in low-resolution angular bins. A heading
-correction is applied only when that comparison has enough non-ambiguous
-support; otherwise it stays with conservative commanded-motion prediction.
+The LD19 panel now uses a small rolling **SLAM-lite** local map. It keeps a
+6 m local occupancy sketch at 5 cm per cell, integrates the latest useful
+indoor returns, and compares successive scans in 90 four-degree angular bins.
+A heading correction is applied only when that comparison has enough
+non-ambiguous support; otherwise it stays with conservative commanded-motion
+prediction. This increases useful local detail without turning a map estimate
+into a motor-control input.
 
 This is intentionally advisory. The current LiDAR sectors remain the only
 range input to steering and safety—the map cannot command the motors. Without

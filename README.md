@@ -21,8 +21,10 @@ deliberately separate paths:
   returns, suppresses weak near-sensor noise, and groups adjacent returns into
   geometric obstacle clusters. It does not classify or control anything.
 - **Pi indoor robot mode:** an optional, supervised Pi + LD19 + webcam + Uno
-  runtime for the OSOYOO robot kit. The Uno keeps the final ultrasonic stop and
-  motor dead-man timeout; the Pi supplies conservative high-level planning.
+  runtime for the OSOYOO robot kit. The Uno keeps the final ultrasonic stop,
+  motor dead-man timeout, and gradual PWM ramp; the Pi selects short,
+  LiDAR-measured exploration paths and supplies conservative high-level
+  planning.
 
 ![status](https://img.shields.io/badge/status-prototype-blue)
 ![python](https://img.shields.io/badge/python-3.11%2B-green)

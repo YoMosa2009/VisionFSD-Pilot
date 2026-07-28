@@ -30,17 +30,18 @@ class SlamLiteState:
 class LidarSlamLite:
     """A Pi 3B-friendly, advisory local LiDAR mapper.
 
-    The angular matcher uses 72 five-degree bins and tests only 17 possible
-    shifts.  That is inexpensive enough to run beside camera inference, while
-    rejecting ambiguous matches instead of inventing a pose.
+    The angular matcher uses 90 four-degree bins and tests 21 nearby shifts.
+    That is still inexpensive enough to run beside camera inference, while
+    preserving more useful LD19 geometry and rejecting ambiguous matches
+    instead of inventing a pose.
     """
 
-    BIN_COUNT = 72
+    BIN_COUNT = 90
     BIN_DEGREES = 360.0 / BIN_COUNT
-    MIN_MATCH_BINS = 24
+    MIN_MATCH_BINS = 28
     MAX_SCAN_AGE_S = 0.35
 
-    def __init__(self, cells: int = 100, metres: float = 5.0) -> None:
+    def __init__(self, cells: int = 120, metres: float = 6.0) -> None:
         self.cells = cells
         self.metres = metres
         self.grid = np.zeros((cells, cells), dtype=np.uint8)
@@ -62,12 +63,12 @@ class LidarSlamLite:
 
     @classmethod
     def bins_from_points(cls, points: Iterable[tuple[int, object]]) -> tuple[np.ndarray, float]:
-        """Build robust five-degree range bins and return the newest timestamp."""
+        """Build robust four-degree range bins and return the newest timestamp."""
         buckets: list[list[float]] = [[] for _ in range(cls.BIN_COUNT)]
         newest = -1.0
         for _index, point in points:
             distance = float(point.distance_mm) / 1000.0
-            if not 0.10 <= distance <= 4.5:
+            if not 0.10 <= distance <= 5.8:
                 continue
             bin_index = int((float(point.angle_deg) % 360.0) / cls.BIN_DEGREES) % cls.BIN_COUNT
             buckets[bin_index].append(distance)
@@ -88,7 +89,7 @@ class LidarSlamLite:
         if self._previous_bins is None:
             return 0.0, 0.0, False
         choices: list[tuple[float, int, int]] = []
-        for shift in range(-8, 9):
+        for shift in range(-10, 11):
             shifted_previous = np.roll(self._previous_bins, shift)
             valid = np.isfinite(current) & np.isfinite(shifted_previous)
             count = int(np.count_nonzero(valid))
@@ -136,7 +137,10 @@ class LidarSlamLite:
         scale = self.cells / self.metres
         for _index, point in list(points)[::3]:
             distance = float(point.distance_mm) / 1000.0
-            if not 0.10 <= distance <= self.metres / 1.5:
+            # The default map remains five-centimetre resolution (120 cells
+            # across 6 m) while retaining substantially more of the LD19's
+            # useful indoor returns than the prior 3.3 m display window.
+            if not 0.10 <= distance <= self.metres * 0.85:
                 continue
             angle = math.radians(float(point.angle_deg) + self.heading)
             x = self.x + math.sin(angle) * distance

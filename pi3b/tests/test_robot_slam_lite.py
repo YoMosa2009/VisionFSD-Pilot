@@ -18,7 +18,9 @@ class SlamLiteTests(unittest.TestCase):
         previous = np.arange(mapper.BIN_COUNT, dtype=np.float32) * 0.04 + 0.5
         mapper._previous_bins = previous
         current = np.roll(previous, 2)
-        correction, confidence, accepted = mapper._align_yaw(current, expected_delta_deg=-10.0)
+        correction, confidence, accepted = mapper._align_yaw(
+            current, expected_delta_deg=-2 * mapper.BIN_DEGREES
+        )
         self.assertTrue(accepted)
         self.assertGreater(confidence, 0.16)
         self.assertAlmostEqual(correction, 0.0, places=3)
