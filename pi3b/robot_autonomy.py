@@ -37,6 +37,7 @@ from serial.tools import list_ports
 from lidar_visualizer import LD19Parser, LivePolarMap
 from robot_navigation import (
     PLANNING_HORIZON_M,
+    DriveCommand,
     NavigationPlanner,
     PlannerTuning,
     RobotGeometry,
