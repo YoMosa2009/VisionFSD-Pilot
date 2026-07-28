@@ -110,6 +110,12 @@ commands, allowing gentle forward arcs instead of only straight/pivot motion.
 The Uno blocks forward travel below 18 cm even if the Pi crashes or sends a
 bad command. **Re-flash this sketch after each robot-firmware update.**
 
+The ultrasonic sensor is sampled on its own fixed 60 ms cadence, filtered with
+a 3-sample median, and must read short **twice in a row** before it gates
+forward travel. Sampling no longer happens inside a `DRIVE` command, so a motor
+update is never delayed by an echo timeout. Reverse and pivots are never gated,
+so the Pi can always drive out of a close-range situation.
+
 Run a supervised first test on blocks, wheels free, then on an empty floor:
 
 ```bash
@@ -122,9 +128,7 @@ move during that interval. Afterwards its authority order is fixed:
 1. A stale Uno, LD19, or webcam stops the robot; it will not drive blind.
 2. A confirmed person in the camera's forward path stops it. The camera draws
    its confirmed-person boxes in the robot display.
-3. The LD19 begins a gentle arc away from a central obstacle below 82 cm. At
-   42 cm (or an ultrasonic return below 22 cm), it uses a short LiDAR-cleared
-   pivot escape instead of remaining stopped in front of the obstacle.
+3. The LD19 chooses where to drive, using the robot's own body dimensions.
 4. Uno ultrasonic hard-stop (under 18 cm) always wins and blocks forward
    motor commands even if the Pi fails.
 
@@ -132,11 +136,74 @@ This keeps roles separate: LD19 geometry chooses an open direction, the camera
 prevents movement toward confirmed people, and the Uno enforces the final
 close-range stop. A camera classification never overrides measured range data.
 
+### How the navigation works
+
+The planner treats the robot as a rectangle rather than a point. For each of
+106 candidate headings across a 210-degree fan it computes how far a body of
+the configured width can travel before anything enters the swept corridor. That
+single geometric test is what lets it enter gaps it actually fits through,
+refuse gaps it does not, and respect a chair leg that occupies one degree of
+the scan.
+
+Among headings with real room, it picks the best score from: usable clear
+distance (which **saturates**, so "far enough" beats "roomiest"), a strong
+preference for going straight, a penalty for turning the same way it has been
+turning, a penalty for world headings it has already spent time driving, a
+small bonus for unmeasured directions, and a penalty for confirmed people. The
+saturation matters: without it the robot rotates toward whatever is roomiest
+and gently spins in the middle of a room instead of crossing it.
+
+Speed is proportional to the clear distance ahead. Headings within 42 degrees
+are taken as a smooth differential arc; anything wider first turns on the spot
+toward a measured heading target, then commits to driving for 0.7 s so it
+cannot shuffle between turns without ever moving.
+
+When nothing ahead is drivable it runs an escape ladder rather than stopping:
+curved reverse burst, then a quarter-turn pivot, then a short straight nudge
+backwards, then a tighter pivot, and only then HOLD. HOLD is retried every
+cycle, so it is a state and not a dead end.
+
+Because the chassis has no encoders and no IMU, heading change is estimated by
+correlating successive LiDAR range profiles. That measured turn rate feeds the
+anti-orbit penalty and detects a **stall** — the Pi commanding motion while the
+world does not change, which is what a sagging motor battery looks like. A
+stall triggers the same escape ladder.
+
+The ultrasonic sensor is cross-checked against the LiDAR. If it keeps reporting
+something much closer than the LiDAR can see, it is marked `UNTRUSTED` on the
+dashboard and ignored for planning; the Uno's independent 18 cm hard stop is
+unaffected. When trusted it may only *shorten* travel within its own narrow
+cone. It can no longer trigger a turn, which is what previously trapped the
+robot in a pivot loop in front of an obstacle.
+
+### Tell it its own size
+
+Defaults assume a 0.17 m wide, 0.22 m long chassis with the LD19 2 cm ahead of
+centre. Measure yours (widest point, wheels included) and set it before
+launching, or gap choices will be wrong in both directions:
+
+```bash
+export VISIONFSD_ROBOT_WIDTH_M=0.17
+export VISIONFSD_ROBOT_LENGTH_M=0.22
+export VISIONFSD_LIDAR_OFFSET_M=0.02
+export VISIONFSD_SAFETY_MARGIN_M=0.055
+```
+
+The startup line prints the resulting corridor half-width and pivot radius.
+
 The LD19 panel includes a small **local LiDAR map**. It accumulates nearby
-returns and uses commanded-motion dead reckoning for the displayed pose. The
-OSOYOO kit has no wheel encoders or IMU, so this is useful local mapping, but
-it is **not reliable metric SLAM**. Add wheel encoders or an IMU before relying
-on a persistent room map, loop closure, or autonomous room navigation.
+returns and draws a travelled trail. Its heading now comes from LiDAR scan
+matching instead of commanded PWM, so a pivot no longer smears the map into
+rings, but translation is still commanded-motion only. The OSOYOO kit has no
+wheel encoders or IMU, so this is a useful local sketch and **not reliable
+metric SLAM**. Add wheel encoders or an IMU before relying on a persistent room
+map, loop closure, or autonomous room navigation.
+
+The dashboard header shows the planner state, the reason for the current
+command, forward and rear clear distance, ultrasonic trust, measured yaw rate,
+accumulated turn, recovery count, planning rate, and a `STALL` marker. The
+green/blue fan drawn over the map is the per-heading travel limit; the yellow
+arrow is the chosen heading.
 
 The LD19's 0-degree direction must physically point forward. If your mount is
 rotated, set its correction before launching, for example:
@@ -242,6 +309,14 @@ lane-aware target selection, label and box stability, lane extraction, version
 rendering, reduced split-view size, and detector output decoding. The benchmark
 records display/detection rates plus preprocess, invoke, postprocess, render,
 capture, and end-to-end timings.
+
+The robot navigation tests run without any hardware and cover the body-inflated
+corridor test (including a gap one robot accepts and a wider robot rejects),
+thin-obstacle survival, rear clearance, LiDAR yaw estimation, stall detection,
+ultrasonic distrust, the anti-orbit penalty, the escape ladder, and the motor
+deadband. Two of them encode field failures directly: a close ultrasonic
+reading with clear LiDAR must still make forward progress, and a dead end must
+produce a reverse rather than a stop.
 
 ## LD19 LiDAR visualizer
 
