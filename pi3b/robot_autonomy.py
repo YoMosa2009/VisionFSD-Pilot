@@ -25,6 +25,7 @@ import signal
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -35,15 +36,15 @@ from serial.tools import list_ports
 
 from lidar_visualizer import LD19Parser, LivePolarMap
 from robot_navigation import (
-    BIN_COUNT,
     PLANNING_HORIZON_M,
-    DriveCommand,
     NavigationPlanner,
     PlannerTuning,
     RobotGeometry,
     ScanFrame,
     scan_from_points,
 )
+from robot_slam import SlamConfig, SlamTracker, SlamWorker
+from robot_vision import LowObstacleGuard
 from visionfsd_pi import (
     AsyncDetector,
     LatestCamera,
@@ -59,6 +60,9 @@ UNO_BAUD = 115200
 LD19_BAUD = 230400
 PLAN_PERIOD_S = 0.08
 RENDER_PERIOD_S = 0.16
+# Roughly two LD19 revolutions per scan match.  Matching faster buys little,
+# because the sensor cannot show the world changing faster than it spins.
+SLAM_PERIOD_S = 0.22
 
 
 @dataclass(frozen=True)
@@ -170,6 +174,11 @@ class LD19Link:
         self._lock = threading.Lock()
         self._running = True
         self._last_packet_at = 0.0
+        # Raw returns keep their sub-degree angle and their own timestamp, which
+        # the 1-degree planning grid throws away.  Scan matching wants both: the
+        # angle for accuracy and the timestamp to undo the robot's own motion
+        # across a revolution.
+        self._raw: deque[tuple[float, float, float]] = deque(maxlen=1400)
         self._thread = threading.Thread(target=self._read_loop, name="ld19-reader", daemon=True)
         self._thread.start()
 
@@ -193,6 +202,11 @@ class LD19Link:
             ]
             with self._lock:
                 self._map.update(rotated, min_confidence=8, min_range_mm=80, max_range_mm=6000)
+                self._raw.extend(
+                    (point.angle_deg, point.distance_mm / 1000.0, point.captured_at)
+                    for point in rotated
+                    if point.confidence >= 8 and 80 <= point.distance_mm <= 6000
+                )
                 self._last_packet_at = now
 
     @property
@@ -210,84 +224,23 @@ class LD19Link:
             fresh = now - self._last_packet_at <= 0.45
         return scan_from_points(points, fresh, now)
 
+    def revolution(self, window_s: float = 0.13) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Raw returns from roughly the last LD19 revolution, with their ages."""
+        now = time.monotonic()
+        with self._lock:
+            recent = [item for item in self._raw if now - item[2] <= window_s]
+        if not recent:
+            empty = np.zeros(0, dtype=np.float32)
+            return empty, empty, empty
+        data = np.asarray(recent, dtype=np.float32)
+        return data[:, 0], data[:, 1], (now - data[:, 2]).astype(np.float32)
+
     def close(self) -> None:
         self._running = False
         try:
             self._serial.close()
         except serial.SerialException:
             pass
-
-
-class LocalLidarMap:
-    """Display-only local occupancy sketch with an explicitly approximate pose.
-
-    Heading comes from the planner's LiDAR scan matching rather than from the
-    commanded PWM, which keeps a pivot from smearing the map into rings.
-    Translation is still commanded-motion only, so this remains a sketch.
-    """
-
-    def __init__(self, cells: int = 110, metres: float = 5.5) -> None:
-        self.cells = cells
-        self.metres = metres
-        self.grid = np.zeros((cells, cells), dtype=np.uint8)
-        self.x = metres / 2.0
-        self.y = metres / 2.0
-        self.heading = 0.0
-        self.trail: list[tuple[float, float]] = []
-        self._last_motion_at = time.monotonic()
-
-    def integrate_motion(self, left_pwm: int, right_pwm: int, measured_heading: float, now: float) -> None:
-        elapsed = min(0.40, max(0.0, now - self._last_motion_at))
-        self._last_motion_at = now
-        self.heading = measured_heading % 360.0
-        forward = (left_pwm + right_pwm) * 0.5
-        # Only near-symmetric wheel commands are treated as translation; a
-        # pivot has a mean near zero and correctly moves the pose very little.
-        linear = (forward / 105.0) * 0.32
-        self.x += math.sin(math.radians(self.heading)) * linear * elapsed
-        self.y -= math.cos(math.radians(self.heading)) * linear * elapsed
-        self.x = float(np.clip(self.x, 0.3, self.metres - 0.3))
-        self.y = float(np.clip(self.y, 0.3, self.metres - 0.3))
-        if not self.trail or math.hypot(self.x - self.trail[-1][0], self.y - self.trail[-1][1]) > 0.08:
-            self.trail.append((self.x, self.y))
-            del self.trail[:-260]
-
-    def integrate_scan(self, scan: ScanFrame) -> None:
-        finite = np.isfinite(scan.ranges)
-        if not np.any(finite):
-            return
-        distances = scan.ranges[finite]
-        angles = np.radians(np.arange(BIN_COUNT, dtype=np.float32)[finite] + self.heading)
-        keep = (distances >= 0.10) & (distances <= self.metres / 1.6)
-        if not np.any(keep):
-            return
-        scale = self.cells / self.metres
-        columns = ((self.x + np.sin(angles[keep]) * distances[keep]) * scale).astype(np.int32)
-        rows = ((self.y - np.cos(angles[keep]) * distances[keep]) * scale).astype(np.int32)
-        inside = (rows >= 0) & (rows < self.cells) & (columns >= 0) & (columns < self.cells)
-        # Accumulate in uint16: np.add.at sums duplicate indices, so a bright
-        # cell would otherwise wrap past 255 and suddenly go dark.
-        faded = (self.grid.astype(np.float32) * 0.985).astype(np.uint16)
-        np.add.at(faded, (rows[inside], columns[inside]), 40)
-        self.grid = np.minimum(faded, 255).astype(np.uint8)
-
-    def render(self, size: int = 460) -> np.ndarray:
-        image = cv2.resize(self.grid, (size, size), interpolation=cv2.INTER_NEAREST)
-        panel = cv2.applyColorMap(image, cv2.COLORMAP_BONE)
-        scale = size / self.metres
-        for index in range(1, len(self.trail)):
-            start = (int(self.trail[index - 1][0] * scale), int(self.trail[index - 1][1] * scale))
-            end = (int(self.trail[index][0] * scale), int(self.trail[index][1] * scale))
-            cv2.line(panel, start, end, (120, 150, 90), 1, cv2.LINE_AA)
-        px = int(np.clip(self.x * scale, 0, size - 1))
-        py = int(np.clip(self.y * scale, 0, size - 1))
-        radians = math.radians(self.heading)
-        tip = (int(px + math.sin(radians) * 22), int(py - math.cos(radians) * 22))
-        cv2.circle(panel, (px, py), 7, (80, 240, 100), -1, cv2.LINE_AA)
-        cv2.arrowedLine(panel, (px, py), tip, (255, 255, 255), 2, cv2.LINE_AA, tipLength=0.35)
-        cv2.putText(panel, "LOCAL LIDAR MAP - POSE APPROXIMATE", (10, 20), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.44, (235, 245, 250), 1, cv2.LINE_AA)
-        return panel
 
 
 class CameraSafety:
@@ -404,15 +357,16 @@ def draw_clearance_fan(panel: np.ndarray, planner: NavigationPlanner, limits: np
     cv2.arrowedLine(panel, (cx, cy), tip, (255, 235, 120), 2, cv2.LINE_AA, tipLength=0.18)
 
 
-def draw_dashboard(frame: np.ndarray, local_map: np.ndarray, planner: NavigationPlanner,
+def draw_dashboard(frame: np.ndarray, map_panel: np.ndarray, planner: NavigationPlanner,
                    limits: np.ndarray, status: ArduinoStatus, scan: ScanFrame,
                    camera_ready: bool, differential_ready: bool, person: bool,
-                   plan_hz: float) -> np.ndarray:
-    height = max(frame.shape[0], local_map.shape[0])
+                   plan_hz: float, slam, lidar: "LD19Link", guard: LowObstacleGuard,
+                   slam_ms: float) -> np.ndarray:
+    height = max(frame.shape[0], map_panel.shape[0])
     left = cv2.resize(frame, (int(frame.shape[1] * height / frame.shape[0]), height))
-    right = cv2.resize(local_map, (height, height))
+    right = cv2.resize(map_panel, (height, height))
     panel = np.hstack((left, right))
-    header = 104
+    header = 126
     cv2.rectangle(panel, (0, 0), (panel.shape[1], header), (14, 22, 31), -1)
 
     ultra = "--" if status.front_cm is None else f"{status.front_cm:.0f}cm"
@@ -422,21 +376,29 @@ def draw_dashboard(frame: np.ndarray, local_map: np.ndarray, planner: Navigation
     camera_state = "LIVE" if camera_ready else "STALE"
     drive_mode = "DIFFERENTIAL" if differential_ready else "COMPATIBILITY"
     moving = planner.left_pwm or planner.right_pwm
+    slam_state = "TRACKING" if slam.trusted else ("SEARCHING" if slam.updates else "INIT")
+    bearing, weight = planner.frontier
 
-    cv2.putText(panel, f"VisionFSD Robot - {planner.state}", (12, 26),
+    cv2.putText(panel, f"VisionFSD Robot - {planner.state}", (12, 24),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, (238, 244, 250), 1, cv2.LINE_AA)
-    cv2.putText(panel, planner.reason, (12, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.46,
+    cv2.putText(panel, planner.reason, (12, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.46,
                 (90, 235, 130) if moving else (80, 190, 245), 1, cv2.LINE_AA)
-    line = (f"LD19 {lidar_state} {scan.valid_count}pts  FWD {planner.forward_limit_m:.2f}m  "
-            f"REAR {planner.rear_limit_m:.2f}m  ULTRASONIC {ultra}  CAMERA {camera_state}  "
-            f"PERSON {'YES' if person else 'NO'}")
-    cv2.putText(panel, line, (12, 76), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (215, 225, 235), 1, cv2.LINE_AA)
+    line = (f"LD19 {lidar_state} {scan.valid_count}pts {lidar.scan_hz:.1f}Hz CRC {lidar.crc_errors}  "
+            f"FWD {planner.forward_limit_m:.2f}m  REAR {planner.rear_limit_m:.2f}m  "
+            f"ULTRASONIC {ultra}  CAMERA {camera_state}  PERSON {'YES' if person else 'NO'}")
+    cv2.putText(panel, line, (12, 71), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (215, 225, 235), 1, cv2.LINE_AA)
     stall = "  STALL" if planner.motion.stalled else ""
     line2 = (f"UNO {drive_mode}: left {planner.left_pwm:+d} right {planner.right_pwm:+d}  "
              f"YAW {planner.yaw.yaw_rate_dps:+.0f}deg/s  TURNSUM {planner.motion.turn_integral_deg:+.0f}  "
              f"RECOVER {planner.recovery_count}  PLAN {plan_hz:.0f}Hz{stall}")
-    cv2.putText(panel, line2, (12, 98), cv2.FONT_HERSHEY_SIMPLEX, 0.40,
+    cv2.putText(panel, line2, (12, 93), cv2.FONT_HERSHEY_SIMPLEX, 0.40,
                 (255, 170, 120) if stall else (185, 200, 215), 1, cv2.LINE_AA)
+    low = "  LOW-OBSTACLE" if guard.blocked else ""
+    line3 = (f"SLAM {slam_state} res {slam.residual_m*100:.0f}cm {slam.matched_points}pts "
+             f"{slam_ms:.0f}ms  FRONTIER {bearing:+.0f}deg w{weight:.2f}  "
+             f"FLOOR {guard.coverage*100:.0f}%{low}")
+    cv2.putText(panel, line3, (12, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.40,
+                (255, 170, 120) if (low or not slam.trusted) else (170, 205, 190), 1, cv2.LINE_AA)
 
     fan_origin = (left.shape[1] + height // 2, header + (height - header) // 2 + 40)
     draw_clearance_fan(panel, planner, limits, fan_origin, min(height // 3, 150))
@@ -462,16 +424,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fov", type=float, default=70.0)
     parser.add_argument("--lidar-front-offset-deg", type=float, default=0.0,
                         help="Physical LD19 zero-angle correction; positive rotates readings right")
-    parser.add_argument("--robot-width-m", type=float, default=env_float("VISIONFSD_ROBOT_WIDTH_M", 0.17),
+    parser.add_argument("--robot-width-m", type=float, default=env_float("VISIONFSD_ROBOT_WIDTH_M", 0.14),
                         help="Widest part of the chassis, wheels included")
-    parser.add_argument("--robot-length-m", type=float, default=env_float("VISIONFSD_ROBOT_LENGTH_M", 0.22),
+    parser.add_argument("--robot-length-m", type=float, default=env_float("VISIONFSD_ROBOT_LENGTH_M", 0.15),
                         help="Front bumper to rear bumper")
-    parser.add_argument("--lidar-offset-m", type=float, default=env_float("VISIONFSD_LIDAR_OFFSET_M", 0.02),
+    parser.add_argument("--lidar-offset-m", type=float, default=env_float("VISIONFSD_LIDAR_OFFSET_M", 0.0),
                         help="How far the LD19 sits ahead of the middle of the robot")
-    parser.add_argument("--safety-margin-m", type=float, default=env_float("VISIONFSD_SAFETY_MARGIN_M", 0.055),
+    parser.add_argument("--safety-margin-m", type=float, default=env_float("VISIONFSD_SAFETY_MARGIN_M", 0.040),
                         help="Extra clearance added to each side of the body")
     parser.add_argument("--min-move-pwm", type=int, default=50,
                         help="Lowest PWM that actually turns these motors")
+    parser.add_argument("--no-slam", action="store_true",
+                        help="Disable scan-matching SLAM and its exploration bias")
+    parser.add_argument("--no-low-obstacle-guard", action="store_true",
+                        help="Disable the camera floor-clutter slow-down")
     parser.add_argument("--no-display", action="store_true")
     return parser.parse_args()
 
@@ -507,7 +473,9 @@ def main() -> int:
 
     planner = NavigationPlanner(geometry, tuning, args.standby_seconds)
     sender = CommandSender()
-    local_map = LocalLidarMap()
+    slam = SlamTracker(SlamConfig())
+    slam_worker = None if args.no_slam else SlamWorker(slam)
+    guard = LowObstacleGuard(enabled=not args.no_low_obstacle_guard)
     keep_running = True
 
     def stop(_signum: int, _frame: object) -> None:
@@ -520,8 +488,10 @@ def main() -> int:
         cv2.namedWindow(WINDOW_TITLE, cv2.WINDOW_AUTOSIZE)
 
     next_render = 0.0
+    next_slam = 0.0
     plan_hz = 0.0
     last_plan_at = time.monotonic()
+    last_slam_at = time.monotonic()
     try:
         while keep_running:
             now = time.monotonic()
@@ -530,6 +500,9 @@ def main() -> int:
             status = arduino.status()
             camera_ready = camera.ready(now)
             person = camera.person_stop()
+            # The camera can only slow the robot down.  Whichever of the two
+            # visual cues is more cautious wins; neither may steer.
+            speed_scale = min(camera.clutter_scale(), guard.update(camera.frame))
             command = planner.decide(
                 scan,
                 status.front_cm,
@@ -538,23 +511,37 @@ def main() -> int:
                 person,
                 camera.person_bearings(),
                 now,
-                camera.clutter_scale(),
+                speed_scale,
+                slam.frontier(),
             )
             sender.send(arduino, command, now)
             plan_hz = 0.85 * plan_hz + 0.15 / max(1e-3, now - last_plan_at)
             last_plan_at = now
 
+            if slam_worker is not None and now >= next_slam:
+                next_slam = now + SLAM_PERIOD_S
+                bearings, ranges, ages = lidar.revolution()
+                if bearings.size:
+                    # Commanded speed is only a search-window centre; scan
+                    # matching is what actually decides the pose.
+                    forward = (planner.left_pwm + planner.right_pwm) / 2.0 / 105.0 * 0.32
+                    slam_worker.submit(bearings, ranges, ages, planner.yaw.yaw_rate_dps,
+                                       forward, now - last_slam_at)
+                    last_slam_at = now
+
             if not args.no_display and now >= next_render:
                 next_render = now + RENDER_PERIOD_S
-                local_map.integrate_motion(planner.left_pwm, planner.right_pwm,
-                                           planner.yaw.heading_deg, now)
-                local_map.integrate_scan(scan)
                 display_frame = camera.annotated_frame()
                 if display_frame is not None:
+                    guard.annotate(display_frame)
                     limits = planner.corridor.travel_limits(scan)
-                    panel = draw_dashboard(display_frame, local_map.render(), planner, limits,
+                    state = slam.state()
+                    map_panel = slam.map.render(state.x, state.y, state.heading_deg,
+                                                trail=slam.trail)
+                    panel = draw_dashboard(display_frame, map_panel, planner, limits,
                                            status, scan, camera_ready, arduino.differential_ready,
-                                           person, plan_hz)
+                                           person, plan_hz, state, lidar, guard,
+                                           slam_worker.last_duration_ms if slam_worker else 0.0)
                     cv2.imshow(WINDOW_TITLE, panel)
                     cv2.setWindowTitle(WINDOW_TITLE, f"VisionFSD Pi Robot - {planner.state.lower()}")
                     if cv2.waitKey(1) & 0xFF in (27, ord("q"), ord("Q")):
@@ -564,6 +551,8 @@ def main() -> int:
         arduino.close()
         lidar.close()
         camera.close()
+        if slam_worker is not None:
+            slam_worker.close()
         cv2.destroyAllWindows()
     return 0
 

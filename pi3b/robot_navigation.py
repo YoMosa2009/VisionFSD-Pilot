@@ -468,6 +468,10 @@ class PlannerTuning:
     exploration_penalty: float = 0.55
     person_penalty: float = 1.20
     unknown_bonus: float = 0.25
+    # Pull toward mapped unexplored space.  Deliberately smaller than the
+    # straight-line cost so a confident frontier nudges the route rather than
+    # commanding it: SLAM is advisory and must never steer around obstacles.
+    frontier_bonus: float = 0.70
 
 
 class NavigationPlanner:
@@ -501,6 +505,7 @@ class NavigationPlanner:
         self._speed_scale = 1.0
         self._commit_until = 0.0
         self._heading_index: int | None = None
+        self.frontier: tuple[float, float] = (0.0, 0.0)
         self._blocked_since: float | None = None
         self._last_escape_dir = 1
         self._unknown_kernel = np.ones(25, dtype=np.float32) / 25.0
@@ -614,10 +619,19 @@ class NavigationPlanner:
         smoothed = np.convolve(padded, self._unknown_kernel, mode="valid")[:BIN_COUNT]
         score += smoothed[np.round(headings).astype(np.int32) % BIN_COUNT] * tuning.unknown_bonus
 
+        bearing, weight = self.frontier
+        if weight > 0.0:
+            pull = np.exp(-(self._wrap_array(headings - bearing) ** 2) / (2.0 * 38.0 ** 2))
+            score += pull * tuning.frontier_bonus * weight
+
         for bearing in person_bearings:
-            closeness = np.exp(-((headings - bearing) ** 2) / (2.0 * 22.0 ** 2))
+            closeness = np.exp(-(self._wrap_array(headings - bearing) ** 2) / (2.0 * 22.0 ** 2))
             score -= closeness * tuning.person_penalty
         return score
+
+    @staticmethod
+    def _wrap_array(angles: np.ndarray) -> np.ndarray:
+        return (angles + 180.0) % 360.0 - 180.0
 
     @staticmethod
     def _window(centre_deg: float, half_width_deg: int) -> np.ndarray:
@@ -627,11 +641,14 @@ class NavigationPlanner:
     # ---- main entry point ------------------------------------------------
     def decide(self, scan: ScanFrame | None, front_cm: float | None, uno_fresh: bool,
                camera_ready: bool, person_stop: bool, person_bearings: list[float],
-               now: float, speed_scale: float = 1.0) -> DriveCommand:
+               now: float, speed_scale: float = 1.0,
+               frontier: tuple[float, float] = (0.0, 0.0)) -> DriveCommand:
         # A caller-supplied slow-down (for example the camera seeing clutter
         # close ahead) is applied as a speed cap inside the planner, so it goes
         # through the same deadband and ramp handling as every other output.
         self._speed_scale = float(np.clip(speed_scale, 0.5, 1.0))
+        # Advisory exploration bias only; it is scored, never used as geometry.
+        self.frontier = (float(frontier[0]), float(np.clip(frontier[1], 0.0, 1.0)))
         if now - self.started_at < self.standby_s:
             remaining = max(0, int(self.standby_s - (now - self.started_at)))
             return self._stop("STANDBY", f"STANDBY {remaining}s")

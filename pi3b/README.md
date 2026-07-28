@@ -185,32 +185,74 @@ robot in a pivot loop in front of an obstacle.
 
 ### Tell it its own size
 
-Defaults assume a 0.17 m wide, 0.22 m long chassis with the LD19 2 cm ahead of
-centre. Measure yours (widest point, wheels included) and set it before
-launching, or gap choices will be wrong in both directions:
+Defaults are the measured chassis: 0.14 m wide, 0.15 m long, LD19 assumed
+centred. If yours differs, measure the widest point with the wheels included
+and set it before launching, or gap choices go wrong in both directions:
 
 ```bash
-export VISIONFSD_ROBOT_WIDTH_M=0.17
-export VISIONFSD_ROBOT_LENGTH_M=0.22
-export VISIONFSD_LIDAR_OFFSET_M=0.02
-export VISIONFSD_SAFETY_MARGIN_M=0.055
+export VISIONFSD_ROBOT_WIDTH_M=0.14
+export VISIONFSD_ROBOT_LENGTH_M=0.15
+export VISIONFSD_LIDAR_OFFSET_M=0.0
+export VISIONFSD_SAFETY_MARGIN_M=0.040
 ```
 
-The startup line prints the resulting corridor half-width and pivot radius.
+`VISIONFSD_LIDAR_OFFSET_M` is how far the LD19 sits ahead of the middle of the
+robot, negative if behind. The startup line prints the resulting corridor
+half-width and pivot radius.
 
-The LD19 panel includes a small **local LiDAR map**. It accumulates nearby
-returns and draws a travelled trail. Its heading now comes from LiDAR scan
-matching instead of commanded PWM, so a pivot no longer smears the map into
-rings, but translation is still commanded-motion only. The OSOYOO kit has no
-wheel encoders or IMU, so this is a useful local sketch and **not reliable
-metric SLAM**. Add wheel encoders or an IMU before relying on a persistent room
-map, loop closure, or autonomous room navigation.
+### Scan-matching SLAM
 
-The dashboard header shows the planner state, the reason for the current
-command, forward and rear clear distance, ultrasonic trust, measured yaw rate,
-accumulated turn, recovery count, planning rate, and a `STALL` marker. The
-green/blue fan drawn over the map is the per-heading travel limit; the yellow
-arrow is the chosen heading.
+Pose comes from matching each LiDAR revolution against the map built from
+previous revolutions, using a chamfer score over an OpenCV distance transform.
+Commanded PWM is only the centre of the search window; the match decides the
+answer, which is why the estimate survives the motor battery sagging.
+
+It is genuinely simultaneous localization and mapping, and just as genuinely a
+small one: **no loop closure and no pose-graph optimization.** Error creeps and
+is never corrected by revisiting a place, so treat the map as a good sketch of
+the room the robot is in now, not a survey. It is deliberately confined to
+advisory work. The occupancy grid never reaches the corridor geometry or the
+escape ladder; obstacle avoidance always runs on the live scan. A wrong pose
+therefore makes the robot explore badly, never drive into furniture.
+
+Two failure handlers matter in practice. A match residual above 13 cm marks the
+pose `SEARCHING` on the dashboard, freezes map updates, and drops the
+exploration bias to zero. If that persists for about three seconds the tracker
+throws the map away and rebuilds around the current position, rather than
+dead-reckoning itself out of the room.
+
+Known-free cells that touch unknown space form **frontiers**, and their
+direction becomes a scored preference in the planner. That is what turns
+"drives around safely" into "works through the room".
+
+Disable the whole subsystem with `--no-slam` if you want the older purely
+reactive behaviour.
+
+### What the camera adds
+
+The LD19 measures one horizontal plane at its mounting height, so a shoe, a
+cable, or a book is invisible to it. The camera covers that gap with a floor
+guard: it learns the floor's appearance from the strip directly ahead and flags
+sustained off-colour clutter low in the frame.
+
+Without a calibrated camera height and tilt there is no honest way to turn that
+into metres, so it never produces a distance or a bearing and never steers. Its
+only authority is a forward speed cap, shown as `FLOOR n%` and `LOW-OBSTACLE`
+on the dashboard. A patterned rug can still trigger it; `--no-low-obstacle-guard`
+turns it off. Confirmed people remain a full stop, and their bearing biases
+steering away before a stop becomes necessary.
+
+### Reading the dashboard
+
+The right panel is the SLAM occupancy map: blue-ish cells are measured
+obstacles, grey-green is confirmed free space, dark is unknown, and the trail
+is where the robot believes it has been. The green/blue fan is the per-heading
+body-inflated travel limit and the yellow arrow is the chosen heading.
+
+The header lines carry planner state and reason; LD19 liveness, point count,
+spin rate and CRC error count; forward and rear clearance; ultrasonic trust;
+measured yaw rate, accumulated turn and recovery count; SLAM state, residual
+and cost in milliseconds; frontier bearing and weight; and floor coverage.
 
 The LD19's 0-degree direction must physically point forward. If your mount is
 rotated, set its correction before launching, for example:
@@ -321,9 +363,20 @@ The robot navigation tests run without any hardware and cover the body-inflated
 corridor test (including a gap one robot accepts and a wider robot rejects),
 thin-obstacle survival, rear clearance, LiDAR yaw estimation, stall detection,
 ultrasonic distrust, the anti-orbit penalty, the escape ladder, and the motor
-deadband. Two of them encode field failures directly: a close ultrasonic
-reading with clear LiDAR must still make forward progress, and a dead end must
-produce a reverse rather than a stop.
+deadband. Several encode field failures directly: a close ultrasonic reading
+with clear LiDAR must still make forward progress, a dead end must produce a
+reverse rather than a stop, and an open room must not weave.
+
+The SLAM tests cover occupancy integration, the distance field, map recentring,
+frontier direction, recovery of a known translation and rotation, sweep
+deskewing, divergence detection, and the map restart. The camera guard is
+tested on a plain floor and on a planted object.
+
+None of this is a hardware measurement. A closed-loop simulation of the control
+law in a synthetic room is used to check behaviour that unit tests cannot:
+coverage, absence of orbiting, and pose error against ground truth including a
+modelled intermittent 55% drivetrain slip. Simulated results do not transfer
+directly to a real floor with real wheel slip and real LiDAR noise.
 
 ## LD19 LiDAR visualizer
 
