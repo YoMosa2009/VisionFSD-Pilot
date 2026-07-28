@@ -34,8 +34,9 @@ from robot_navigation import (
 )
 
 
-GEOMETRY = RobotGeometry(width_m=0.17, length_m=0.22, lidar_forward_offset_m=0.02,
-                         safety_margin_m=0.055)
+# The measured OSOYOO chassis: 140 mm wide, 150 mm long, LD19 taken as centred.
+GEOMETRY = RobotGeometry(width_m=0.14, length_m=0.15, lidar_forward_offset_m=0.0,
+                         safety_margin_m=0.040)
 
 
 def open_room(distance_m: float = 2.6) -> ScanFrame:
@@ -73,9 +74,9 @@ def drive_cycles(planner: NavigationPlanner, scan: ScanFrame, start: float, cycl
 
 class GeometryTests(unittest.TestCase):
     def test_derived_dimensions(self) -> None:
-        self.assertAlmostEqual(GEOMETRY.corridor_half_width_m, 0.085 + 0.055)
-        self.assertAlmostEqual(GEOMETRY.front_overhang_m, 0.11 - 0.02)
-        self.assertAlmostEqual(GEOMETRY.rear_overhang_m, 0.11 + 0.02)
+        self.assertAlmostEqual(GEOMETRY.corridor_half_width_m, 0.070 + 0.040)
+        self.assertAlmostEqual(GEOMETRY.front_overhang_m, 0.075)
+        self.assertAlmostEqual(GEOMETRY.rear_overhang_m, 0.075)
         self.assertGreater(GEOMETRY.pivot_radius_m, GEOMETRY.corridor_half_width_m)
 
 
@@ -282,6 +283,31 @@ class PlannerTests(unittest.TestCase):
         self.assertGreater(min(command.left_pwm, command.right_pwm), 0)
         self.assertGreaterEqual(max(command.left_pwm, command.right_pwm), 60)
 
+    def test_straight_ahead_is_an_actual_candidate(self) -> None:
+        """An even candidate split leaves -1 and +1 tying, and the robot weaves."""
+        headings = NavigationPlanner(GEOMETRY, PlannerTuning(), 0.0, started_at=0.0).corridor.headings
+        self.assertIn(0.0, set(float(value) for value in headings))
+
+    def test_open_room_does_not_weave(self) -> None:
+        """The reported failure: it wandered left and right while driving straight."""
+        planner = self.make()
+        planner.motion.stall_after_s = float("inf")
+        headings = []
+        for index in range(60):
+            command = planner.decide(open_room(2.8), None, True, True, False, [], 1.0 + index * 0.1)
+            headings.append(command.heading_deg)
+        settled = headings[10:]
+        self.assertEqual(set(settled), {0.0}, f"heading wandered: {sorted(set(settled))}")
+        self.assertEqual(command.left_pwm, command.right_pwm)
+
+    def test_exploration_memory_does_not_curl_a_straight_run(self) -> None:
+        """Penalising the heading currently being driven turns a straight line into an arc."""
+        planner = self.make()
+        planner.motion.stall_after_s = float("inf")
+        for index in range(120):
+            command = planner.decide(open_room(2.8), None, True, True, False, [], 1.0 + index * 0.1)
+        self.assertAlmostEqual(command.heading_deg, 0.0, places=6)
+
     def test_obstacle_ahead_produces_a_forward_arc_not_a_stop(self) -> None:
         scan = scan_from_ranges({angle: 0.75 for angle in range(-14, 15)}, default=2.8)
         planner = self.make()
@@ -301,8 +327,8 @@ class PlannerTests(unittest.TestCase):
 
     def test_too_tight_to_turn_still_nudges_backwards(self) -> None:
         """Between "can reverse freely" and "hopeless" there must still be a move."""
-        ranges = {angle % 360: 0.34 for angle in range(-180, 181)}
-        ranges.update({angle % 360: 0.18 for angle in range(-100, 101)})
+        ranges = {angle % 360: 0.30 for angle in range(-180, 181)}
+        ranges.update({angle % 360: 0.12 for angle in range(-100, 101)})
         planner = self.make()
         command = drive_cycles(planner, scan_from_ranges(ranges), 1.0, 3)
         self.assertEqual(command.state, "REVERSE")
@@ -310,7 +336,7 @@ class PlannerTests(unittest.TestCase):
 
     def test_fully_enclosed_robot_holds_rather_than_driving_blind(self) -> None:
         planner = self.make()
-        command = drive_cycles(planner, scan_from_ranges({}, default=0.16), 1.0, 3)
+        command = drive_cycles(planner, scan_from_ranges({}, default=0.11), 1.0, 3)
         self.assertEqual(command.state, "HOLD")
         self.assertEqual((command.left_pwm, command.right_pwm), (0, 0))
 

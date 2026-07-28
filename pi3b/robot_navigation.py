@@ -49,10 +49,14 @@ class RobotGeometry:
     corridor test measures from the wrong origin and the robot clips corners.
     """
 
-    width_m: float = 0.17
-    length_m: float = 0.22
-    lidar_forward_offset_m: float = 0.02
-    safety_margin_m: float = 0.055
+    width_m: float = 0.14
+    length_m: float = 0.15
+    # Measured chassis, LiDAR assumed centred until measured.  Set
+    # VISIONFSD_LIDAR_OFFSET_M if the LD19 is not over the middle of the robot.
+    lidar_forward_offset_m: float = 0.0
+    # Scaled down with the body: on a 0.14 m robot the previous 0.055 m was 79%
+    # of the half-width, which quietly made every gap look narrower than it is.
+    safety_margin_m: float = 0.040
 
     @property
     def half_width_m(self) -> float:
@@ -165,9 +169,14 @@ class CorridorModel:
     Pi 3B's planning cost near a millisecond.
     """
 
-    def __init__(self, geometry: RobotGeometry, span_deg: float = 105.0, step_deg: float = 2.0) -> None:
+    def __init__(self, geometry: RobotGeometry, span_deg: float = 104.0, step_deg: float = 2.0) -> None:
         self.geometry = geometry
-        self.headings = np.arange(-span_deg, span_deg + step_deg / 2.0, step_deg, dtype=np.float32)
+        # The span must be a whole number of steps so that 0 degrees is itself a
+        # candidate.  With an even split the two nearest options are -1 and +1,
+        # they tie in open space, and argmax alternates between them: the robot
+        # weaves while believing it is driving straight.
+        steps = int(round(span_deg / step_deg))
+        self.headings = (np.arange(-steps, steps + 1, dtype=np.float32) * step_deg)
         bins = np.arange(BIN_COUNT, dtype=np.float32)
         delta = np.radians(((bins[None, :] - self.headings[:, None]) + 180.0) % 360.0 - 180.0)
         self._sin = np.sin(delta).astype(np.float32)
@@ -449,6 +458,12 @@ class PlannerTuning:
     clearance_saturation_m: float = 1.60
     straight_cost_per_90deg: float = 0.90
     arc_max_deg: float = 42.0
+    # A new heading must be this much better before the robot commits to it.
+    # It exists to stop near-tied candidates swapping every cycle on scan noise.
+    # Keep it small: the margin is also the largest standing heading bias the
+    # robot can hold, since straight-line cost has to overcome it to recentre.
+    # At 0.9 m per 90 degrees, 0.05 caps that bias at about 5 degrees.
+    heading_switch_margin_m: float = 0.05
     circling_penalty: float = 0.80
     exploration_penalty: float = 0.55
     person_penalty: float = 1.20
@@ -485,6 +500,7 @@ class NavigationPlanner:
         self._reverse_floor_m = 0.0
         self._speed_scale = 1.0
         self._commit_until = 0.0
+        self._heading_index: int | None = None
         self._blocked_since: float | None = None
         self._last_escape_dir = 1
         self._unknown_kernel = np.ones(25, dtype=np.float32) / 25.0
@@ -531,6 +547,7 @@ class NavigationPlanner:
         self.state, self.reason = state, reason
         self.left_pwm = self.right_pwm = 0
         self._manoeuvre = None
+        self._heading_index = None
         return DriveCommand(0, 0, state, reason, self.chosen_heading, 0)
 
     def _speed_for(self, limit_m: float) -> int:
@@ -584,8 +601,12 @@ class NavigationPlanner:
             strength = min(1.0, (abs(turn_integral) - 240.0) / 360.0)
             score -= same_way * (np.abs(headings) / 90.0) * tuning.circling_penalty * strength
 
+        # Heading-diversity only influences which way to *turn*.  Applying it to
+        # near-straight candidates penalises whatever heading the robot is
+        # currently driving along, which curls a straight run into a slow arc.
         world = (self.yaw.heading_deg + headings) % 360.0
-        score -= self.memory.penalty(world) * tuning.exploration_penalty
+        turning = np.clip((np.abs(headings) - 10.0) / 30.0, 0.0, 1.0)
+        score -= self.memory.penalty(world) * tuning.exploration_penalty * turning
 
         # An unmeasured direction is a candidate frontier, not a wall.
         unknown = (~np.isfinite(scan.ranges)).astype(np.float32)
@@ -666,6 +687,12 @@ class NavigationPlanner:
 
         self._blocked_since = None
         best = int(np.argmax(np.where(usable, scores, -np.inf)))
+        # Stay on the previous heading unless a different one is clearly better.
+        previous = self._heading_index
+        if previous is not None and usable[previous] and best != previous:
+            if scores[previous] + self.tuning.heading_switch_margin_m >= scores[best]:
+                best = previous
+        self._heading_index = best
         heading = float(self.corridor.headings[best])
         limit = float(limits[best])
         self.chosen_heading = heading
@@ -707,6 +734,7 @@ class NavigationPlanner:
             return self._begin_recovery(scan, now, "PIVOT_TOO_TIGHT")
         direction = 1 if target_deg > 0 else -1
         self._manoeuvre = "PIVOT"
+        self._heading_index = None
         self._manoeuvre_dir = direction
         self._manoeuvre_until = now + self.tuning.pivot_max_s
         self._pivot_goal_deg = (self.yaw.heading_deg + target_deg) % 360.0
@@ -744,6 +772,7 @@ class NavigationPlanner:
     def _start_reverse(self, now: float, curve: int, burst_s: float, abort_below_m: float,
                        reason: str) -> DriveCommand:
         self._manoeuvre = "REVERSE"
+        self._heading_index = None
         self._manoeuvre_dir = curve
         self._manoeuvre_until = now + burst_s
         self._reverse_floor_m = abort_below_m
@@ -754,6 +783,7 @@ class NavigationPlanner:
     def _start_escape_pivot(self, scan: ScanFrame, now: float, cause: str) -> DriveCommand:
         direction = self._best_pivot_direction(scan)
         self._manoeuvre = "PIVOT"
+        self._heading_index = None
         self._manoeuvre_dir = direction
         self._manoeuvre_until = now + self.tuning.pivot_max_s
         # No specific target when escaping: sweep a quarter turn and re-plan.
