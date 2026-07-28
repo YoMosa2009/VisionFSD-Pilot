@@ -67,20 +67,6 @@ class SectorClearance:
     front_right_m: float | None = None
 
 
-@dataclass(frozen=True)
-class DirectionalClearance:
-    """Dense, current LD19 clearances used to choose an exploration heading."""
-
-    samples: tuple[tuple[float, float | None], ...]
-    fresh: bool
-
-    def nearest(self, bearing_deg: float) -> float | None:
-        if not self.fresh or not self.samples:
-            return None
-        _bearing, distance = min(self.samples, key=lambda item: abs(_signed_angle(item[0] - bearing_deg)))
-        return distance
-
-
 def _signed_angle(angle: float) -> float:
     return (angle + 180.0) % 360.0 - 180.0
 
@@ -247,20 +233,6 @@ class LD19Link:
             _sector_clearance(points, 35.0, 20.0),
         )
 
-    def directions(self) -> DirectionalClearance:
-        """Use more of the LD19 than the five coarse safety sectors alone."""
-        points, fresh = self.snapshot()
-        if not fresh:
-            return DirectionalClearance((), False)
-        # A 10-degree, 17-direction profile is still tiny on a Pi 3B but
-        # gives the planner a real choice of paths instead of just five coarse
-        # left/centre/right sectors.
-        headings = tuple(float(value) for value in range(-80, 81, 10))
-        return DirectionalClearance(
-            tuple((heading, _sector_clearance(points, heading, 9.0)) for heading in headings),
-            True,
-        )
-
     def close(self) -> None:
         self._running = False
         try:
@@ -396,10 +368,6 @@ class AutonomousPolicy:
         self._arc_active = False
         self._guidance_bias = 0.0
         self.drive_confidence = 0.0
-        self._goal_world_heading: float | None = None
-        self._goal_until = 0.0
-        self._goal_visits = np.zeros(12, dtype=np.float32)
-        self.goal_bearing = 0.0
         self.last_command = "STOP"
         self.left_pwm = 0
         self.right_pwm = 0
@@ -443,76 +411,25 @@ class AutonomousPolicy:
         return self._set_output("R", turn_speed, -turn_speed)
 
     def _arc(self, direction: str, base_speed: int) -> str:
-        return self._arc_bearing(-45.0 if direction == "L" else 45.0, base_speed)
-
-    def _arc_bearing(self, bearing_deg: float, base_speed: int) -> str:
         # Both tracks stay forward.  This is smoother and uses less peak motor
         # current than repeatedly stopping and pivoting at every obstacle.
         outer = max(58, base_speed)
         # Keep both motors above the practical low-PWM region of this cheap
         # chassis.  A very low inner PWM is more likely to stall a wheel than
         # produce a smooth arc, especially as the motor battery weakens.
-        turn_strength = float(np.clip(abs(bearing_deg) / 60.0, 0.18, 1.0))
-        inner = max(48, int(outer * (1.0 - 0.38 * turn_strength)))
-        if bearing_deg < 0.0:
+        inner = max(48, int(outer * 0.62))
+        if direction == "L":
             return self._set_output("F", inner, outer)
         return self._set_output("F", outer, inner)
-
-    def _active_goal(self, directions: DirectionalClearance | None, map_heading_deg: float,
-                     now: float, minimum_clearance: float) -> tuple[float, float] | None:
-        if directions is None or self._goal_world_heading is None or now >= self._goal_until:
-            return None
-        relative = _signed_angle(self._goal_world_heading - map_heading_deg)
-        clearance = directions.nearest(relative)
-        if clearance is None or clearance < minimum_clearance or abs(relative) > 88.0:
-            return None
-        self.goal_bearing = relative
-        return relative, clearance
-
-    def _choose_exploration_goal(self, directions: DirectionalClearance | None, map_heading_deg: float,
-                                 now: float, minimum_clearance: float,
-                                 force_side: bool = False) -> tuple[float, float] | None:
-        """Pick and lock a measured open heading instead of wandering randomly."""
-        active = self._active_goal(directions, map_heading_deg, now, minimum_clearance)
-        if active is not None:
-            return active
-        if directions is None or not directions.fresh:
-            return None
-        self._goal_visits *= 0.94
-        candidates: list[tuple[float, float, float]] = []
-        for bearing, clearance in directions.samples:
-            if clearance is None or clearance < minimum_clearance:
-                continue
-            if force_side and abs(bearing) < 25.0:
-                continue
-            world_heading = (map_heading_deg + bearing) % 360.0
-            history_bin = int(world_heading // 30.0) % len(self._goal_visits)
-            # Enough room beats merely far-away room.  The straight preference
-            # makes an open room drive purposefully forward; the small history
-            # penalty only matters at decision points and reduces loops.
-            score = min(clearance, 1.8) - abs(bearing) * 0.0055 - float(self._goal_visits[history_bin]) * 0.16
-            candidates.append((score, bearing, clearance))
-        if not candidates:
-            self._goal_world_heading = None
-            return None
-        _score, bearing, clearance = max(candidates, key=lambda item: item[0])
-        self._goal_world_heading = (map_heading_deg + bearing) % 360.0
-        self._goal_until = now + (1.25 if force_side else 0.90)
-        history_bin = int(self._goal_world_heading // 30.0) % len(self._goal_visits)
-        self._goal_visits[history_bin] += 1.0
-        self.goal_bearing = bearing
-        return bearing, clearance
 
     def _set_stop(self, reason: str) -> str:
         self.reason = reason
         self._arc_active = False
         self.drive_confidence = 0.0
-        self._goal_world_heading = None
         return self._set_output("STOP", 0, 0)
 
     def decide(self, lidar: SectorClearance, arduino: ArduinoStatus, person: bool, now: float,
-               camera_ready: bool = True, directions: DirectionalClearance | None = None,
-               map_heading_deg: float = 0.0) -> str:
+               camera_ready: bool = True) -> str:
         if now - self.started_at < self.standby_s:
             return self._set_stop(f"STANDBY {max(0, int(self.standby_s - (now - self.started_at)))}s")
         if now - arduino.received_at > 1.5:
@@ -533,10 +450,7 @@ class AutonomousPolicy:
         close_ultrasonic = arduino.front_cm is not None and arduino.front_cm < 22.0
         close_lidar = lidar.front_m < 0.42
         if close_ultrasonic or close_lidar:
-            goal = self._choose_exploration_goal(directions, map_heading_deg, now, 0.34, force_side=True)
-            choice = self._choose_turn(lidar, now) if goal is None else (
-                "L" if goal[0] < 0.0 else "R", goal[1]
-            )
+            choice = self._choose_turn(lidar, now)
             if choice is None or choice[1] < 0.34:
                 return self._set_stop("STOP:ESCAPE_SIDE_BLOCKED")
             self.turn_command = choice[0]
@@ -557,27 +471,14 @@ class AutonomousPolicy:
         elif lidar.front_m > 1.05:
             self._arc_active = False
         if self._arc_active:
-            goal = self._choose_exploration_goal(directions, map_heading_deg, now, 0.42)
-            choice = self._choose_turn(lidar, now) if goal is None else (
-                "L" if goal[0] < 0.0 else "R", goal[1]
-            )
+            choice = self._choose_turn(lidar, now)
             if choice is not None and choice[1] >= 0.42:
                 progress = float(np.clip((lidar.front_m - 0.42) / 0.63, 0.0, 1.0))
                 base = int(max(56, self.speed * (0.78 + 0.22 * progress)))
-                bearing = goal[0] if goal is not None else (-45.0 if choice[0] == "L" else 45.0)
-                self.reason = f"EXPLORE_ARC:{bearing:+.0f}deg"
+                self.reason = f"ARC_AVOID:{choice[0]}"
                 self.drive_confidence = 0.55 + 0.25 * progress
-                return self._arc_bearing(bearing, min(self.speed, base))
+                return self._arc(choice[0], min(self.speed, base))
             return self._set_stop("STOP:ARC_SIDE_BLOCKED")
-
-        # Finish a short, measured exploration heading after the obstacle has
-        # cleared.  The live LiDAR profile must still agree; a remembered map
-        # direction is never allowed to pull the robot through a new obstacle.
-        active_goal = self._active_goal(directions, map_heading_deg, now, 0.50)
-        if active_goal is not None and abs(active_goal[0]) >= 6.0:
-            self.reason = f"EXPLORE_TARGET:{active_goal[0]:+.0f}deg"
-            self.drive_confidence = 0.74
-            return self._arc_bearing(active_goal[0], self.speed)
 
         # Centre gently toward the clearer front quarter.  It is deliberately
         # capped so a noisy far-wall measurement cannot cause a sharp turn.
@@ -645,8 +546,7 @@ def draw_dashboard(frame: np.ndarray, local_map: np.ndarray, policy: AutonomousP
     match = "MATCH" if slam_lite.matched else "PREDICT"
     cv2.putText(panel,
                 f"NAV CONFIDENCE {policy.drive_confidence:.2f}   SLAM-LITE {match} "
-                f"yaw {slam_lite.yaw_confidence:.2f} correction {slam_lite.yaw_correction_deg:+.1f}deg "
-                f"TARGET {policy.goal_bearing:+.0f}deg",
+                f"yaw {slam_lite.yaw_confidence:.2f} correction {slam_lite.yaw_correction_deg:+.1f}deg",
                 (12, 106), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (185, 205, 225), 1, cv2.LINE_AA)
     return panel
 
@@ -705,12 +605,9 @@ def main() -> int:
             now = time.monotonic()
             camera.tick()
             clearance = lidar.clearance()
-            directions = lidar.directions()
             status = arduino.status()
             camera_ready = camera.ready(now)
-            map_state = local_map.state()
-            command = policy.decide(clearance, status, camera.person_in_path(), now, camera_ready,
-                                    directions, map_state.heading_deg)
+            command = policy.decide(clearance, status, camera.person_in_path(), now, camera_ready)
             policy.send(arduino, command, now)
             points, _fresh = lidar.snapshot()
             slam_lite = local_map.update(points, policy.left_pwm, policy.right_pwm, now)

@@ -7,7 +7,7 @@ import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from robot_autonomy import ArduinoStatus, AutonomousPolicy, DirectionalClearance, SectorClearance
+from robot_autonomy import ArduinoStatus, AutonomousPolicy, SectorClearance
 
 
 class AutonomousPolicyTests(unittest.TestCase):
@@ -88,42 +88,6 @@ class AutonomousPolicyTests(unittest.TestCase):
         policy = AutonomousPolicy(0.0, 70)
         clear = SectorClearance(1.2, 1.0, 1.0, True)
         self.assertEqual(policy.decide(clear, self.status, False, time.monotonic()), "F")
-
-    def test_dense_lidar_profile_selects_a_measured_exploration_arc(self) -> None:
-        policy = AutonomousPolicy(0.0, 70)
-        now = time.monotonic()
-        # The left-forward opening is both close enough to be safe and more
-        # useful than the right.  This must become a measured path choice,
-        # not an arbitrary left/right reaction.
-        directions = DirectionalClearance((
-            (-60.0, 1.1), (-40.0, 1.6), (-20.0, 2.0), (0.0, 0.70),
-            (20.0, 1.0), (40.0, 0.85), (60.0, 0.80),
-        ), True)
-        obstacle = SectorClearance(0.70, 1.6, 0.8, True, 1.5, 0.8)
-        self.assertEqual(policy.decide(obstacle, self.status, False, now, directions=directions), "F")
-        self.assertLess(policy.left_pwm, policy.right_pwm)
-        self.assertIn("EXPLORE_ARC", policy.reason)
-        self.assertLess(policy.goal_bearing, 0.0)
-
-    def test_exploration_goal_is_locked_against_small_scan_changes(self) -> None:
-        policy = AutonomousPolicy(0.0, 70)
-        now = time.monotonic()
-        obstacle = SectorClearance(0.72, 1.5, 1.2, True, 1.4, 1.1)
-        first = DirectionalClearance((
-            (-50.0, 1.2), (-30.0, 1.9), (-10.0, 1.45), (10.0, 1.2),
-            (30.0, 1.1), (50.0, 1.0),
-        ), True)
-        policy.decide(obstacle, self.status, False, now, directions=first)
-        first_bearing = policy.goal_bearing
-        # A distant right reading improves slightly.  The safe, active left
-        # route should remain locked until its short commitment expires.
-        second = DirectionalClearance((
-            (-50.0, 1.2), (-30.0, 1.75), (-10.0, 1.45), (10.0, 1.2),
-            (30.0, 2.0), (50.0, 1.0),
-        ), True)
-        policy.decide(obstacle, self.status, False, now + 0.15, directions=second)
-        self.assertAlmostEqual(policy.goal_bearing, first_bearing)
-        self.assertLess(policy.left_pwm, policy.right_pwm)
 
 
 if __name__ == "__main__":
