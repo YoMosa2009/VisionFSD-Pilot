@@ -265,8 +265,11 @@ class LocalLidarMap:
         columns = ((self.x + np.sin(angles[keep]) * distances[keep]) * scale).astype(np.int32)
         rows = ((self.y - np.cos(angles[keep]) * distances[keep]) * scale).astype(np.int32)
         inside = (rows >= 0) & (rows < self.cells) & (columns >= 0) & (columns < self.cells)
-        self.grid = (self.grid.astype(np.float32) * 0.985).astype(np.uint8)
-        np.add.at(self.grid, (rows[inside], columns[inside]), 40)
+        # Accumulate in uint16: np.add.at sums duplicate indices, so a bright
+        # cell would otherwise wrap past 255 and suddenly go dark.
+        faded = (self.grid.astype(np.float32) * 0.985).astype(np.uint16)
+        np.add.at(faded, (rows[inside], columns[inside]), 40)
+        self.grid = np.minimum(faded, 255).astype(np.uint8)
 
     def render(self, size: int = 460) -> np.ndarray:
         image = cv2.resize(self.grid, (size, size), interpolation=cv2.INTER_NEAREST)
@@ -535,12 +538,8 @@ def main() -> int:
                 person,
                 camera.person_bearings(),
                 now,
+                camera.clutter_scale(),
             )
-            clutter = camera.clutter_scale()
-            if clutter < 1.0 and command.left_pwm > 0 and command.right_pwm > 0:
-                command = DriveCommand(int(command.left_pwm * clutter), int(command.right_pwm * clutter),
-                                       command.state, command.reason + " CAM_SLOW",
-                                       command.heading_deg, command.target_speed)
             sender.send(arduino, command, now)
             plan_hz = 0.85 * plan_hz + 0.15 / max(1e-3, now - last_plan_at)
             last_plan_at = now

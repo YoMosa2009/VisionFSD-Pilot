@@ -116,6 +116,13 @@ forward travel. Sampling no longer happens inside a `DRIVE` command, so a motor
 update is never delayed by an echo timeout. Reverse and pivots are never gated,
 so the Pi can always drive out of a close-range situation.
 
+**Re-flashing is required for v1.0.0, not optional.** The planner makes tight
+turns by idling the inner wheel, so it sends commands such as `DRIVE 105 0`.
+Firmware before v1.0.0 only gated a command when *both* wheels were positive,
+so on old firmware those close-quarters turns would drive past the 18 cm
+ultrasonic guard entirely. The current sketch gates any command with a forward
+component.
+
 Run a supervised first test on blocks, wheels free, then on an empty floor:
 
 ```bash

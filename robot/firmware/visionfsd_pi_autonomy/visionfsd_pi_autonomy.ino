@@ -127,9 +127,13 @@ char describeMotion(int left, int right) {
 void driveDifferential(int left, int right) {
   left = constrain(left, -MAX_SAFE_SPEED, MAX_SAFE_SPEED);
   right = constrain(right, -MAX_SAFE_SPEED, MAX_SAFE_SPEED);
-  // Only straight-ahead travel is gated.  Reverse and pivots stay available so
-  // the Pi can always drive itself out of a close-range situation.
-  if (left > 0 && right > 0 && forwardIsBlocked()) {
+  // Any command with a forward component is gated.  A tight arc idles its
+  // inner wheel, so the Pi legitimately sends values like (105, 0); testing
+  // for "both wheels positive" would let exactly those close-quarters turns
+  // drive past the guard.  Reverse and pivots have a negative wheel and stay
+  // ungated, so the Pi can always drive itself out of a tight spot.
+  bool forwardComponent = (left >= 0 && right >= 0) && (left > 0 || right > 0);
+  if (forwardComponent && forwardIsBlocked()) {
     stopMotors();
     Serial.println(F("BLOCKED:FRONT_ULTRASONIC"));
     return;

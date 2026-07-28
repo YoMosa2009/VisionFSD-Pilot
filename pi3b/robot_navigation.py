@@ -202,11 +202,14 @@ def reverse_limit(scan: ScanFrame, geometry: RobotGeometry, span_deg: float = 30
     delta = np.radians(((np.arange(BIN_COUNT, dtype=np.float32) - 180.0) + 180.0) % 360.0 - 180.0)
     lateral = np.sin(delta) * ranges
     along = np.cos(delta) * ranges
-    inside = (np.abs(np.degrees(delta)) <= span_deg) & (
-        np.abs(lateral) <= geometry.corridor_half_width_m + 0.02
-    )
+    in_cone = np.abs(np.degrees(delta)) <= span_deg
+    inside = in_cone & (np.abs(lateral) <= geometry.corridor_half_width_m + 0.02)
     if not np.any(inside):
-        return PLANNING_HORIZON_M
+        # Nothing measured behind the robot within LiDAR range.  That is good
+        # evidence of open floor in the scan plane, but it is not a measurement,
+        # so claim only enough room for one short burst rather than a clear run.
+        confirmed = int(np.count_nonzero(np.isfinite(scan.ranges) & in_cone))
+        return PLANNING_HORIZON_M if confirmed >= 4 else 0.30
     limit = float(np.min(np.where(inside, along, np.inf))) - geometry.rear_overhang_m
     return float(np.clip(limit, 0.0, PLANNING_HORIZON_M))
 
@@ -480,6 +483,7 @@ class NavigationPlanner:
         self._manoeuvre_dir = 1
         self._pivot_goal_deg = 0.0
         self._reverse_floor_m = 0.0
+        self._speed_scale = 1.0
         self._commit_until = 0.0
         self._blocked_since: float | None = None
         self._last_escape_dir = 1
@@ -534,7 +538,10 @@ class NavigationPlanner:
         span = max(0.05, tuning.cruise_limit_m - tuning.creep_limit_m)
         fraction = float(np.clip((limit_m - tuning.creep_limit_m) / span, 0.0, 1.0))
         slowest = max(tuning.min_move_pwm, int(tuning.speed * 0.62))
-        return int(round(slowest + fraction * (tuning.speed - slowest)))
+        value = (slowest + fraction * (tuning.speed - slowest)) * self._speed_scale
+        # Any external slow-down still has to clear the motor deadband, or the
+        # wheels only buzz and the stall detector fires on our own command.
+        return int(round(max(tuning.min_move_pwm, value)))
 
     def _arc(self, heading_deg: float, speed: int) -> DriveCommand:
         # Curvature scales with heading error, so a distant obstacle is dodged
@@ -599,7 +606,11 @@ class NavigationPlanner:
     # ---- main entry point ------------------------------------------------
     def decide(self, scan: ScanFrame | None, front_cm: float | None, uno_fresh: bool,
                camera_ready: bool, person_stop: bool, person_bearings: list[float],
-               now: float) -> DriveCommand:
+               now: float, speed_scale: float = 1.0) -> DriveCommand:
+        # A caller-supplied slow-down (for example the camera seeing clutter
+        # close ahead) is applied as a speed cap inside the planner, so it goes
+        # through the same deadband and ramp handling as every other output.
+        self._speed_scale = float(np.clip(speed_scale, 0.5, 1.0))
         if now - self.started_at < self.standby_s:
             remaining = max(0, int(self.standby_s - (now - self.started_at)))
             return self._stop("STANDBY", f"STANDBY {remaining}s")

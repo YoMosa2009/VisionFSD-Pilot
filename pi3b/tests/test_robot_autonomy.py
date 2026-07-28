@@ -355,6 +355,36 @@ class PlannerTests(unittest.TestCase):
                 self.assertTrue(value == 0 or abs(value) >= 50, f"deadband PWM {value}")
                 self.assertLessEqual(abs(value), 105)
 
+    def test_tight_arc_idles_the_inner_wheel_but_stays_a_forward_command(self) -> None:
+        """A tight arc emits values like (105, 0), which the Uno must still gate."""
+        planner = self.make()
+        command = None
+        for _ in range(6):
+            command = planner._arc(35.0, 62)
+        self.assertEqual(command.right_pwm, 0)
+        self.assertGreater(command.left_pwm, 0)
+        # Both wheels non-negative with one positive: a forward component, and
+        # visionfsd_pi_autonomy.ino gates exactly this shape.
+        self.assertGreaterEqual(min(command.left_pwm, command.right_pwm), 0)
+
+    def test_arcs_across_the_steering_range_respect_the_deadband(self) -> None:
+        for heading in (-40.0, -25.0, -10.0, 0.0, 10.0, 25.0, 40.0):
+            planner = self.make(min_move_pwm=50)
+            for _ in range(6):
+                command = planner._arc(heading, 62)
+            for value in (command.left_pwm, command.right_pwm):
+                self.assertTrue(value == 0 or abs(value) >= 50, f"{heading}deg gave {value}")
+                self.assertLessEqual(abs(value), 105)
+
+    def test_camera_slow_down_never_drops_a_wheel_into_the_deadband(self) -> None:
+        planner = self.make(min_move_pwm=50)
+        planner.motion.stall_after_s = float("inf")
+        for index in range(20):
+            command = planner.decide(open_room(2.8), None, True, True, False, [],
+                                     1.0 + index * 0.1, speed_scale=0.75)
+        for value in (command.left_pwm, command.right_pwm):
+            self.assertTrue(value == 0 or abs(value) >= 50, f"deadband PWM {value}")
+
     def test_pivot_direction_signs_match_the_angle_convention(self) -> None:
         planner = self.make()
         right = planner._pivot(1)
