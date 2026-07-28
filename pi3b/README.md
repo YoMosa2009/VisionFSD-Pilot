@@ -105,8 +105,10 @@ Flash this separate sketch to the Uno first:
 It is intentionally different from the earlier manual-drive sketch: the
 ultrasonic sensor is static and front-facing, the servo is unused/detached to
 avoid its continuous battery draw, motor PWM is capped at 105, and every
-motion command expires after 350 ms. The Uno blocks forward travel below
-18 cm even if the Pi crashes or sends a bad command.
+motion command expires after 350 ms. The Pi sends bounded differential motor
+commands, allowing gentle forward arcs instead of only straight/pivot motion.
+The Uno blocks forward travel below 18 cm even if the Pi crashes or sends a
+bad command. **Re-flash this sketch after each robot-firmware update.**
 
 Run a supervised first test on blocks, wheels free, then on an empty floor:
 
@@ -117,20 +119,34 @@ cd ~/visionfsd-pi && bash ./pi3b/run_robot.sh
 At boot the robot runtime starts in a **25-second STOP standby**. It will not
 move during that interval. Afterwards its authority order is fixed:
 
-1. Uno ultrasonic hard-stop (under 18 cm) wins.
-2. Stale LiDAR, a LiDAR obstacle within 42 cm, or a confirmed person in the
-   camera's forward path tells the Pi to stop/turn.
-3. Only then may the low-speed planner send a forward/turn command.
+1. A stale Uno, LD19, or webcam stops the robot; it will not drive blind.
+2. A confirmed person in the camera's forward path stops it. The camera draws
+   its confirmed-person boxes in the robot display.
+3. The LD19 begins a gentle arc away from a central obstacle below 82 cm. At
+   42 cm (or an ultrasonic return below 22 cm), it uses a short LiDAR-cleared
+   pivot escape instead of remaining stopped in front of the obstacle.
+4. Uno ultrasonic hard-stop (under 18 cm) always wins and blocks forward
+   motor commands even if the Pi fails.
 
-This prevents camera guesses from overriding measured range data and prevents
-LiDAR from overriding the Uno's close front stop. The camera uses confirmed
-person tracking only as a semantic veto; it does not steer around people.
+This keeps roles separate: LD19 geometry chooses an open direction, the camera
+prevents movement toward confirmed people, and the Uno enforces the final
+close-range stop. A camera classification never overrides measured range data.
 
 The LD19 panel includes a small **local LiDAR map**. It accumulates nearby
 returns and uses commanded-motion dead reckoning for the displayed pose. The
 OSOYOO kit has no wheel encoders or IMU, so this is useful local mapping, but
 it is **not reliable metric SLAM**. Add wheel encoders or an IMU before relying
 on a persistent room map, loop closure, or autonomous room navigation.
+
+The LD19's 0-degree direction must physically point forward. If your mount is
+rotated, set its correction before launching, for example:
+
+```bash
+export VISIONFSD_LIDAR_FRONT_OFFSET_DEG=90
+```
+
+Use `-90`, `90`, or `180` only when that matches the actual mounting rotation;
+the dashboard's `F`, `FL`, and `FR` readings make a wrong orientation visible.
 
 ### Boot automatically
 

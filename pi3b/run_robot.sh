@@ -25,4 +25,5 @@ exec "$PYTHON" "$ROOT/robot_autonomy.py" \
   --camera "${VISIONFSD_CAMERA:-0}" \
   --standby-seconds "${VISIONFSD_STANDBY_SECONDS:-25}" \
   --speed "${VISIONFSD_ROBOT_SPEED:-70}" \
+  --lidar-front-offset-deg "${VISIONFSD_LIDAR_FRONT_OFFSET_DEG:-0}" \
   "$@"

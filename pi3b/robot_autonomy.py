@@ -59,19 +59,41 @@ class SectorClearance:
     left_m: float | None
     right_m: float | None
     fresh: bool
+    # These narrower sectors let the planner steer before an obstacle reaches
+    # the centre of the robot.  The wider left/right values remain useful when
+    # choosing a close-range escape direction.
+    front_left_m: float | None = None
+    front_right_m: float | None = None
 
 
 def _signed_angle(angle: float) -> float:
     return (angle + 180.0) % 360.0 - 180.0
 
 
-def _sector_minimum(points: list[tuple[int, object]], centre_deg: float, half_width_deg: float) -> float | None:
-    distances = [
-        point.distance_mm / 1000.0
+def _sector_clearance(points: list[tuple[int, object]], centre_deg: float, half_width_deg: float) -> float | None:
+    """Return a conservative range only when adjacent LD19 returns agree.
+
+    A raw nearest-point rule reacts to one bad LiDAR return.  Requiring a
+    small angular cluster preserves small real obstacles while suppressing a
+    lone speckle, which otherwise makes a lightweight robot twitch or spin.
+    """
+    samples = sorted(
+        (float(point.angle_deg), point.distance_mm / 1000.0)
         for _index, point in points
         if abs(_signed_angle(point.angle_deg - centre_deg)) <= half_width_deg
-    ]
-    return min(distances) if distances else None
+        and 0.08 <= point.distance_mm / 1000.0 <= 4.5
+    )
+    clustered: list[float] = []
+    for angle, distance in samples:
+        neighbours = [
+            other_distance
+            for other_angle, other_distance in samples
+            if abs(_signed_angle(other_angle - angle)) <= 3.0
+            and abs(other_distance - distance) <= max(0.14, distance * 0.22)
+        ]
+        if len(neighbours) >= 2:
+            clustered.append(float(np.median(neighbours)))
+    return min(clustered) if clustered else None
 
 
 def discover_arduino_port() -> str | None:
@@ -105,8 +127,10 @@ class ArduinoLink:
         self._lines: queue.Queue[str] = queue.Queue()
         self._running = True
         self._status = ArduinoStatus(None, "S", 0.0)
+        self._supports_differential = False
         self._reader = threading.Thread(target=self._read_loop, name="uno-status", daemon=True)
         self._reader.start()
+        self.send("CAPS")
         self.send("STOP")
 
     def _read_loop(self) -> None:
@@ -124,6 +148,8 @@ class ArduinoLink:
                 except ValueError:
                     front = None
                 self._status = ArduinoStatus(front, fields.get("motion", "S"), time.monotonic())
+            elif line == "CAPS DRIVE":
+                self._supports_differential = True
             self._lines.put(line)
 
     def send(self, command: str) -> None:
@@ -132,6 +158,10 @@ class ArduinoLink:
 
     def status(self) -> ArduinoStatus:
         return self._status
+
+    @property
+    def differential_ready(self) -> bool:
+        return self._supports_differential
 
     def close(self) -> None:
         try:
@@ -191,10 +221,12 @@ class LD19Link:
         if not fresh:
             return SectorClearance(None, None, None, False)
         return SectorClearance(
-            _sector_minimum(points, 0.0, 22.0),
-            _sector_minimum(points, -75.0, 35.0),
-            _sector_minimum(points, 75.0, 35.0),
+            _sector_clearance(points, 0.0, 20.0),
+            _sector_clearance(points, -75.0, 35.0),
+            _sector_clearance(points, 75.0, 35.0),
             True,
+            _sector_clearance(points, -35.0, 20.0),
+            _sector_clearance(points, 35.0, 20.0),
         )
 
     def close(self) -> None:
@@ -217,21 +249,17 @@ class LocalLidarMap:
         self.heading = 0.0
         self._last_motion_at = time.monotonic()
 
-    def integrate_motion(self, motion: str, now: float) -> None:
+    def integrate_motion(self, left_pwm: int, right_pwm: int, now: float) -> None:
         elapsed = min(0.20, max(0.0, now - self._last_motion_at))
         self._last_motion_at = now
-        # Conservative nominal chassis speeds.  These are display-only and
-        # intentionally do not feed movement decisions.
-        if motion == "F":
-            self.x += math.sin(math.radians(self.heading)) * 0.11 * elapsed
-            self.y -= math.cos(math.radians(self.heading)) * 0.11 * elapsed
-        elif motion == "B":
-            self.x -= math.sin(math.radians(self.heading)) * 0.07 * elapsed
-            self.y += math.cos(math.radians(self.heading)) * 0.07 * elapsed
-        elif motion == "L":
-            self.heading = (self.heading - 72.0 * elapsed) % 360.0
-        elif motion == "R":
-            self.heading = (self.heading + 72.0 * elapsed) % 360.0
+        # Conservative commanded-motion dead reckoning.  It makes the map
+        # follow gradual differential turns, but deliberately never feeds the
+        # movement planner: this chassis has no encoders or IMU.
+        linear = ((left_pwm + right_pwm) * 0.5 / 105.0) * 0.12
+        turn_rate = ((left_pwm - right_pwm) / 105.0) * 104.0
+        self.heading = (self.heading + turn_rate * elapsed) % 360.0
+        self.x += math.sin(math.radians(self.heading)) * linear * elapsed
+        self.y -= math.cos(math.radians(self.heading)) * linear * elapsed
 
     def integrate_points(self, points: list[tuple[int, object]]) -> None:
         scale = self.cells / self.metres
@@ -262,7 +290,7 @@ class LocalLidarMap:
 
 
 class CameraSafety:
-    """Camera is a semantic veto only; it never overrides range sensing."""
+    """Camera health/person semantics are a veto; range sensing steers."""
 
     def __init__(self, model: Path, fallback: Path, camera: str, threads: int, fov: float) -> None:
         try:
@@ -274,6 +302,7 @@ class CameraSafety:
         self.tracker = SceneObjectTracker(fov)
         self._last_camera_sequence = 0
         self._last_result_sequence = 0
+        self._last_frame_at = 0.0
         self.frame: np.ndarray | None = None
         self.people: list[SceneObject] = []
 
@@ -284,6 +313,7 @@ class CameraSafety:
             if sequence > self._last_camera_sequence:
                 self.worker.submit(sequence, frame, captured)
                 self._last_camera_sequence = sequence
+                self._last_frame_at = captured
         result = self.worker.latest_after(self._last_result_sequence)
         if result is not None and self.frame is not None:
             self.people = [item for item in self.tracker.update(
@@ -296,13 +326,33 @@ class CameraSafety:
         # condition.  A one-frame model guess is intentionally ignored.
         return any(item.observed and item.distance_m < 1.7 for item in self.people)
 
+    def ready(self, now: float) -> bool:
+        """Do not drive blind if the webcam has stopped delivering frames."""
+        return self.frame is not None and not self.camera.error and now - self._last_frame_at <= 1.0
+
+    def annotated_frame(self) -> np.ndarray | None:
+        if self.frame is None:
+            return None
+        panel = self.frame.copy()
+        for item in self.people:
+            x1, y1, x2, y2 = (int(value) for value in item.detection.box)
+            cv2.rectangle(panel, (x1, y1), (x2, y2), (50, 70, 255), 2, cv2.LINE_AA)
+            cv2.putText(panel, f"PERSON {item.distance_m:.1f}m", (x1, max(18, y1 - 7)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, (50, 70, 255), 1, cv2.LINE_AA)
+        return panel
+
     def close(self) -> None:
         self.worker.close()
         self.camera.close()
 
 
 class AutonomousPolicy:
-    """One authority, ordered by safety: ultrasonic, LiDAR, camera, planner."""
+    """Sensor-fused, low-speed differential-drive planner.
+
+    The LD19 supplies geometry, the webcam supplies a live/person safety
+    veto, and the Uno's ultrasonic sensor remains the final near-field guard.
+    This is reactive local navigation, not a claim of room-scale SLAM.
+    """
 
     def __init__(self, standby_s: float, speed: int) -> None:
         self.started_at = time.monotonic()
@@ -311,64 +361,152 @@ class AutonomousPolicy:
         self.turn_until = 0.0
         self.turn_command = "L"
         self.last_command = "STOP"
+        self.left_pwm = 0
+        self.right_pwm = 0
+        self._last_output = (0, 0)
         self.last_sent_at = 0.0
         self.reason = "BOOT_STANDBY"
 
-    def decide(self, lidar: SectorClearance, arduino: ArduinoStatus, person: bool, now: float) -> str:
+    @staticmethod
+    def _side_score(primary: float | None, outer: float | None) -> float | None:
+        values = [value for value in (primary, outer) if value is not None]
+        return min(values) if values else None
+
+    def _set_output(self, label: str, left_pwm: int, right_pwm: int) -> str:
+        self.left_pwm = int(np.clip(left_pwm, -105, 105))
+        self.right_pwm = int(np.clip(right_pwm, -105, 105))
+        return label
+
+    def _choose_turn(self, lidar: SectorClearance) -> tuple[str, float] | None:
+        left = self._side_score(lidar.front_left_m, lidar.left_m)
+        right = self._side_score(lidar.front_right_m, lidar.right_m)
+        if left is None and right is None:
+            return None
+        if right is None or (left is not None and left >= right):
+            return "L", left or 0.0
+        return "R", right
+
+    def _pivot(self, direction: str) -> str:
+        turn_speed = max(46, self.speed - 15)
+        if direction == "L":
+            return self._set_output("L", -turn_speed, turn_speed)
+        return self._set_output("R", turn_speed, -turn_speed)
+
+    def _arc(self, direction: str, base_speed: int) -> str:
+        # Both tracks stay forward.  This is smoother and uses less peak motor
+        # current than repeatedly stopping and pivoting at every obstacle.
+        inner = max(34, int(base_speed * 0.42))
+        if direction == "L":
+            return self._set_output("F", inner, base_speed)
+        return self._set_output("F", base_speed, inner)
+
+    def decide(self, lidar: SectorClearance, arduino: ArduinoStatus, person: bool, now: float,
+               camera_ready: bool = True) -> str:
         if now - self.started_at < self.standby_s:
             self.reason = f"STANDBY {max(0, int(self.standby_s - (now - self.started_at)))}s"
-            return "STOP"
+            return self._set_output("STOP", 0, 0)
         if now - arduino.received_at > 1.5:
             self.reason = "STOP:UNO_STATUS_STALE"
-            return "STOP"
+            return self._set_output("STOP", 0, 0)
         if not lidar.fresh:
             self.reason = "STOP:LD19_STALE"
-            return "STOP"
-        if arduino.front_cm is not None and arduino.front_cm < 22.0:
-            self.reason = "STOP:ULTRASONIC"
-            return "STOP"
+            return self._set_output("STOP", 0, 0)
+        if not camera_ready:
+            self.reason = "STOP:CAMERA_STALE"
+            return self._set_output("STOP", 0, 0)
         if person:
             self.reason = "STOP:CONFIRMED_PERSON"
-            return "STOP"
-        if lidar.front_m is not None and lidar.front_m < 0.42:
-            if now >= self.turn_until:
-                self.turn_command = "L" if (lidar.left_m or 0.0) >= (lidar.right_m or 0.0) else "R"
-                self.turn_until = now + 0.65
-            self.reason = f"AVOID:{self.turn_command}"
-            return self.turn_command
+            return self._set_output("STOP", 0, 0)
+        if lidar.front_m is None:
+            self.reason = "STOP:LD19_FRONT_UNSEEN"
+            return self._set_output("STOP", 0, 0)
+
+        # The old policy STOPped when the static ultrasonic saw an obstacle,
+        # which trapped the robot in front of it.  Turning is safe because the
+        # Uno independently blocks only forward motion; the Pi still requires
+        # LD19 clearance before it commands the turn.
+        close_ultrasonic = arduino.front_cm is not None and arduino.front_cm < 22.0
+        close_lidar = lidar.front_m < 0.42
+        if close_ultrasonic or close_lidar:
+            choice = self._choose_turn(lidar)
+            if choice is None or choice[1] < 0.34:
+                self.reason = "STOP:ESCAPE_SIDE_BLOCKED"
+                return self._set_output("STOP", 0, 0)
+            self.turn_command = choice[0]
+            self.turn_until = max(self.turn_until, now + 0.50)
+            source = "ULTRASONIC" if close_ultrasonic else "LD19"
+            self.reason = f"ESCAPE_{source}:{self.turn_command}"
+            return self._pivot(self.turn_command)
         if now < self.turn_until:
-            self.reason = f"TURN:{self.turn_command}"
-            return self.turn_command
-        self.reason = "CLEAR:FORWARD"
-        return "F"
+            self.reason = f"ESCAPE_TURN:{self.turn_command}"
+            return self._pivot(self.turn_command)
+
+        # Begin a gentle differential arc before a central range return gets
+        # close.  This creates continuous avoidance rather than drive/stop.
+        if lidar.front_m < 0.82:
+            choice = self._choose_turn(lidar)
+            if choice is not None and choice[1] >= 0.42:
+                base = int(max(48, self.speed * (0.62 + 0.38 * (lidar.front_m - 0.42) / 0.40)))
+                self.reason = f"ARC_AVOID:{choice[0]}"
+                return self._arc(choice[0], min(self.speed, base))
+            self.reason = "STOP:ARC_SIDE_BLOCKED"
+            return self._set_output("STOP", 0, 0)
+
+        # Centre gently toward the clearer front quarter.  It is deliberately
+        # capped so a noisy far-wall measurement cannot cause a sharp turn.
+        left = self._side_score(lidar.front_left_m, lidar.left_m)
+        right = self._side_score(lidar.front_right_m, lidar.right_m)
+        bias = 0.0
+        if left is not None and right is not None:
+            bias = float(np.clip((left - right) / 2.0, -0.20, 0.20))
+        left_pwm = int(self.speed * (1.0 - bias))
+        right_pwm = int(self.speed * (1.0 + bias))
+        self.reason = "CLEAR:GUIDED_FORWARD" if abs(bias) >= 0.04 else "CLEAR:FORWARD"
+        return self._set_output("F", left_pwm, right_pwm)
 
     def send(self, link: ArduinoLink, command: str, now: float) -> None:
         # Refresh inside the Uno's 350 ms dead-man timeout, but do not spam the
         # USB serial link or waste Pi/Uno CPU on redundant writes.
-        if command != self.last_command or now - self.last_sent_at >= 0.12:
-            if command == "F":
-                link.send(f"SPEED {self.speed}")
-            elif command in ("L", "R"):
-                link.send(f"SPEED {max(48, self.speed - 15)}")
-            link.send(command)
-            self.last_command, self.last_sent_at = command, now
+        output = (self.left_pwm, self.right_pwm)
+        if output != self._last_output or now - self.last_sent_at >= 0.12:
+            if link.differential_ready:
+                link.send(f"DRIVE {output[0]} {output[1]}")
+            elif output == (0, 0):
+                link.send("STOP")
+            elif output[0] >= 0 and output[1] >= 0:
+                # Old firmware still avoids the obstacle, but cannot make the
+                # new gentle arc.  This keeps a missed re-flash fail-safe.
+                link.send("L" if output[0] < output[1] else ("R" if output[0] > output[1] else "F"))
+            elif output[0] <= 0 and output[1] <= 0:
+                link.send("B")
+            else:
+                link.send("L" if output[0] < output[1] else "R")
+            self.last_command, self._last_output, self.last_sent_at = command, output, now
 
 
 def draw_dashboard(frame: np.ndarray, local_map: np.ndarray, policy: AutonomousPolicy,
-                   clearance: SectorClearance, status: ArduinoStatus, person: bool) -> np.ndarray:
+                   clearance: SectorClearance, status: ArduinoStatus, person: bool,
+                   camera_ready: bool, differential_ready: bool) -> np.ndarray:
     height = max(frame.shape[0], local_map.shape[0])
     left = cv2.resize(frame, (int(frame.shape[1] * height / frame.shape[0]), height))
     right = cv2.resize(local_map, (height, height))
     panel = np.hstack((left, right))
-    cv2.rectangle(panel, (0, 0), (panel.shape[1], 72), (14, 22, 31), -1)
+    cv2.rectangle(panel, (0, 0), (panel.shape[1], 94), (14, 22, 31), -1)
     front = "--" if clearance.front_m is None else f"{clearance.front_m:.2f}m"
+    front_left = "--" if clearance.front_left_m is None else f"{clearance.front_left_m:.2f}m"
+    front_right = "--" if clearance.front_right_m is None else f"{clearance.front_right_m:.2f}m"
     ultra = "--" if status.front_cm is None else f"{status.front_cm:.0f}cm"
     lidar_state = "LIVE" if clearance.fresh else "STALE"
-    message = f"{policy.reason}   LD19 {lidar_state} FRONT {front}   ULTRASONIC {ultra}   PERSON {'YES' if person else 'NO'}"
+    camera_state = "LIVE" if camera_ready else "STALE"
+    message = (f"{policy.reason}   LD19 {lidar_state} F {front} FL {front_left} FR {front_right}   "
+               f"ULTRASONIC {ultra}   CAMERA {camera_state}   PERSON {'YES' if person else 'NO'}")
     cv2.putText(panel, "VisionFSD Robot - sensor fused low-speed mode", (12, 27),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, (238, 244, 250), 1, cv2.LINE_AA)
     cv2.putText(panel, message, (12, 56), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
                 (90, 235, 130) if policy.last_command == "F" else (80, 190, 245), 1, cv2.LINE_AA)
+    drive_mode = "DIFFERENTIAL" if differential_ready else "COMPATIBILITY"
+    cv2.putText(panel, f"UNO {drive_mode}: left {policy.left_pwm:+d}  right {policy.right_pwm:+d}",
+                (12, 82), cv2.FONT_HERSHEY_SIMPLEX, 0.43, (215, 225, 235), 1, cv2.LINE_AA)
     return panel
 
 
@@ -406,6 +544,7 @@ def main() -> int:
     arduino = ArduinoLink(arduino_port)
     lidar = LD19Link(lidar_port, args.lidar_front_offset_deg)
     camera = CameraSafety(args.model, args.fallback_model, args.camera, args.threads, args.fov)
+    print(f"VisionFSD Robot: Uno={arduino_port}, LD19={lidar_port}, camera={args.camera}")
     policy = AutonomousPolicy(args.standby_seconds, args.speed)
     local_map = LocalLidarMap()
     keep_running = True
@@ -424,14 +563,16 @@ def main() -> int:
             camera.tick()
             clearance = lidar.clearance()
             status = arduino.status()
-            command = policy.decide(clearance, status, camera.person_in_path(), now)
+            camera_ready = camera.ready(now)
+            command = policy.decide(clearance, status, camera.person_in_path(), now, camera_ready)
             policy.send(arduino, command, now)
             points, _fresh = lidar.snapshot()
-            local_map.integrate_motion(command, now)
+            local_map.integrate_motion(policy.left_pwm, policy.right_pwm, now)
             local_map.integrate_points(points)
-            if not args.no_display and camera.frame is not None:
-                panel = draw_dashboard(camera.frame, local_map.render(), policy, clearance, status,
-                                       camera.person_in_path())
+            display_frame = camera.annotated_frame()
+            if not args.no_display and display_frame is not None:
+                panel = draw_dashboard(display_frame, local_map.render(), policy, clearance, status,
+                                       camera.person_in_path(), camera_ready, arduino.differential_ready)
                 cv2.imshow(WINDOW_TITLE, panel)
                 if cv2.waitKey(1) & 0xFF in (27, ord("q"), ord("Q")):
                     break

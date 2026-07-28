@@ -6,7 +6,8 @@
 // - only the Pi performs LiDAR/camera planning;
 // - no Servo scan is attached, reducing continuous battery draw.
 //
-// Commands at 115200 baud: F, B, L, R, STOP, SPEED 0..105, PING.
+// Commands at 115200 baud: F, B, L, R, STOP, SPEED 0..105,
+// DRIVE <left PWM> <right PWM>, PING.  DRIVE values are -105..105.
 // Status: STATUS motion=<F|B|L|R|S> front_cm=<cm|NO_ECHO>
 
 const byte M1_A = 7;       // IN1 (K1/K2)
@@ -19,7 +20,7 @@ const byte ULTRASONIC_TRIGGER = 3;
 const byte ULTRASONIC_ECHO = 2;
 
 const unsigned long COMMAND_TIMEOUT_MS = 350UL;
-const unsigned long STATUS_PERIOD_MS = 500UL;
+const unsigned long STATUS_PERIOD_MS = 250UL;
 const unsigned long ECHO_TIMEOUT_US = 26000UL;
 const int FORWARD_STOP_DISTANCE_CM = 18;
 const int DEFAULT_SPEED = 70;
@@ -29,6 +30,8 @@ char commandBuffer[24];
 byte commandLength = 0;
 char activeMotion = 'S';
 int driveSpeed = DEFAULT_SPEED;
+int leftOutput = 0;
+int rightOutput = 0;
 unsigned long lastMotionCommandAt = 0;
 unsigned long lastStatusAt = 0;
 
@@ -48,6 +51,8 @@ void stopMotors() {
   setMotor(M1_A, M1_B, M1_ENABLE, 0, 0);
   setMotor(M2_A, M2_B, M2_ENABLE, 0, 0);
   activeMotion = 'S';
+  leftOutput = 0;
+  rightOutput = 0;
 }
 
 long frontDistanceCentimetres() {
@@ -65,35 +70,47 @@ bool forwardIsBlocked() {
   return distance > 0 && distance < FORWARD_STOP_DISTANCE_CM;
 }
 
-void drive(char motion) {
-  if (motion == 'F' && forwardIsBlocked()) {
+char describeMotion(int left, int right) {
+  if (left == 0 && right == 0) return 'S';
+  if (left >= 0 && right >= 0) return 'F';
+  if (left <= 0 && right <= 0) return 'B';
+  return left < right ? 'L' : 'R';
+}
+
+void driveDifferential(int left, int right) {
+  left = constrain(left, -MAX_SAFE_SPEED, MAX_SAFE_SPEED);
+  right = constrain(right, -MAX_SAFE_SPEED, MAX_SAFE_SPEED);
+  if (left > 0 && right > 0 && forwardIsBlocked()) {
     stopMotors();
     Serial.println(F("BLOCKED:FRONT_ULTRASONIC"));
     return;
   }
+  setMotor(M1_A, M1_B, M1_ENABLE, left > 0 ? +1 : (left < 0 ? -1 : 0), abs(left));
+  setMotor(M2_A, M2_B, M2_ENABLE, right > 0 ? +1 : (right < 0 ? -1 : 0), abs(right));
+  leftOutput = left;
+  rightOutput = right;
+  activeMotion = describeMotion(left, right);
+  lastMotionCommandAt = millis();
+}
+
+void drive(char motion) {
   switch (motion) {
     case 'F':
-      setMotor(M1_A, M1_B, M1_ENABLE, +1, driveSpeed);
-      setMotor(M2_A, M2_B, M2_ENABLE, +1, driveSpeed);
+      driveDifferential(driveSpeed, driveSpeed);
       break;
     case 'B':
-      setMotor(M1_A, M1_B, M1_ENABLE, -1, driveSpeed);
-      setMotor(M2_A, M2_B, M2_ENABLE, -1, driveSpeed);
+      driveDifferential(-driveSpeed, -driveSpeed);
       break;
     case 'L':
-      setMotor(M1_A, M1_B, M1_ENABLE, -1, driveSpeed);
-      setMotor(M2_A, M2_B, M2_ENABLE, +1, driveSpeed);
+      driveDifferential(-driveSpeed, driveSpeed);
       break;
     case 'R':
-      setMotor(M1_A, M1_B, M1_ENABLE, +1, driveSpeed);
-      setMotor(M2_A, M2_B, M2_ENABLE, -1, driveSpeed);
+      driveDifferential(driveSpeed, -driveSpeed);
       break;
     default:
       stopMotors();
       return;
   }
-  activeMotion = motion;
-  lastMotionCommandAt = millis();
 }
 
 void handleCommand(const char* command) {
@@ -101,8 +118,25 @@ void handleCommand(const char* command) {
     stopMotors();
   } else if (strcmp(command, "PING") == 0) {
     Serial.println(F("PONG"));
+  } else if (strcmp(command, "CAPS") == 0) {
+    Serial.println(F("CAPS DRIVE"));
   } else if (strncmp(command, "SPEED ", 6) == 0) {
     driveSpeed = constrain(atoi(command + 6), 0, MAX_SAFE_SPEED);
+  } else if (strncmp(command, "DRIVE ", 6) == 0) {
+    char* end = NULL;
+    long left = strtol(command + 6, &end, 10);
+    if (end == command + 6) {
+      Serial.println(F("ERROR:DRIVE_LEFT"));
+      return;
+    }
+    while (*end == ' ') ++end;
+    char* rightEnd = NULL;
+    long right = strtol(end, &rightEnd, 10);
+    if (rightEnd == end || *rightEnd != '\0') {
+      Serial.println(F("ERROR:DRIVE_RIGHT"));
+      return;
+    }
+    driveDifferential(static_cast<int>(left), static_cast<int>(right));
   } else if (strlen(command) == 1 && strchr("FBLR", command[0]) != NULL) {
     drive(command[0]);
   } else if (command[0] != '\0') {
@@ -132,7 +166,13 @@ void reportStatus() {
   Serial.print(activeMotion);
   Serial.print(F(" front_cm="));
   if (distance < 0) Serial.println(F("NO_ECHO"));
-  else Serial.println(distance);
+  else {
+    Serial.print(distance);
+    Serial.print(F(" left_pwm="));
+    Serial.print(leftOutput);
+    Serial.print(F(" right_pwm="));
+    Serial.println(rightOutput);
+  }
 }
 
 void setup() {
@@ -143,7 +183,7 @@ void setup() {
   stopMotors();
   Serial.begin(115200);
   Serial.println(F("VISIONFSD_PI_AUTONOMY_READY"));
-  Serial.println(F("SAFETY:350MS_TIMEOUT,STATIC_FRONT_STOP_18CM,MAX_PWM_105"));
+  Serial.println(F("SAFETY:350MS_TIMEOUT,STATIC_FRONT_STOP_18CM,DIFFERENTIAL_DRIVE,MAX_PWM_105"));
 }
 
 void loop() {

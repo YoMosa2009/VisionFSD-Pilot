@@ -131,10 +131,12 @@ See [`pi3b/README.md`](pi3b/README.md) for camera, model, and benchmark details.
 
 The Pi robot runtime is separate from the read-only desktop visualizer. It
 uses the LD19 as 360-degree measured range, the front static ultrasonic sensor
-as an independent near-field stop, and the camera only as a confirmed-person
-veto. The Pi sends commands/status over the Uno's normal USB cable. It starts
-with a 25-second no-motion standby and then performs low-speed obstacle
-avoidance with a display-only approximate local LiDAR map.
+as an independent near-field stop, and the webcam as both a live-frame safety
+gate and a confirmed-person veto. The Pi sends bounded differential motor
+commands/status over the Uno's normal USB cable. It starts with a 25-second
+no-motion standby, makes gentle LiDAR-guided arcs around obstacles, and uses a
+short LiDAR-cleared pivot only for close escape manoeuvres. Its local LiDAR map
+uses commanded-motion dead reckoning and is explicitly approximate.
 
 It is not vehicle autonomy and is not robust room-scale SLAM: the kit has no
 wheel encoders or IMU. Do not run it unsupervised, near stairs, pets, people,
