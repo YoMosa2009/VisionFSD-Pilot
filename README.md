@@ -1,9 +1,11 @@
 # VisionFSD Pilot
 
-**Read-only** forward-camera driving-scene visualizer with dual-pane **3D world + camera** display, a separate Raspberry Pi 3B runtime, and an LD19 2D LiDAR inspection tool.
+Forward-camera driving-scene visualizer with dual-pane **3D world + camera**
+display, a separate Raspberry Pi 3B runtime, an LD19 2D LiDAR inspection tool,
+and a low-speed OSOYOO indoor-robot integration.
 
-It has **no** CAN-bus, steering, braking, throttle, actuator, or vehicle-control code.  
-Do **not** use it to make or automate driving decisions.
+It has **no** CAN-bus, steering, braking, throttle, actuator, or real-vehicle
+control code. Do **not** use it to make or automate driving decisions.
 
 ## About
 
@@ -18,6 +20,9 @@ deliberately separate paths:
   viewer for an LD19 through its USB-UART adapter. It renders only fresh range
   returns, suppresses weak near-sensor noise, and groups adjacent returns into
   geometric obstacle clusters. It does not classify or control anything.
+- **Pi indoor robot mode:** an optional, supervised Pi + LD19 + webcam + Uno
+  runtime for the OSOYOO robot kit. The Uno keeps the final ultrasonic stop and
+  motor dead-man timeout; the Pi supplies conservative high-level planning.
 
 ![status](https://img.shields.io/badge/status-prototype-blue)
 ![python](https://img.shields.io/badge/python-3.11%2B-green)
@@ -121,6 +126,20 @@ FPS and detector FPS separately; 25 FPS inference is not claimed without a
 sustained physical-Pi benchmark. The HUD also shows the installed Pi runtime
 version and active detector.
 See [`pi3b/README.md`](pi3b/README.md) for camera, model, and benchmark details.
+
+### Pi OSOYOO robot integration
+
+The Pi robot runtime is separate from the read-only desktop visualizer. It
+uses the LD19 as 360-degree measured range, the front static ultrasonic sensor
+as an independent near-field stop, and the camera only as a confirmed-person
+veto. The Pi sends commands/status over the Uno's normal USB cable. It starts
+with a 25-second no-motion standby and then performs low-speed obstacle
+avoidance with a display-only approximate local LiDAR map.
+
+It is not vehicle autonomy and is not robust room-scale SLAM: the kit has no
+wheel encoders or IMU. Do not run it unsupervised, near stairs, pets, people,
+or property that can be damaged. Details, firmware location, boot behaviour,
+and the one-command Pi update are in [`pi3b/README.md`](pi3b/README.md#osoyoo-robot-mode-pi--ld19--camera--uno).
 
 ### LD19 LiDAR visualizer
 

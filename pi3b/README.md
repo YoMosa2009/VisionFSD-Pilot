@@ -1,7 +1,7 @@
 # VisionFSD Pi 3B runtime
 
-This is a **separate, read-only** Raspberry Pi 3B runtime derived from the
-design of the desktop VisionFSD Pilot. It is deliberately not a direct port.
+This is a **separate** Raspberry Pi 3B runtime derived from the design of the
+desktop VisionFSD Pilot. It is deliberately not a direct port.
 
 It preserves newest-frame capture, bounded asynchronous inference, a sticky
 lane-aware lead target, and a target shown in both camera and world panels.
@@ -56,6 +56,11 @@ are explicitly changed.
 It intentionally does not require the optional `libatlas-base-dev` package,
 which is unavailable on some current Raspberry Pi OS package sources.
 
+The installer uses Git sparse checkout: it keeps only `pi3b/` and the exact
+Uno firmware sketch needed by the robot runtime. Desktop OpenVINO models,
+Windows scripts, CAD assets, and unrelated source files are removed from an
+existing Pi checkout during installation/update.
+
 To update an existing installation, preserving the release branch it was
 installed from:
 
@@ -73,6 +78,82 @@ curl -fsSL https://raw.githubusercontent.com/YoMosa2009/VisionFSD-Pilot/codex/pi
 It saves tracked local edits in a named Git stash, installs the current Pi
 release, and leaves the model and virtual environment in place. Normal future
 updates can then use `bash ~/visionfsd-pi/pi3b/update.sh`.
+
+## OSOYOO robot mode: Pi + LD19 + camera + Uno
+
+The optional indoor robot runtime connects all four sensor/control parts:
+
+```text
+Pi USB webcam ──────────────> Pi (semantic person veto + display)
+LD19 USB-UART ──────────────> Pi (360-degree range obstacles/local map)
+Arduino Uno USB ────────────> Pi (serial commands/status)
+front static ultrasonic ────> Uno (independent final forward-stop guard)
+Uno motor shield ───────────> motors
+```
+
+**Yes:** connect the Uno's normal USB port directly to a Pi USB port. It
+provides the serial link and, when the Pi is powered adequately, can power the
+Uno's logic. The motors must remain on their own correctly rated battery pack;
+do not try to power the motors from the Pi or its USB power bank.
+
+Flash this separate sketch to the Uno first:
+
+```text
+~/visionfsd-pi/robot/firmware/visionfsd_pi_autonomy/visionfsd_pi_autonomy.ino
+```
+
+It is intentionally different from the earlier manual-drive sketch: the
+ultrasonic sensor is static and front-facing, the servo is unused/detached to
+avoid its continuous battery draw, motor PWM is capped at 105, and every
+motion command expires after 350 ms. The Uno blocks forward travel below
+18 cm even if the Pi crashes or sends a bad command.
+
+Run a supervised first test on blocks, wheels free, then on an empty floor:
+
+```bash
+cd ~/visionfsd-pi && bash ./pi3b/run_robot.sh
+```
+
+At boot the robot runtime starts in a **25-second STOP standby**. It will not
+move during that interval. Afterwards its authority order is fixed:
+
+1. Uno ultrasonic hard-stop (under 18 cm) wins.
+2. Stale LiDAR, a LiDAR obstacle within 42 cm, or a confirmed person in the
+   camera's forward path tells the Pi to stop/turn.
+3. Only then may the low-speed planner send a forward/turn command.
+
+This prevents camera guesses from overriding measured range data and prevents
+LiDAR from overriding the Uno's close front stop. The camera uses confirmed
+person tracking only as a semantic veto; it does not steer around people.
+
+The LD19 panel includes a small **local LiDAR map**. It accumulates nearby
+returns and uses commanded-motion dead reckoning for the displayed pose. The
+OSOYOO kit has no wheel encoders or IMU, so this is useful local mapping, but
+it is **not reliable metric SLAM**. Add wheel encoders or an IMU before relying
+on a persistent room map, loop closure, or autonomous room navigation.
+
+### Boot automatically
+
+The default installer creates this Pi Desktop autostart file:
+
+```text
+~/.config/autostart/visionfsd-robot.desktop
+```
+
+With Raspberry Pi OS **Desktop** configured to auto-login, connecting power
+starts the visual robot runtime after the graphical desktop appears; it still
+holds STOP for 25 seconds. Use `--no-robot-autostart` with `install.sh` if you
+do not want that. Raspberry Pi OS Lite has no graphical autostart session, so
+it needs a separate headless service and does not show the visualizer.
+
+The short normal update command is still:
+
+```bash
+bash ~/visionfsd-pi/pi3b/update.sh
+```
+
+It preserves the Pi release branch, updates only the sparse Pi checkout, and
+does not download Windows/CAD files.
 
 ## Run from this checkout
 
