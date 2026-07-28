@@ -224,8 +224,16 @@ class LD19Link:
             fresh = now - self._last_packet_at <= 0.45
         return scan_from_points(points, fresh, now)
 
-    def revolution(self, window_s: float = 0.13) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Raw returns from roughly the last LD19 revolution, with their ages."""
+    def revolution(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Raw returns from the last LD19 revolution, with their ages.
+
+        The window is exactly one revolution, taken from the sensor's reported
+        spin rate.  A longer window measures some directions twice from two
+        different robot positions, which hands scan matching a smeared scan and
+        makes it look unreliable when it is being fed badly.
+        """
+        spin = self._parser.speed_dps
+        window_s = float(np.clip(360.0 / spin, 0.08, 0.16)) if spin > 0 else 0.10
         now = time.monotonic()
         with self._lock:
             recent = [item for item in self._raw if now - item[2] <= window_s]
@@ -491,7 +499,6 @@ def main() -> int:
     next_slam = 0.0
     plan_hz = 0.0
     last_plan_at = time.monotonic()
-    last_slam_at = time.monotonic()
     try:
         while keep_running:
             now = time.monotonic()
@@ -523,11 +530,11 @@ def main() -> int:
                 bearings, ranges, ages = lidar.revolution()
                 if bearings.size:
                     # Commanded speed is only a search-window centre; scan
-                    # matching is what actually decides the pose.
+                    # matching is what actually decides the pose.  The worker
+                    # times its own interval, so a dropped sweep cannot make the
+                    # prediction under-count how far the robot moved.
                     forward = (planner.left_pwm + planner.right_pwm) / 2.0 / 105.0 * 0.32
-                    slam_worker.submit(bearings, ranges, ages, planner.yaw.yaw_rate_dps,
-                                       forward, now - last_slam_at)
-                    last_slam_at = now
+                    slam_worker.submit(bearings, ranges, ages, planner.yaw.yaw_rate_dps, forward)
 
             if not args.no_display and now >= next_render:
                 next_render = now + RENDER_PERIOD_S

@@ -86,6 +86,8 @@ class OccupancyMap:
         self._distance_cache: np.ndarray | None = None
         self._cache_dirty = True
         self._since_field = 0
+        # The SLAM thread writes this grid while the display thread reads it.
+        self._lock = threading.RLock()
 
     def world_to_cell(self, xs: np.ndarray, ys: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         res = self.config.resolution_m
@@ -99,6 +101,10 @@ class OccupancyMap:
         Rolling loses the far edge rather than growing memory without bound,
         which suits a robot that only ever needs the room it is currently in.
         """
+        with self._lock:
+            self._recentre_locked(x, y)
+
+    def _recentre_locked(self, x: float, y: float) -> None:
         cells, res = self.config.cells, self.config.resolution_m
         centre = cells // 2
         rows, cols = self.world_to_cell(np.array([x]), np.array([y]))
@@ -126,6 +132,10 @@ class OccupancyMap:
         change shape between sweeps, so it is refreshed every few integrations
         rather than every one.
         """
+        with self._lock:
+            return self._distance_field_locked()
+
+    def _distance_field_locked(self) -> np.ndarray:
         self._since_field += 1
         if self._distance_cache is not None and self._since_field < self.FIELD_REFRESH_UPDATES:
             return self._distance_cache
@@ -142,6 +152,11 @@ class OccupancyMap:
 
     def integrate(self, pose_x: float, pose_y: float, world_x: np.ndarray, world_y: np.ndarray) -> None:
         """Mark hits occupied and the space along each beam free."""
+        with self._lock:
+            self._integrate_locked(pose_x, pose_y, world_x, world_y)
+
+    def _integrate_locked(self, pose_x: float, pose_y: float, world_x: np.ndarray,
+                          world_y: np.ndarray) -> None:
         config = self.config
         cells = config.cells
         rows, cols = self.world_to_cell(world_x, world_y)
@@ -170,8 +185,9 @@ class OccupancyMap:
         is what turns aimless wandering into coverage.
         """
         config = self.config
-        known_free = (self.grid <= config.free_threshold).astype(np.uint8)
-        unknown = (np.abs(self.grid) < 0.2).astype(np.uint8)
+        with self._lock:
+            known_free = (self.grid <= config.free_threshold).astype(np.uint8)
+            unknown = (np.abs(self.grid) < 0.2).astype(np.uint8)
         if not np.any(known_free) or not np.any(unknown):
             return 0.0, 0.0
         neighbours = cv2.dilate(unknown, np.ones((3, 3), np.uint8), iterations=1)
@@ -207,8 +223,9 @@ class OccupancyMap:
 
     def render(self, x: float, y: float, heading_deg: float, size: int = 460,
                trail: list[tuple[float, float]] | None = None) -> np.ndarray:
-        occupied = np.clip(self.grid / self.config.occupied_threshold, 0.0, 1.0)
-        free = np.clip(-self.grid / abs(self.config.free_threshold), 0.0, 1.0)
+        with self._lock:
+            occupied = np.clip(self.grid / self.config.occupied_threshold, 0.0, 1.0)
+            free = np.clip(-self.grid / abs(self.config.free_threshold), 0.0, 1.0)
         panel = np.zeros((self.config.cells, self.config.cells, 3), dtype=np.uint8)
         panel[..., 0] = (44 + free * 46).astype(np.uint8)
         panel[..., 1] = (40 + free * 44 + occupied * 150).astype(np.uint8)
@@ -296,7 +313,10 @@ class ScanMatcher:
         clamped = np.minimum(np.where(valid, field[rows, cols], 0.0), 0.5)
         counted = valid.sum(axis=1)
         total = np.sum(np.where(valid, clamped, 0.0), axis=1)
-        enough = counted >= max(8, int(points.shape[0] * 0.5))
+        # The bar is relative to the best-covered candidate, not to the whole
+        # scan.  Near a map edge every candidate legitimately sees only part of
+        # the map, and an absolute threshold would reject them all as diverged.
+        enough = counted >= max(8, int(counted.max() * 0.6))
         return np.where(enough, total / np.maximum(counted, 1), 1.0)
 
     def match(self, occupancy: OccupancyMap, points: np.ndarray,
@@ -442,19 +462,23 @@ class SlamTracker:
 class SlamWorker:
     """Runs SLAM off the planning thread and drops ticks rather than blocking."""
 
-    def __init__(self, tracker: SlamTracker, period_s: float = 0.22) -> None:
+    def __init__(self, tracker: SlamTracker) -> None:
         self.tracker = tracker
-        self.period_s = period_s
         self._pending: tuple | None = None
         self._condition = threading.Condition()
         self._stop = False
         self.last_duration_ms = 0.0
+        self.dropped = 0
+        self._last_processed_at = 0.0
         self._thread = threading.Thread(target=self._run, name="robot-slam", daemon=True)
         self._thread.start()
 
-    def submit(self, bearings, ranges, ages, yaw_rate_dps, forward_speed_ms, elapsed_s) -> None:
+    def submit(self, bearings, ranges, ages, yaw_rate_dps, forward_speed_ms) -> None:
+        """Offer the newest sweep.  An unprocessed older one is discarded."""
         with self._condition:
-            self._pending = (bearings, ranges, ages, yaw_rate_dps, forward_speed_ms, elapsed_s)
+            if self._pending is not None:
+                self.dropped += 1
+            self._pending = (bearings, ranges, ages, yaw_rate_dps, forward_speed_ms)
             self._condition.notify()
 
     def _run(self) -> None:
@@ -467,13 +491,18 @@ class SlamWorker:
                 work = self._pending
                 self._pending = None
             started = time.monotonic()
+            # The interval is measured here rather than at submit time.  A
+            # dropped submission would otherwise leave the caller reporting a
+            # shorter interval than actually elapsed, and that interval scales
+            # the motion prediction the search window is centred on.
+            elapsed = 0.22 if self._last_processed_at == 0.0 else started - self._last_processed_at
+            self._last_processed_at = started
             try:
-                self.tracker.update(*work)
+                self.tracker.update(*work, min(1.0, max(0.05, elapsed)))
             except Exception:
                 # SLAM is advisory.  It must never take the robot down with it.
                 pass
             self.last_duration_ms = (time.monotonic() - started) * 1000.0
-            time.sleep(max(0.0, self.period_s - (time.monotonic() - started)))
 
     def close(self) -> None:
         with self._condition:
