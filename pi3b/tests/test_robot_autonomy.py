@@ -14,6 +14,7 @@ from robot_autonomy import (
     MAX_PWM,
     MIN_MOVE_PWM,
     STEER_HEADINGS,
+    ArduinoLink,
     ArduinoStatus,
     AutonomousPolicy,
     SectorClearance,
@@ -280,6 +281,36 @@ class AutonomousPolicyTests(unittest.TestCase):
         link = Link()
         policy.send(link, "F", time.monotonic())
         self.assertEqual(link.commands, ["STOP"])
+
+
+class ArduinoLinkTests(unittest.TestCase):
+    def test_capability_handshake_retries_until_drive_is_confirmed(self) -> None:
+        link = object.__new__(ArduinoLink)
+        link._supports_differential = False
+        link._last_caps_sent_at = float("-inf")
+        commands = []
+        link.send = commands.append
+
+        link.poll_capabilities(10.0)
+        link.poll_capabilities(10.1)
+        link.poll_capabilities(10.6)
+        self.assertEqual(commands, ["CAPS", "CAPS"])
+
+        link._supports_differential = True
+        link.poll_capabilities(11.2)
+        self.assertEqual(commands, ["CAPS", "CAPS"])
+
+    def test_status_parser_exposes_actual_motor_outputs_and_hard_stop(self) -> None:
+        status = ArduinoLink._parse_status(
+            "STATUS motion=F front_cm=14.8 left_pwm=0 right_pwm=0 blocked=1",
+            123.0,
+        )
+        self.assertEqual(status.front_cm, 14.8)
+        self.assertEqual(status.motion, "F")
+        self.assertEqual(status.left_pwm, 0)
+        self.assertEqual(status.right_pwm, 0)
+        self.assertTrue(status.blocked)
+        self.assertEqual(status.received_at, 123.0)
 
 
 class CorridorProfileTests(unittest.TestCase):

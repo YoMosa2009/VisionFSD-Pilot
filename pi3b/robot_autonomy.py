@@ -72,6 +72,7 @@ ESCAPE_FRONT_RELEASE_M = 0.50
 ESCAPE_COMMIT_SECONDS = 0.85
 FORWARD_PREFERENCE_CLEARANCE_M = 1.00
 DISPLAY_PERIOD_S = 0.10
+CAPS_RETRY_S = 0.50
 
 # Measured chassis, in metres.  The planner needs its own width because a
 # rectangle fits through a gap that a point always would: this is what lets it
@@ -94,6 +95,9 @@ class ArduinoStatus:
     front_cm: float | None
     motion: str
     received_at: float
+    blocked: bool = False
+    left_pwm: int = 0
+    right_pwm: int = 0
 
 
 @dataclass(frozen=True)
@@ -242,10 +246,35 @@ class ArduinoLink:
         self._running = True
         self._status = ArduinoStatus(None, "S", 0.0)
         self._supports_differential = False
+        self._last_caps_sent_at = float("-inf")
         self._reader = threading.Thread(target=self._read_loop, name="uno-status", daemon=True)
         self._reader.start()
-        self.send("CAPS")
         self.send("STOP")
+        self.poll_capabilities(time.monotonic())
+
+    @staticmethod
+    def _parse_status(line: str, received_at: float) -> ArduinoStatus:
+        fields = dict(part.split("=", 1) for part in line[7:].split() if "=" in part)
+        try:
+            front = float(fields["front_cm"]) if fields.get("front_cm") not in (None, "NO_ECHO") else None
+        except ValueError:
+            front = None
+        try:
+            left_pwm = int(fields.get("left_pwm", "0"))
+        except ValueError:
+            left_pwm = 0
+        try:
+            right_pwm = int(fields.get("right_pwm", "0"))
+        except ValueError:
+            right_pwm = 0
+        return ArduinoStatus(
+            front,
+            fields.get("motion", "S"),
+            received_at,
+            fields.get("blocked", "0") == "1",
+            left_pwm,
+            right_pwm,
+        )
 
     def _read_loop(self) -> None:
         while self._running:
@@ -256,12 +285,7 @@ class ArduinoLink:
             if not line:
                 continue
             if line.startswith("STATUS "):
-                fields = dict(part.split("=", 1) for part in line[7:].split() if "=" in part)
-                try:
-                    front = float(fields["front_cm"]) if fields.get("front_cm") not in (None, "NO_ECHO") else None
-                except ValueError:
-                    front = None
-                self._status = ArduinoStatus(front, fields.get("motion", "S"), time.monotonic())
+                self._status = self._parse_status(line, time.monotonic())
             elif line == "CAPS DRIVE":
                 self._supports_differential = True
             self._lines.put(line)
@@ -272,6 +296,12 @@ class ArduinoLink:
 
     def status(self) -> ArduinoStatus:
         return self._status
+
+    def poll_capabilities(self, now: float) -> None:
+        """Retry the Uno capability handshake until differential drive is confirmed."""
+        if not self._supports_differential and now - self._last_caps_sent_at >= CAPS_RETRY_S:
+            self.send("CAPS")
+            self._last_caps_sent_at = now
 
     @property
     def differential_ready(self) -> bool:
@@ -781,35 +811,37 @@ class AutonomousPolicy:
             self.last_command, self._last_output, self.last_sent_at = command, output, now
 
 
-def draw_dashboard(frame: np.ndarray, local_map: np.ndarray, policy: AutonomousPolicy,
+def draw_dashboard(local_map: np.ndarray, policy: AutonomousPolicy,
                    clearance: SectorClearance, status: ArduinoStatus, person: bool,
                    camera_ready: bool, differential_ready: bool,
                    slam_lite: SlamLiteState) -> np.ndarray:
-    height = max(frame.shape[0], local_map.shape[0])
-    left = cv2.resize(frame, (int(frame.shape[1] * height / frame.shape[0]), height))
-    right = cv2.resize(local_map, (height, height))
-    panel = np.hstack((left, right))
-    cv2.rectangle(panel, (0, 0), (panel.shape[1], 116), (14, 22, 31), -1)
+    panel = local_map.copy()
+    cv2.rectangle(panel, (0, 0), (panel.shape[1], 134), (14, 22, 31), -1)
     front = "--" if clearance.front_m is None else f"{clearance.front_m:.2f}m"
     front_left = "--" if clearance.front_left_m is None else f"{clearance.front_left_m:.2f}m"
     front_right = "--" if clearance.front_right_m is None else f"{clearance.front_right_m:.2f}m"
     ultra = "--" if status.front_cm is None else f"{status.front_cm:.0f}cm"
     lidar_state = "LIVE" if clearance.fresh else "STALE"
     camera_state = "LIVE" if camera_ready else "STALE"
-    message = (f"{policy.reason}   LD19 {lidar_state} F {front} FL {front_left} FR {front_right}   "
-               f"ULTRASONIC {ultra}   CAMERA {camera_state}   PERSON {'YES' if person else 'NO'}")
-    cv2.putText(panel, "VisionFSD Robot - sensor fused low-speed mode", (12, 27),
+    cv2.putText(panel, "VisionFSD Robot - LiDAR navigation", (12, 24),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, (238, 244, 250), 1, cv2.LINE_AA)
-    cv2.putText(panel, message, (12, 56), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+    cv2.putText(panel, f"POLICY {policy.reason}", (12, 49), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
                 (90, 235, 130) if policy.last_command == "F" else (80, 190, 245), 1, cv2.LINE_AA)
-    drive_mode = "DIFFERENTIAL" if differential_ready else "COMPATIBILITY"
-    cv2.putText(panel, f"UNO {drive_mode}: left {policy.left_pwm:+d}  right {policy.right_pwm:+d}",
-                (12, 82), cv2.FONT_HERSHEY_SIMPLEX, 0.43, (215, 225, 235), 1, cv2.LINE_AA)
+    cv2.putText(panel,
+                f"LD19 {lidar_state}  F {front}  FL {front_left}  FR {front_right}  "
+                f"ULTRA {ultra}  CAM {camera_state}  PERSON {'YES' if person else 'NO'}",
+                (12, 73), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (195, 215, 230), 1, cv2.LINE_AA)
+    drive_mode = "DIFFERENTIAL" if differential_ready else "WAITING FOR CAPS DRIVE - MOTORS HELD STOPPED"
+    drive_color = (90, 235, 130) if differential_ready else (70, 95, 255)
+    cv2.putText(panel,
+                f"UNO {drive_mode}  CMD {policy.left_pwm:+d}/{policy.right_pwm:+d}  "
+                f"ACTUAL {status.left_pwm:+d}/{status.right_pwm:+d}  BLOCKED {'YES' if status.blocked else 'NO'}",
+                (12, 97), cv2.FONT_HERSHEY_SIMPLEX, 0.35, drive_color, 1, cv2.LINE_AA)
     match = "MATCH" if slam_lite.matched else "PREDICT"
     cv2.putText(panel,
                 f"NAV CONFIDENCE {policy.drive_confidence:.2f}   SLAM-LITE {match} "
                 f"yaw {slam_lite.yaw_confidence:.2f} correction {slam_lite.yaw_correction_deg:+.1f}deg",
-                (12, 106), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (185, 205, 225), 1, cv2.LINE_AA)
+                (12, 121), cv2.FONT_HERSHEY_SIMPLEX, 0.37, (185, 205, 225), 1, cv2.LINE_AA)
     return panel
 
 
@@ -873,6 +905,7 @@ def main() -> int:
     try:
         while keep_running:
             now = time.monotonic()
+            arduino.poll_capabilities(now)
             camera.tick()
             clearance = lidar.clearance()
             status = arduino.status()
@@ -883,14 +916,12 @@ def main() -> int:
             slam_lite = local_map.update(points, policy.left_pwm, policy.right_pwm, now)
             if not args.no_display and now >= next_display_at:
                 next_display_at = now + DISPLAY_PERIOD_S
-                display_frame = camera.annotated_frame()
-                if display_frame is not None:
-                    panel = draw_dashboard(display_frame, local_map.render(), policy, clearance, status,
-                                           camera.person_in_path(), camera_ready, arduino.differential_ready,
-                                           slam_lite)
-                    cv2.imshow(WINDOW_TITLE, panel)
-                    if cv2.waitKey(1) & 0xFF in (27, ord("q"), ord("Q")):
-                        break
+                panel = draw_dashboard(local_map.render(size=640), policy, clearance, status,
+                                       camera.person_in_path(), camera_ready,
+                                       arduino.differential_ready, slam_lite)
+                cv2.imshow(WINDOW_TITLE, panel)
+                if cv2.waitKey(1) & 0xFF in (27, ord("q"), ord("Q")):
+                    break
             time.sleep(0.03)
     finally:
         arduino.close()

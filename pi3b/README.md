@@ -178,8 +178,9 @@ At boot the robot runtime starts in a **25-second STOP standby**. It will not
 move during that interval. Afterwards its authority order is fixed:
 
 1. A stale Uno, LD19, or webcam stops the robot; it will not drive blind.
-2. A confirmed person in the camera's forward path stops it. The camera draws
-   its confirmed-person boxes in the robot display.
+2. A confirmed person in the camera's forward path stops it. Camera inference
+   remains a safety gate, but camera frames are not rendered in the robot
+   display to reduce Pi 3B display work.
 3. The LD19 begins a direction-locked forward arc away from a central obstacle
    below 86 cm. Turning is capped to a small PWM split, both motors stay above
    the loaded-wheel stall region, and an isolated LiDAR speckle cannot change
@@ -205,13 +206,18 @@ controller reset regardless of this software. Replace it with the kit's rated
 
 The runtime no longer translates steering into legacy `L`/`R` commands while
 waiting for `CAPS DRIVE`; those commands are fast counter-rotating pivots. It
-holds STOP unless the dashboard reports `UNO DIFFERENTIAL`.
+holds STOP unless the dashboard reports `UNO DIFFERENTIAL`. The Pi retries the
+capability request every 0.5 seconds until it receives that exact response.
+The LiDAR-only dashboard shows commanded PWM, Uno-reported actual PWM, and the
+Uno ultrasonic `blocked` flag so a software STOP is distinguishable from a
+motor-power problem.
 
 ### LiDAR SLAM-lite local map
 
-The LD19 panel now uses a small rolling **SLAM-lite** local map. It keeps a
-6 m local occupancy sketch at 5 cm per cell, integrates the latest useful
-indoor returns, and compares successive scans in 90 four-degree angular bins.
+The LD19-only panel uses a rolling **SLAM-lite** local map. It keeps a 6 m local
+occupancy sketch at about 3.3 cm per cell, integrates every valid current scan
+return with vectorized NumPy operations, and compares successive scans in 180
+two-degree angular bins. Metre range rings make nearby geometry easier to read.
 A heading correction is applied only when that comparison has enough
 non-ambiguous support; otherwise it stays with conservative commanded-motion
 prediction. This increases useful local detail without turning a map estimate

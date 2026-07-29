@@ -30,18 +30,18 @@ class SlamLiteState:
 class LidarSlamLite:
     """A Pi 3B-friendly, advisory local LiDAR mapper.
 
-    The angular matcher uses 90 four-degree bins and tests 21 nearby shifts.
-    That is still inexpensive enough to run beside camera inference, while
+    The angular matcher uses 180 two-degree bins and tests nearby shifts.
+    Vectorized scan integration keeps this inexpensive beside camera inference, while
     preserving more useful LD19 geometry and rejecting ambiguous matches
     instead of inventing a pose.
     """
 
-    BIN_COUNT = 90
+    BIN_COUNT = 180
     BIN_DEGREES = 360.0 / BIN_COUNT
-    MIN_MATCH_BINS = 28
+    MIN_MATCH_BINS = 45
     MAX_SCAN_AGE_S = 0.35
 
-    def __init__(self, cells: int = 120, metres: float = 6.0) -> None:
+    def __init__(self, cells: int = 180, metres: float = 6.0) -> None:
         self.cells = cells
         self.metres = metres
         self.grid = np.zeros((cells, cells), dtype=np.uint8)
@@ -63,7 +63,7 @@ class LidarSlamLite:
 
     @classmethod
     def bins_from_points(cls, points: Iterable[tuple[int, object]]) -> tuple[np.ndarray, float]:
-        """Build robust four-degree range bins and return the newest timestamp."""
+        """Build robust two-degree range bins and return the newest timestamp."""
         buckets: list[list[float]] = [[] for _ in range(cls.BIN_COUNT)]
         newest = -1.0
         for _index, point in points:
@@ -89,7 +89,7 @@ class LidarSlamLite:
         if self._previous_bins is None:
             return 0.0, 0.0, False
         choices: list[tuple[float, int, int]] = []
-        for shift in range(-10, 11):
+        for shift in range(-12, 13):
             shifted_previous = np.roll(self._previous_bins, shift)
             valid = np.isfinite(current) & np.isfinite(shifted_previous)
             count = int(np.count_nonzero(valid))
@@ -134,21 +134,28 @@ class LidarSlamLite:
         self.y -= math.cos(radians) * linear_mps * elapsed
 
     def _integrate_points(self, points: Iterable[tuple[int, object]]) -> None:
+        point_list = list(points)
         scale = self.cells / self.metres
-        for _index, point in list(points)[::3]:
-            distance = float(point.distance_mm) / 1000.0
-            # The default map remains five-centimetre resolution (120 cells
-            # across 6 m) while retaining substantially more of the LD19's
-            # useful indoor returns than the prior 3.3 m display window.
-            if not 0.10 <= distance <= self.metres * 0.85:
-                continue
-            angle = math.radians(float(point.angle_deg) + self.heading)
-            x = self.x + math.sin(angle) * distance
-            y = self.y - math.cos(angle) * distance
-            col, row = int(x * scale), int(y * scale)
-            if 0 <= row < self.cells and 0 <= col < self.cells:
-                self.grid[row, col] = min(255, int(self.grid[row, col]) + 32)
-        self.grid = (self.grid.astype(np.float32) * 0.992).astype(np.uint8)
+        accumulator = (self.grid.astype(np.uint16) * 248) // 250
+        if point_list:
+            distances = np.fromiter(
+                (float(point.distance_mm) / 1000.0 for _index, point in point_list),
+                dtype=np.float32,
+                count=len(point_list),
+            )
+            angles = np.fromiter(
+                (float(point.angle_deg) for _index, point in point_list),
+                dtype=np.float32,
+                count=len(point_list),
+            )
+            valid = (distances >= 0.10) & (distances <= self.metres * 0.85)
+            distances = distances[valid]
+            radians = np.radians(angles[valid] + self.heading)
+            cols = ((self.x + np.sin(radians) * distances) * scale).astype(np.int32)
+            rows = ((self.y - np.cos(radians) * distances) * scale).astype(np.int32)
+            inside = (rows >= 0) & (rows < self.cells) & (cols >= 0) & (cols < self.cells)
+            np.add.at(accumulator, (rows[inside], cols[inside]), 12)
+        self.grid = np.minimum(accumulator, 255).astype(np.uint8)
         self._map_updates += 1
 
     def update(self, points: list[tuple[int, object]], left_pwm: int, right_pwm: int,
@@ -182,14 +189,20 @@ class LidarSlamLite:
         panel = cv2.applyColorMap(image, cv2.COLORMAP_BONE)
         px = int(np.clip(self.x / self.metres * size, 0, size - 1))
         py = int(np.clip(self.y / self.metres * size, 0, size - 1))
+        pixels_per_metre = size / self.metres
+        for metres in range(1, int(self.metres / 2.0) + 1):
+            cv2.circle(panel, (px, py), int(metres * pixels_per_metre),
+                       (45, 65, 75), 1, cv2.LINE_AA)
         radians = math.radians(self.heading)
         tip = (int(px + math.sin(radians) * 20), int(py - math.cos(radians) * 20))
         cv2.circle(panel, (px, py), 8, (80, 240, 100), -1, cv2.LINE_AA)
         cv2.arrowedLine(panel, (px, py), tip, (255, 255, 255), 2, cv2.LINE_AA, tipLength=0.35)
         label = "SLAM-LITE LOCAL MAP - ADVISORY"
-        detail = f"yaw match {self._yaw_confidence:.2f} correction {self._last_correction:+.1f} deg"
-        cv2.putText(panel, label, (12, 25), cv2.FONT_HERSHEY_SIMPLEX,
+        detail = (f"{self.metres / self.cells * 100:.1f} cm/cell  scans {self._map_updates}  "
+                  f"yaw match {self._yaw_confidence:.2f} correction {self._last_correction:+.1f} deg")
+        cv2.rectangle(panel, (0, size - 56), (size, size), (14, 22, 31), -1)
+        cv2.putText(panel, label, (12, size - 32), cv2.FONT_HERSHEY_SIMPLEX,
                     0.48, (235, 245, 250), 1, cv2.LINE_AA)
-        cv2.putText(panel, detail, (12, 47), cv2.FONT_HERSHEY_SIMPLEX,
+        cv2.putText(panel, detail, (12, size - 10), cv2.FONT_HERSHEY_SIMPLEX,
                     0.40, (190, 215, 230), 1, cv2.LINE_AA)
         return panel

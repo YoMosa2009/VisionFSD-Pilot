@@ -13,6 +13,10 @@ from robot_slam_lite import LidarSlamLite
 
 
 class SlamLiteTests(unittest.TestCase):
+    def test_default_map_uses_about_three_centimetre_cells(self) -> None:
+        mapper = LidarSlamLite()
+        self.assertLessEqual(mapper.metres / mapper.cells, 0.034)
+
     def test_angular_match_accepts_a_clear_shift(self) -> None:
         mapper = LidarSlamLite()
         previous = np.arange(mapper.BIN_COUNT, dtype=np.float32) * 0.04 + 0.5
@@ -46,6 +50,15 @@ class SlamLiteTests(unittest.TestCase):
         second = mapper.update(points, 0, 0, 1.08)
         self.assertEqual(first.map_updates, 1)
         self.assertEqual(second.map_updates, 1)
+
+    def test_map_integrates_all_distinct_scan_returns(self) -> None:
+        mapper = LidarSlamLite()
+        points = [
+            (index, LidarPoint(float(angle), 1000, 90, 1.0))
+            for index, angle in enumerate(range(0, 180, 20))
+        ]
+        mapper._integrate_points(points)
+        self.assertGreaterEqual(int(np.count_nonzero(mapper.grid)), len(points))
 
 
 if __name__ == "__main__":
