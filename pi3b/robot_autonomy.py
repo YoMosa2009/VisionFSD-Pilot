@@ -73,6 +73,9 @@ ESCAPE_COMMIT_SECONDS = 0.85
 FORWARD_PREFERENCE_CLEARANCE_M = 1.00
 DISPLAY_PERIOD_S = 0.10
 CAPS_RETRY_S = 0.50
+CAMERA_RETRY_S = 1.0
+CAMERA_START_TIMEOUT_S = 2.0
+CAMERA_AUTO_INDEX_LIMIT = 8
 
 # Measured chassis, in metres.  The planner needs its own width because a
 # rectangle fits through a gap that a point always would: this is what lets it
@@ -452,7 +455,6 @@ class CameraSafety:
             detector = TFLiteVehicleDetector(model, 0.50, threads)
         except Exception:
             detector = TFLiteVehicleDetector(fallback, 0.50, threads)
-        self.camera = LatestCamera(camera, 640, 480, 25)
         self.worker = AsyncDetector(detector)
         self.tracker = SceneObjectTracker(fov)
         self._last_camera_sequence = 0
@@ -460,9 +462,76 @@ class CameraSafety:
         self._last_frame_at = 0.0
         self.frame: np.ndarray | None = None
         self.people: list[SceneObject] = []
+        self.camera: LatestCamera | None = None
+        self.camera_source = "none"
+        self._camera_sources = self._candidate_sources(camera)
+        self._next_camera_source = 0
+        self._next_camera_retry_at = 0.0
+        self._camera_opened_at = 0.0
+        self._last_camera_error = ""
+        self._open_next_camera(time.monotonic())
+
+    @staticmethod
+    def _candidate_sources(requested: str) -> list[str]:
+        sources: list[str] = []
+        if requested != "auto":
+            sources.append(requested)
+        if requested == "auto" or requested.isdigit():
+            by_id = Path("/dev/v4l/by-id")
+            if by_id.is_dir():
+                sources.extend(str(path) for path in sorted(by_id.glob("*-video-index0")))
+            sources.extend(str(index) for index in range(CAMERA_AUTO_INDEX_LIMIT))
+        return list(dict.fromkeys(sources))
+
+    def _open_next_camera(self, now: float) -> None:
+        errors: list[str] = []
+        for _attempt in range(len(self._camera_sources)):
+            source = self._camera_sources[self._next_camera_source % len(self._camera_sources)]
+            self._next_camera_source += 1
+            try:
+                self.camera = LatestCamera(source, 640, 480, 25)
+            except Exception as exc:
+                errors.append(f"{source}: {exc}")
+                continue
+            self.camera_source = source
+            self._camera_opened_at = now
+            self._last_camera_error = ""
+            print(f"Camera candidate opened: {source}")
+            return
+        self.camera = None
+        self.camera_source = "none"
+        self._next_camera_retry_at = now + CAMERA_RETRY_S
+        error = "; ".join(errors) if errors else "no camera candidates"
+        if error != self._last_camera_error:
+            print(f"Camera unavailable; safe STOP while retrying: {error}", file=sys.stderr)
+            self._last_camera_error = error
+
+    def _drop_camera(self, now: float, reason: str) -> None:
+        if self.camera is not None:
+            self.camera.close()
+        self.camera = None
+        self.camera_source = "none"
+        self.frame = None
+        self.people = []
+        self._last_frame_at = 0.0
+        self._last_camera_sequence = 0
+        self._next_camera_retry_at = now + CAMERA_RETRY_S
+        print(f"Camera lost; safe STOP while retrying: {reason}", file=sys.stderr)
 
     def tick(self) -> None:
+        now = time.monotonic()
+        if self.camera is None:
+            if now >= self._next_camera_retry_at:
+                self._open_next_camera(now)
+            return
         sequence, frame, captured = self.camera.latest()
+        timed_out = (
+            (self.frame is None and now - self._camera_opened_at >= CAMERA_START_TIMEOUT_S)
+            or (self._last_frame_at > 0.0 and now - self._last_frame_at >= CAMERA_START_TIMEOUT_S)
+        )
+        if self.camera.error or timed_out:
+            self._drop_camera(now, self.camera.error or "no live frames")
+            return
         if frame is not None:
             self.frame = frame
             if sequence > self._last_camera_sequence:
@@ -483,7 +552,12 @@ class CameraSafety:
 
     def ready(self, now: float) -> bool:
         """Do not drive blind if the webcam has stopped delivering frames."""
-        return self.frame is not None and not self.camera.error and now - self._last_frame_at <= 1.0
+        return (
+            self.camera is not None
+            and self.frame is not None
+            and not self.camera.error
+            and now - self._last_frame_at <= 1.0
+        )
 
     def annotated_frame(self) -> np.ndarray | None:
         if self.frame is None:
@@ -498,7 +572,8 @@ class CameraSafety:
 
     def close(self) -> None:
         self.worker.close()
-        self.camera.close()
+        if self.camera is not None:
+            self.camera.close()
 
 
 class AutonomousPolicy:
@@ -849,7 +924,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Conservative VisionFSD Pi robot runtime")
     parser.add_argument("--arduino-port", default="auto", help="Normally /dev/ttyACM0")
     parser.add_argument("--lidar-port", default="auto", help="Normally /dev/ttyUSB0")
-    parser.add_argument("--camera", default="0")
+    parser.add_argument("--camera", default="auto")
     parser.add_argument("--model", type=Path, default=PROJECT_ROOT / "models/vehicle_efficientdet_lite0_int8.tflite")
     parser.add_argument("--fallback-model", type=Path, default=PROJECT_ROOT / "models/vehicle_ssd_mobilenet_v1.tflite")
     parser.add_argument("--standby-seconds", type=float, default=25.0)
@@ -885,7 +960,7 @@ def main() -> int:
     arduino = ArduinoLink(arduino_port)
     lidar = LD19Link(lidar_port, args.lidar_front_offset_deg)
     camera = CameraSafety(args.model, args.fallback_model, args.camera, args.threads, args.fov)
-    print(f"VisionFSD Robot: Uno={arduino_port}, LD19={lidar_port}, camera={args.camera}")
+    print(f"VisionFSD Robot: Uno={arduino_port}, LD19={lidar_port}, camera request={args.camera}")
     policy = AutonomousPolicy(args.standby_seconds, args.speed, args.min_move_pwm)
     # The mapper is advisory: obstacle avoidance always uses the current LD19
     # sectors above, never a past map cell or a guessed pose.

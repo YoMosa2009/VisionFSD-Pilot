@@ -212,6 +212,11 @@ The LiDAR-only dashboard shows commanded PWM, Uno-reported actual PWM, and the
 Uno ultrasonic `blocked` flag so a software STOP is distinguishable from a
 motor-power problem.
 
+Camera startup defaults to `auto`. The runtime tries stable V4L by-id paths and
+camera indexes 0 through 7. If no webcam currently delivers frames, the LiDAR
+dashboard remains open in `CAMERA STALE` safe-STOP mode and retries instead of
+terminating the complete robot runtime.
+
 ### LiDAR SLAM-lite local map
 
 The LD19-only panel uses a rolling **SLAM-lite** local map. It keeps a 6 m local

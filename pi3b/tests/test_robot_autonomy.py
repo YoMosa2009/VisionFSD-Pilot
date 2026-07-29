@@ -5,6 +5,7 @@ import pathlib
 import sys
 import time
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -17,6 +18,7 @@ from robot_autonomy import (
     ArduinoLink,
     ArduinoStatus,
     AutonomousPolicy,
+    CameraSafety,
     SectorClearance,
     corridor_profile,
 )
@@ -311,6 +313,41 @@ class ArduinoLinkTests(unittest.TestCase):
         self.assertEqual(status.right_pwm, 0)
         self.assertTrue(status.blocked)
         self.assertEqual(status.received_at, 123.0)
+
+
+class CameraSafetyTests(unittest.TestCase):
+    def test_missing_camera_keeps_runtime_in_safe_stale_state(self) -> None:
+        with (
+            mock.patch("robot_autonomy.TFLiteVehicleDetector", return_value=object()),
+            mock.patch("robot_autonomy.AsyncDetector"),
+            mock.patch("robot_autonomy.SceneObjectTracker"),
+            mock.patch.object(CameraSafety, "_candidate_sources", return_value=["0", "1"]),
+            mock.patch("robot_autonomy.LatestCamera", side_effect=RuntimeError("not available")),
+        ):
+            safety = CameraSafety(pathlib.Path("model"), pathlib.Path("fallback"), "auto", 1, 62.0)
+            self.assertIsNone(safety.camera)
+            self.assertFalse(safety.ready(time.monotonic()))
+            safety.tick()
+            safety.close()
+
+    def test_auto_camera_moves_to_next_usable_video_node(self) -> None:
+        working_camera = mock.Mock()
+        working_camera.error = ""
+        with (
+            mock.patch("robot_autonomy.TFLiteVehicleDetector", return_value=object()),
+            mock.patch("robot_autonomy.AsyncDetector"),
+            mock.patch("robot_autonomy.SceneObjectTracker"),
+            mock.patch.object(CameraSafety, "_candidate_sources", return_value=["0", "1"]),
+            mock.patch(
+                "robot_autonomy.LatestCamera",
+                side_effect=[RuntimeError("index zero failed"), working_camera],
+            ),
+        ):
+            safety = CameraSafety(pathlib.Path("model"), pathlib.Path("fallback"), "auto", 1, 62.0)
+            self.assertIs(safety.camera, working_camera)
+            self.assertEqual(safety.camera_source, "1")
+            safety.close()
+            working_camera.close.assert_called_once()
 
 
 class CorridorProfileTests(unittest.TestCase):

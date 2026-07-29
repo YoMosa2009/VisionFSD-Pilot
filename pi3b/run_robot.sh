@@ -48,7 +48,7 @@ done
 ARGS=(
   "$ROOT/robot_autonomy.py"
   --model "$MODEL" --fallback-model "$FALLBACK_MODEL"
-  --camera "${VISIONFSD_CAMERA:-0}"
+  --camera "${VISIONFSD_CAMERA:-auto}"
   --standby-seconds "${VISIONFSD_STANDBY_SECONDS:-25}"
   --speed "${VISIONFSD_ROBOT_SPEED:-118}"
   --lidar-front-offset-deg "${VISIONFSD_LIDAR_FRONT_OFFSET_DEG:-0}"
