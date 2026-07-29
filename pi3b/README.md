@@ -118,11 +118,12 @@ around 2.3 V. That is enough to spin a free wheel with the robot on blocks and
 **not** enough to move the loaded chassis on a floor: the motor sits energised
 and buzzing, the robot creeps, pauses and stutters, and the battery sags for no
 useful work. Full 8-bit range is now available and the Pi decides the actual
-speed, defaulting to 150.
+speed, defaulting to 125 in clear space and slowing from there.
 
 For the same reason the practical deadband is measured loaded, not in the air.
-`MIN_MOVE_PWM` is 105: any commanded wheel value is either zero or above it,
-because in between the motor only buzzes.
+`MIN_MOVE_PWM` is 100: any commanded wheel value is either zero or above it,
+because in between the motor only buzzes. A wheel deliberately dropped to zero
+is how a tight arc is made.
 
 A start from rest also gets a brief 90 ms full-power pulse, because static
 friction takes more torque to break than motion takes to sustain. Without it a
