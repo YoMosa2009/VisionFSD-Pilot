@@ -20,10 +20,44 @@ if [[ ! -f "$MODEL" ]]; then
   exit 1
 fi
 
-exec "$PYTHON" "$ROOT/robot_autonomy.py" \
-  --model "$MODEL" --fallback-model "$FALLBACK_MODEL" \
-  --camera "${VISIONFSD_CAMERA:-0}" \
-  --standby-seconds "${VISIONFSD_STANDBY_SECONDS:-25}" \
-  --speed "${VISIONFSD_ROBOT_SPEED:-70}" \
-  --lidar-front-offset-deg "${VISIONFSD_LIDAR_FRONT_OFFSET_DEG:-0}" \
+# The desktop autostart entry runs with no terminal, so anything printed here
+# is lost and a failed start is indistinguishable from "nothing happened".
+# Keep the last two runs on disk so a boot failure can be read afterwards.
+LOG_DIR="$ROOT/logs"
+mkdir -p "$LOG_DIR"
+LOG="$LOG_DIR/robot.log"
+if [[ -f "$LOG" ]]; then mv -f "$LOG" "$LOG_DIR/robot.previous.log"; fi
+
+# USB devices are not always enumerated by the time the desktop session starts,
+# and the runtime exits when it cannot find the Uno.  Waiting turns a boot race
+# into a normal start instead of a silent failure.
+for _ in $(seq 1 30); do
+  if compgen -G "/dev/ttyACM*" >/dev/null && compgen -G "/dev/ttyUSB*" >/dev/null; then break; fi
+  sleep 0.5
+done
+
+{
+  echo "=== VisionFSD robot start: $(date -Is) ==="
+  echo "version: $(tr -d '\r\n' < "$ROOT/VERSION" 2>/dev/null)"
+  echo "serial: $(ls /dev/ttyACM* /dev/ttyUSB* 2>/dev/null | tr '\n' ' ')"
+  echo "display: DISPLAY=${DISPLAY:-unset} WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-unset}"
+} >> "$LOG"
+
+# 150 matches the runtime default.  Below about 120 the L298N drop leaves too
+# little at the motors to move the loaded chassis, and it only buzzes.
+ARGS=(
+  "$ROOT/robot_autonomy.py"
+  --model "$MODEL" --fallback-model "$FALLBACK_MODEL"
+  --camera "${VISIONFSD_CAMERA:-0}"
+  --standby-seconds "${VISIONFSD_STANDBY_SECONDS:-25}"
+  --speed "${VISIONFSD_ROBOT_SPEED:-150}"
+  --lidar-front-offset-deg "${VISIONFSD_LIDAR_FRONT_OFFSET_DEG:-0}"
   "$@"
+)
+
+# With a terminal attached, print straight to it so errors are visible now.
+if [[ -t 1 ]]; then
+  exec "$PYTHON" "${ARGS[@]}"
+fi
+exec >>"$LOG" 2>&1
+exec "$PYTHON" "${ARGS[@]}"

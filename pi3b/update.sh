@@ -66,10 +66,32 @@ else
   echo "Python requirements unchanged; skipping package download."
 fi
 bash "$PI_ROOT/sync_primary_model.sh" "$PI_ROOT"
+# Desktop sessions disagree about where autostart lives.  XDG .desktop entries
+# cover X11/LXDE and labwc; Wayfire ignores them entirely and reads its own ini.
+# Install to whichever mechanisms this Pi actually has, so a Wayland session
+# does not silently drop the entry.
+launcher="$PI_ROOT/run_robot.sh"
 autostart_dir="$HOME/.config/autostart"
 mkdir -p "$autostart_dir"
-sed "s|__VISIONFSD_RUN_ROBOT__|$PI_ROOT/run_robot.sh|" \
+sed "s|__VISIONFSD_RUN_ROBOT__|$launcher|" \
   "$PI_ROOT/visionfsd-robot.desktop" > "$autostart_dir/visionfsd-robot.desktop"
+echo "Autostart: $autostart_dir/visionfsd-robot.desktop"
+
+wayfire_ini="$HOME/.config/wayfire.ini"
+if [[ -f "$wayfire_ini" ]] && ! grep -q "visionfsd" "$wayfire_ini"; then
+  if grep -q '^\[autostart\]' "$wayfire_ini"; then
+    sed -i "/^\[autostart\]/a visionfsd = $launcher" "$wayfire_ini"
+  else
+    printf '\n[autostart]\nvisionfsd = %s\n' "$launcher" >> "$wayfire_ini"
+  fi
+  echo "Autostart: added to $wayfire_ini"
+fi
+
+labwc_autostart="$HOME/.config/labwc/autostart"
+if [[ -d "$HOME/.config/labwc" ]] && ! grep -qs "visionfsd" "$labwc_autostart"; then
+  printf '%s &\n' "$launcher" >> "$labwc_autostart"
+  echo "Autostart: added to $labwc_autostart"
+fi
 printf '%s\n' "$REF" > "$REF_FILE"
 version="$(tr -d '\r\n' < "$PI_ROOT/VERSION")"
 echo "Updated VisionFSD Pi to v$version from $REF"
