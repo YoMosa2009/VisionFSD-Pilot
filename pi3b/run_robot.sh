@@ -43,14 +43,16 @@ done
   echo "display: DISPLAY=${DISPLAY:-unset} WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-unset}"
 } >> "$LOG"
 
-# 150 matches the runtime default.  Below about 120 the L298N drop leaves too
-# little at the motors to move the loaded chassis, and it only buzzes.
+# 125 matches the runtime default and is the speed in *clear* space only; the
+# planner scales down from it in proportion to measured clearance.  Much below
+# about 110 the L298N drop leaves too little at the motors to move the loaded
+# chassis, and it only buzzes.
 ARGS=(
   "$ROOT/robot_autonomy.py"
   --model "$MODEL" --fallback-model "$FALLBACK_MODEL"
   --camera "${VISIONFSD_CAMERA:-0}"
   --standby-seconds "${VISIONFSD_STANDBY_SECONDS:-25}"
-  --speed "${VISIONFSD_ROBOT_SPEED:-150}"
+  --speed "${VISIONFSD_ROBOT_SPEED:-125}"
   --lidar-front-offset-deg "${VISIONFSD_LIDAR_FRONT_OFFSET_DEG:-0}"
   "$@"
 )

@@ -1,13 +1,45 @@
 from __future__ import annotations
 
+import math
 import pathlib
 import sys
 import time
 import unittest
 
+import numpy as np
+
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from robot_autonomy import MAX_PWM, MIN_MOVE_PWM, ArduinoStatus, AutonomousPolicy, SectorClearance
+from robot_autonomy import (
+    MAX_PWM,
+    MIN_MOVE_PWM,
+    STEER_HEADINGS,
+    ArduinoStatus,
+    AutonomousPolicy,
+    SectorClearance,
+    corridor_profile,
+)
+
+
+class _Return:
+    """Minimal stand-in for an LD19 point."""
+
+    def __init__(self, angle_deg: float, distance_mm: int) -> None:
+        self.angle_deg = angle_deg
+        self.distance_mm = distance_mm
+
+
+def wall_scene(front_m: float, gap: tuple[int, int] | None = None, span: int = 75):
+    """A flat wall ahead, optionally with an opening, plus open space behind."""
+    points = []
+    for angle in range(-span, span + 1):
+        distance = front_m / math.cos(math.radians(angle))
+        if gap is not None and gap[0] <= angle <= gap[1]:
+            distance = 4.5
+        points.append((angle % 360, _Return(angle % 360, int(min(distance, 5.5) * 1000))))
+    for angle in range(span + 1, 360 - span):
+        points.append((angle, _Return(angle, 4000)))
+    return points
 
 
 class AutonomousPolicyTests(unittest.TestCase):
@@ -109,6 +141,73 @@ class AutonomousPolicyTests(unittest.TestCase):
         policy = AutonomousPolicy(0.0, 70)
         clear = SectorClearance(1.2, 1.0, 1.0, True)
         self.assertEqual(policy.decide(clear, self.status, False, time.monotonic()), "F")
+
+
+class CorridorProfileTests(unittest.TestCase):
+    def test_straight_ahead_is_a_candidate_heading(self) -> None:
+        # An even split leaves the two nearest options tied either side of
+        # centre, and the chassis weaves while believing it drives straight.
+        self.assertIn(0.0, {float(value) for value in STEER_HEADINGS})
+
+    def test_wall_limits_travel_to_the_bumper(self) -> None:
+        profile = corridor_profile(wall_scene(1.20))
+        straight = profile[int(np.argmin(np.abs(STEER_HEADINGS)))]
+        self.assertAlmostEqual(float(straight), 1.20 - 0.075, places=2)
+
+    def test_a_gap_the_body_fits_is_seen_as_open(self) -> None:
+        """The five-sector summary cannot express "there is a gap 20 deg right"."""
+        profile = corridor_profile(wall_scene(1.20, gap=(12, 28)))
+        through = profile[int(np.argmin(np.abs(STEER_HEADINGS - 20.0)))]
+        straight = profile[int(np.argmin(np.abs(STEER_HEADINGS)))]
+        self.assertGreater(float(through), 2.5)
+        self.assertLess(float(straight), 1.3)
+
+    def test_returns_behind_never_limit_forward_travel(self) -> None:
+        behind = [(angle, _Return(angle, 150)) for angle in range(160, 201)]
+        behind += [(angle, _Return(angle, 4000)) for angle in range(-60, 61)]
+        profile = corridor_profile(behind)
+        straight = profile[int(np.argmin(np.abs(STEER_HEADINGS)))]
+        self.assertGreater(float(straight), 2.0)
+
+
+class SpeedGovernorTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.status = ArduinoStatus(front_cm=80.0, motion="S", received_at=time.monotonic())
+
+    def _drive(self, front_m: float, speed: int = 125) -> AutonomousPolicy:
+        policy = AutonomousPolicy(0.0, speed)
+        clearance = SectorClearance(front_m, 2.0, 2.0, True, 2.0, 2.0,
+                                    corridor_profile(wall_scene(front_m)))
+        policy.decide(clearance, self.status, False, time.monotonic())
+        return policy
+
+    def test_speed_rises_with_clearance(self) -> None:
+        """The reported failure: one flat-out speed regardless of surroundings."""
+        speeds = [max(self._drive(d).left_pwm, self._drive(d).right_pwm)
+                  for d in (0.80, 1.20, 1.60, 2.40)]
+        self.assertEqual(speeds, sorted(speeds), f"not monotonic: {speeds}")
+        self.assertLess(speeds[0], speeds[-1])
+
+    def test_cruise_never_exceeds_the_configured_ceiling(self) -> None:
+        for front_m in (0.80, 1.20, 2.00, 3.00):
+            policy = self._drive(front_m, speed=125)
+            self.assertLessEqual(max(abs(policy.left_pwm), abs(policy.right_pwm)), 125)
+
+    def test_turning_is_never_faster_than_driving_straight(self) -> None:
+        """Scaling a turn up rather than down makes every corner alarming."""
+        policy = AutonomousPolicy(0.0, 125)
+        clearance = SectorClearance(1.20, 2.0, 2.0, True, 2.0, 2.0,
+                                    corridor_profile(wall_scene(1.20, gap=(12, 28))))
+        policy.decide(clearance, self.status, False, time.monotonic())
+        self.assertLessEqual(max(policy.left_pwm, policy.right_pwm), 125)
+        self.assertNotEqual(policy.left_pwm, policy.right_pwm)
+
+    def test_governed_output_still_clears_the_stall_floor(self) -> None:
+        for front_m in (0.60, 0.90, 1.40, 2.50):
+            policy = self._drive(front_m)
+            for value in (policy.left_pwm, policy.right_pwm):
+                self.assertTrue(value == 0 or abs(value) >= MIN_MOVE_PWM,
+                                f"{front_m} m produced stalling PWM {value}")
 
 
 if __name__ == "__main__":

@@ -128,6 +128,40 @@ A start from rest also gets a brief 90 ms full-power pulse, because static
 friction takes more torque to break than motion takes to sustain. Without it a
 low cruise command can never get the robot going at all.
 
+### Speed is governed by measured clearance
+
+`--speed` (default 125) is the ceiling used in **clear space only**. The planner
+scales down from it in proportion to how far the robot's own body can actually
+travel along the heading it has chosen, so it slows approaching an obstacle
+rather than running flat out until a last-moment stop.
+
+The usable band is narrow in PWM terms but wide in speed terms, because only
+the voltage *above* the stall threshold does any work: roughly 108 PWM is a
+slow crawl and 125 is several times quicker. Below about 108 the loaded chassis
+stops moving entirely, so that is the floor.
+
+Tune with two knobs. `--speed` sets the ceiling. `--min-move-pwm` (default 100)
+is the lowest PWM that turns a loaded wheel; raise it if the robot buzzes
+without moving, lower it if even the crawl is too quick. `MIN_MOVE_PWM` is an
+estimate for this drivetrain, not a measurement of yours.
+
+### Corridor profile: how it steers around things
+
+Rather than five fixed sectors, the LD19 returns are swept into a **body-inflated
+corridor profile**: for each of 37 candidate headings the planner computes how
+far a rectangle of the robot's own width can travel before anything enters its
+path. That is what lets it say "there is a 0.5 m gap 20 degrees to the right,
+3 m deep" — something a five-sector summary structurally cannot express, and
+the reason it can now curve around an object instead of treating a whole side
+as blocked.
+
+The chosen heading comes from that profile, preferring straight ahead, with a
+switch margin so scan noise cannot make it weave between two near-tied options.
+Headings within 50 degrees become a smooth arc; anything wider squares up with
+a brief pivot first. Turning output is normalised so the outer wheel never
+exceeds the governed speed, because scaling a turn *up* makes every corner
+faster than driving straight.
+
 If the robot still stutters on carpet, raise `--speed` before suspecting the
 planner. A 9 V PP3 alkaline is not a usable motor supply here: its internal
 resistance collapses under an amp of motor current. Use the kit's 2x18650

@@ -51,7 +51,21 @@ UNO_BAUD = 115200
 MAX_PWM = 255
 # Lowest PWM that reliably turns a *loaded* wheel.  A deadband measured with
 # the wheels in the air reads far lower than the real one.
-MIN_MOVE_PWM = 105
+MIN_MOVE_PWM = 100
+
+# Measured chassis, in metres.  The planner needs its own width because a
+# rectangle fits through a gap that a point always would: this is what lets it
+# steer around an object rather than treat one sector as blocked.
+ROBOT_WIDTH_M = 0.14
+ROBOT_LENGTH_M = 0.15
+SAFETY_MARGIN_M = 0.04
+CORRIDOR_HALF_WIDTH_M = ROBOT_WIDTH_M / 2.0 + SAFETY_MARGIN_M
+FRONT_OVERHANG_M = ROBOT_LENGTH_M / 2.0
+PLANNING_HORIZON_M = 3.0
+# Candidate headings for the corridor sweep, symmetric so straight ahead is
+# itself an option rather than falling between two near-tied neighbours.
+STEER_HEADINGS = np.arange(-72.0, 72.1, 4.0, dtype=np.float32)
+_STEER_RADIANS = np.radians(STEER_HEADINGS)
 LD19_BAUD = 230400
 
 
@@ -73,6 +87,15 @@ class SectorClearance:
     # choosing a close-range escape direction.
     front_left_m: float | None = None
     front_right_m: float | None = None
+    # Body-inflated clear travel for each heading in STEER_HEADINGS, metres
+    # ahead of the front bumper.  None when no scan was available.
+    profile: np.ndarray | None = None
+
+    def limit_at(self, heading_deg: float) -> float | None:
+        if self.profile is None:
+            return None
+        index = int(np.argmin(np.abs(STEER_HEADINGS - heading_deg)))
+        return float(self.profile[index])
 
 
 def _signed_angle(angle: float) -> float:
@@ -106,6 +129,37 @@ def _sector_clearance(points: list[tuple[int, object]], centre_deg: float, half_
         if len(neighbours) >= 2:
             clustered.append(float(np.median(neighbours)))
     return min(clustered) if clustered else None
+
+
+def corridor_profile(points: list[tuple[int, object]]) -> np.ndarray:
+    """Clear travel ahead of the bumper for every candidate heading.
+
+    For each heading the robot is swept forward as a rectangle of its own
+    width, and any return entering that corridor limits how far it can go.
+    A five-sector summary cannot express "there is a 40 cm gap 12 degrees to
+    the left", which is exactly the information needed to drive around an
+    object instead of stopping in front of it or swerving past the whole side.
+    """
+    if not points:
+        return np.zeros(STEER_HEADINGS.size, dtype=np.float32)
+    angles = np.fromiter((float(point.angle_deg) for _index, point in points),
+                         dtype=np.float32, count=len(points))
+    ranges = np.fromiter((point.distance_mm / 1000.0 for _index, point in points),
+                         dtype=np.float32, count=len(points))
+    usable = (ranges >= 0.08) & (ranges <= 5.8)
+    if not np.any(usable):
+        return np.full(STEER_HEADINGS.size, PLANNING_HORIZON_M, dtype=np.float32)
+    angles, ranges = angles[usable], ranges[usable]
+
+    delta = np.radians(((angles[None, :] - STEER_HEADINGS[:, None]) + 180.0) % 360.0 - 180.0)
+    cos, sin = np.cos(delta), np.sin(delta)
+    lateral = sin * ranges[None, :]
+    along = cos * ranges[None, :]
+    # cos > 0 keeps only returns actually ahead of the candidate heading;
+    # without it, obstacles behind the robot produce negative travel limits.
+    inside = (cos > 0.02) & (np.abs(lateral) <= CORRIDOR_HALF_WIDTH_M)
+    limits = np.where(inside, along, np.inf).min(axis=1) - FRONT_OVERHANG_M
+    return np.clip(limits, 0.0, PLANNING_HORIZON_M).astype(np.float32)
 
 
 def discover_arduino_port() -> str | None:
@@ -239,6 +293,7 @@ class LD19Link:
             True,
             _sector_clearance(points, -35.0, 20.0),
             _sector_clearance(points, 35.0, 20.0),
+            corridor_profile(points),
         )
 
     def close(self) -> None:
@@ -366,10 +421,13 @@ class AutonomousPolicy:
     This is reactive local navigation, not a claim of room-scale SLAM.
     """
 
-    def __init__(self, standby_s: float, speed: int) -> None:
+    def __init__(self, standby_s: float, speed: int, min_move_pwm: int = MIN_MOVE_PWM) -> None:
         self.started_at = time.monotonic()
         self.standby_s = standby_s
         self.speed = speed
+        self.min_move_pwm = min_move_pwm
+        self._heading_index: int | None = None
+        self.cruise_pwm = 0
         self.turn_until = 0.0
         self.turn_command = "L"
         self._direction_lock_until = 0.0
@@ -430,10 +488,72 @@ class AutonomousPolicy:
             return self._set_output("F", inner, outer)
         return self._set_output("F", outer, inner)
 
+    def _cruise_speed(self, limit_m: float | None) -> int:
+        """Scale speed with how far the body can actually travel.
+
+        Open-loop brushed motors have a narrow usable band: below roughly
+        MIN_MOVE_PWM nothing turns under load, and speed rises steeply above it
+        because only the voltage *above* the stall threshold does any work.  So
+        the floor is set just above the deadband and the ceiling is the
+        configured cruise, giving a real several-fold speed range in between.
+        """
+        floor = max(self.min_move_pwm + 8, int(self.speed * 0.72))
+        if limit_m is None:
+            return floor
+        span = float(np.clip((limit_m - 0.45) / 1.45, 0.0, 1.0))
+        return int(round(floor + span * max(0, self.speed - floor)))
+
+    def _differential(self, speed: int, heading_deg: float) -> str:
+        """Turn a desired heading into wheel speeds, respecting the deadband."""
+        turn = float(np.clip(heading_deg / 60.0, -1.0, 1.0)) * 0.55
+        left = speed * (1.0 + turn)
+        right = speed * (1.0 - turn)
+        # Normalise so the outer wheel never exceeds the governed speed.
+        # Scaling the differential *up* instead would make every turn faster
+        # than driving straight, which is both wrong and alarming to watch.
+        peak = max(abs(left), abs(right))
+        if peak > speed:
+            left, right = left * speed / peak, right * speed / peak
+
+        def wheel(value: float) -> int:
+            # Well under the deadband, let the wheel coast: that is what makes a
+            # genuinely tight arc possible.  Just under it, lift to the floor,
+            # because in between the motor only buzzes and sags the pack.
+            if abs(value) < self.min_move_pwm * 0.6:
+                return 0
+            return int(math.copysign(max(self.min_move_pwm, abs(value)), value))
+
+        self.cruise_pwm = speed
+        return self._set_output("F", wheel(left), wheel(right))
+
+    def _heading_from_profile(self, profile: np.ndarray, now: float) -> tuple[float, float] | None:
+        """Pick the best heading, preferring straight and resisting flicker."""
+        # Clear distance stops being worth anything once there is a decent run
+        # ahead; without saturation the robot always turns toward whichever
+        # direction is roomiest and curls instead of crossing the room.
+        # The straight-line cost has to be large relative to the saturated
+        # clearance, or a flat wall ahead always makes some oblique heading
+        # look better and the robot veers off instead of closing on it.
+        score = np.minimum(profile, 1.5) - np.abs(STEER_HEADINGS) / 90.0 * 1.10
+        usable = profile >= 0.38
+        if not np.any(usable):
+            return None
+        best = int(np.argmax(np.where(usable, score, -np.inf)))
+        previous = self._heading_index
+        if previous is not None and usable[previous] and best != previous:
+            # Only switch for a materially better option, so scan noise cannot
+            # make the chassis weave between two near-tied headings.
+            if score[previous] + 0.07 >= score[best]:
+                best = previous
+        self._heading_index = best
+        return float(STEER_HEADINGS[best]), float(profile[best])
+
     def _set_stop(self, reason: str) -> str:
         self.reason = reason
         self._arc_active = False
         self.drive_confidence = 0.0
+        self.cruise_pwm = 0
+        self._heading_index = None
         return self._set_output("STOP", 0, 0)
 
     def decide(self, lidar: SectorClearance, arduino: ArduinoStatus, person: bool, now: float,
@@ -472,6 +592,28 @@ class AutonomousPolicy:
             self.drive_confidence = 0.45
             return self._pivot(self.turn_command)
 
+        # With a corridor profile the planner can steer continuously: it knows
+        # how far its own body can travel along every heading, so it curves
+        # around an object and slows in proportion to what is actually ahead,
+        # instead of switching between a straight mode and an arc mode.
+        if lidar.profile is not None:
+            choice = self._heading_from_profile(lidar.profile, now)
+            if choice is not None:
+                heading, limit = choice
+                if abs(heading) > 50.0:
+                    # Too far off the nose to arc into cleanly; square up first.
+                    self.turn_command = "R" if heading > 0 else "L"
+                    self.turn_until = max(self.turn_until, now + 0.30)
+                    self.reason = f"ALIGN:{heading:+.0f}deg"
+                    self.drive_confidence = 0.4
+                    return self._pivot(self.turn_command)
+                speed = self._cruise_speed(limit)
+                self._arc_active = abs(heading) > 6.0
+                self.drive_confidence = float(np.clip(limit / 2.0, 0.0, 1.0))
+                self.reason = f"DRIVE:{heading:+.0f}deg {limit:.2f}m pwm{speed}"
+                return self._differential(speed, heading)
+            return self._set_stop("STOP:NO_CLEAR_CORRIDOR")
+
         # Use different enter/exit distances so a range return hovering near
         # one threshold cannot make the chassis alternate between arc/straight.
         if lidar.front_m < 0.86:
@@ -482,7 +624,7 @@ class AutonomousPolicy:
             choice = self._choose_turn(lidar, now)
             if choice is not None and choice[1] >= 0.42:
                 progress = float(np.clip((lidar.front_m - 0.42) / 0.63, 0.0, 1.0))
-                base = int(max(MIN_MOVE_PWM, self.speed * (0.78 + 0.22 * progress)))
+                base = self._cruise_speed(lidar.front_m)
                 self.reason = f"ARC_AVOID:{choice[0]}"
                 self.drive_confidence = 0.55 + 0.25 * progress
                 return self._arc(choice[0], min(self.speed, base))
@@ -567,9 +709,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", type=Path, default=PROJECT_ROOT / "models/vehicle_efficientdet_lite0_int8.tflite")
     parser.add_argument("--fallback-model", type=Path, default=PROJECT_ROOT / "models/vehicle_ssd_mobilenet_v1.tflite")
     parser.add_argument("--standby-seconds", type=float, default=25.0)
-    parser.add_argument("--speed", type=int, default=150, choices=range(MIN_MOVE_PWM, MAX_PWM + 1),
+    parser.add_argument("--speed", type=int, default=125, choices=range(MIN_MOVE_PWM, MAX_PWM + 1),
                         metavar=f"{MIN_MOVE_PWM}..{MAX_PWM}",
-                        help="Cruise PWM. Below about 120 a loaded chassis stalls on carpet.")
+                        help="Cruise PWM in clear space. The planner slows below this "
+                             "in proportion to measured clearance.")
+    parser.add_argument("--min-move-pwm", type=int, default=MIN_MOVE_PWM,
+                        help="Lowest PWM that turns a loaded wheel. Raise if the robot "
+                             "buzzes without moving; lower if it is still too quick.")
     parser.add_argument("--threads", type=int, default=2, choices=(1, 2, 3))
     parser.add_argument("--fov", type=float, default=70.0)
     parser.add_argument("--lidar-front-offset-deg", type=float, default=0.0,
@@ -596,7 +742,7 @@ def main() -> int:
     lidar = LD19Link(lidar_port, args.lidar_front_offset_deg)
     camera = CameraSafety(args.model, args.fallback_model, args.camera, args.threads, args.fov)
     print(f"VisionFSD Robot: Uno={arduino_port}, LD19={lidar_port}, camera={args.camera}")
-    policy = AutonomousPolicy(args.standby_seconds, args.speed)
+    policy = AutonomousPolicy(args.standby_seconds, args.speed, args.min_move_pwm)
     # The mapper is advisory: obstacle avoidance always uses the current LD19
     # sectors above, never a past map cell or a guessed pose.
     local_map = LidarSlamLite()
