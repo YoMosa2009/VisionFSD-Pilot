@@ -42,6 +42,20 @@ def wall_scene(front_m: float, gap: tuple[int, int] | None = None, span: int = 7
     return points
 
 
+def settle(policy, clearance, status, person=False, cycles=45, camera_ready=True):
+    """Run the policy to a steady state.
+
+    Output is slew-rate limited, so a single decision only moves the wheels a
+    few PWM off their previous value.  Tests that inspect commanded speed have
+    to let it reach the value it is actually asking for.
+    """
+    now = time.monotonic()
+    label = "STOP"
+    for index in range(cycles):
+        label = policy.decide(clearance, status, person, now + index * 0.03, camera_ready)
+    return label
+
+
 class AutonomousPolicyTests(unittest.TestCase):
     def setUp(self) -> None:
         self.status = ArduinoStatus(front_cm=80.0, motion="S", received_at=time.monotonic())
@@ -62,7 +76,23 @@ class AutonomousPolicyTests(unittest.TestCase):
         clear_sides = SectorClearance(2.0, 2.0, 1.0, True, 1.8, 0.8)
         self.assertEqual(policy.decide(clear_sides, blocked, False, time.monotonic()), "L")
         self.assertLess(policy.left_pwm, 0)
-        self.assertGreater(policy.right_pwm, 0)
+        self.assertEqual(policy.right_pwm, 0)
+
+    def test_motion_starts_at_the_loaded_wheel_floor_not_a_tiny_pwm(self) -> None:
+        policy = AutonomousPolicy(0.0, 118)
+        clear = SectorClearance(2.0, 2.0, 2.0, True)
+        policy.decide(clear, self.status, False, time.monotonic())
+        self.assertEqual(policy.left_pwm, MIN_MOVE_PWM)
+        self.assertEqual(policy.right_pwm, MIN_MOVE_PWM)
+
+    def test_acceleration_rises_in_small_steps_after_the_floor(self) -> None:
+        policy = AutonomousPolicy(0.0, 118)
+        clear = SectorClearance(2.0, 2.0, 2.0, True)
+        policy.decide(clear, self.status, False, time.monotonic())
+        first = policy.left_pwm
+        policy.decide(clear, self.status, False, time.monotonic() + 0.04)
+        self.assertGreaterEqual(policy.left_pwm, first)
+        self.assertLessEqual(policy.left_pwm - first, 4)
 
     def test_confirmed_person_stops(self) -> None:
         policy = AutonomousPolicy(0.0, 70)
@@ -77,34 +107,36 @@ class AutonomousPolicyTests(unittest.TestCase):
     def test_midrange_obstacle_uses_forward_arc(self) -> None:
         policy = AutonomousPolicy(0.0, 70)
         obstacle = SectorClearance(0.60, 1.8, 0.7, True, 1.5, 0.7)
-        self.assertEqual(policy.decide(obstacle, self.status, False, time.monotonic()), "F")
+        self.assertEqual(settle(policy, obstacle, self.status), "F")
         self.assertLess(policy.left_pwm, policy.right_pwm)
-        self.assertGreater(policy.left_pwm, 0)
+        self.assertGreater(policy.right_pwm, 0)
+        self.assertIn(policy.left_pwm, (0, MIN_MOVE_PWM))
 
     def test_arc_hysteresis_avoids_threshold_flicker(self) -> None:
         policy = AutonomousPolicy(0.0, 70)
         first = SectorClearance(0.80, 1.5, 0.8, True, 1.4, 0.8)
-        policy.decide(first, self.status, False, time.monotonic())
+        settle(policy, first, self.status)
         held = SectorClearance(0.94, 1.5, 0.8, True, 1.4, 0.8)
-        self.assertEqual(policy.decide(held, self.status, False, time.monotonic() + 0.10), "F")
+        self.assertEqual(settle(policy, held, self.status), "F")
         self.assertLess(policy.left_pwm, policy.right_pwm)
 
     def test_direction_lock_prevents_small_side_measurement_flip(self) -> None:
         policy = AutonomousPolicy(0.0, 70)
         now = time.monotonic()
         first = SectorClearance(0.70, 1.5, 1.0, True, 1.4, 1.0)
-        policy.decide(first, self.status, False, now)
+        settle(policy, first, self.status)
         # Right improves a little, but not enough to discard the selected left
         # arc in the next scan.
         second = SectorClearance(0.70, 1.2, 1.35, True, 1.2, 1.35)
-        policy.decide(second, self.status, False, now + 0.10)
+        settle(policy, second, self.status)
         self.assertLess(policy.left_pwm, policy.right_pwm)
 
-    def test_arc_keeps_both_motors_out_of_low_pwm_stall_range(self) -> None:
+    def test_arc_never_uses_a_low_pwm_stall_range(self) -> None:
         policy = AutonomousPolicy(0.0, 150)
         obstacle = SectorClearance(0.50, 1.6, 0.8, True, 1.5, 0.8)
-        policy.decide(obstacle, self.status, False, time.monotonic())
-        self.assertGreaterEqual(min(policy.left_pwm, policy.right_pwm), MIN_MOVE_PWM)
+        settle(policy, obstacle, self.status)
+        for value in (policy.left_pwm, policy.right_pwm):
+            self.assertTrue(value == 0 or abs(value) >= MIN_MOVE_PWM)
 
     def test_every_motion_clears_the_loaded_stall_floor(self) -> None:
         """A wheel that turns freely in the air still stalls under the chassis.
@@ -120,8 +152,8 @@ class AutonomousPolicyTests(unittest.TestCase):
             SectorClearance(1.2, 0.6, 1.9, True, 0.6, 1.8),      # guided forward
         ]
         for index, clearance in enumerate(scenarios):
-            policy = AutonomousPolicy(0.0, 150)
-            policy.decide(clearance, self.status, False, time.monotonic())
+            policy = AutonomousPolicy(0.0, 85)
+            settle(policy, clearance, self.status)
             for value in (policy.left_pwm, policy.right_pwm):
                 self.assertTrue(value == 0 or abs(value) >= MIN_MOVE_PWM,
                                 f"scenario {index} produced stalling PWM {value}")
@@ -174,11 +206,11 @@ class SpeedGovernorTests(unittest.TestCase):
     def setUp(self) -> None:
         self.status = ArduinoStatus(front_cm=80.0, motion="S", received_at=time.monotonic())
 
-    def _drive(self, front_m: float, speed: int = 125) -> AutonomousPolicy:
+    def _drive(self, front_m: float, speed: int = 118) -> AutonomousPolicy:
         policy = AutonomousPolicy(0.0, speed)
         clearance = SectorClearance(front_m, 2.0, 2.0, True, 2.0, 2.0,
                                     corridor_profile(wall_scene(front_m)))
-        policy.decide(clearance, self.status, False, time.monotonic())
+        settle(policy, clearance, self.status)
         return policy
 
     def test_speed_rises_with_clearance(self) -> None:
@@ -190,16 +222,16 @@ class SpeedGovernorTests(unittest.TestCase):
 
     def test_cruise_never_exceeds_the_configured_ceiling(self) -> None:
         for front_m in (0.80, 1.20, 2.00, 3.00):
-            policy = self._drive(front_m, speed=125)
-            self.assertLessEqual(max(abs(policy.left_pwm), abs(policy.right_pwm)), 125)
+            policy = self._drive(front_m, speed=118)
+            self.assertLessEqual(max(abs(policy.left_pwm), abs(policy.right_pwm)), 118)
 
     def test_turning_is_never_faster_than_driving_straight(self) -> None:
         """Scaling a turn up rather than down makes every corner alarming."""
-        policy = AutonomousPolicy(0.0, 125)
+        policy = AutonomousPolicy(0.0, 118)
         clearance = SectorClearance(1.20, 2.0, 2.0, True, 2.0, 2.0,
                                     corridor_profile(wall_scene(1.20, gap=(12, 28))))
-        policy.decide(clearance, self.status, False, time.monotonic())
-        self.assertLessEqual(max(policy.left_pwm, policy.right_pwm), 125)
+        settle(policy, clearance, self.status)
+        self.assertLessEqual(max(policy.left_pwm, policy.right_pwm), 118)
         self.assertNotEqual(policy.left_pwm, policy.right_pwm)
 
     def test_governed_output_still_clears_the_stall_floor(self) -> None:

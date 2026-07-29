@@ -117,31 +117,31 @@ The shield's L298N bridge drops roughly 2 V, so a 7.9 V pack puts at most about
 around 2.3 V. That is enough to spin a free wheel with the robot on blocks and
 **not** enough to move the loaded chassis on a floor: the motor sits energised
 and buzzing, the robot creeps, pauses and stutters, and the battery sags for no
-useful work. Full 8-bit range is now available and the Pi decides the actual
-speed, defaulting to 125 in clear space and slowing from there.
+useful work. Full 8-bit range is available, but the Pi uses a cautious direct
+PWM ceiling of **118** in clear space and slows from there.
 
 For the same reason the practical deadband is measured loaded, not in the air.
-`MIN_MOVE_PWM` is 100: any commanded wheel value is either zero or above it,
+`MIN_MOVE_PWM` is 105: any commanded wheel value is either zero or above it,
 because in between the motor only buzzes. A wheel deliberately dropped to zero
 is how a tight arc is made.
 
-A start from rest also gets a brief 90 ms full-power pulse, because static
-friction takes more torque to break than motion takes to sustain. Without it a
-low cruise command can never get the robot going at all.
+The Uno applies a direct 20 ms PWM ramp from that floor to the commanded value.
+It does not use a high-power kickstart or an on/off pulse train, because either
+would make a small robot lurch or audibly stop-start.
 
 ### Speed is governed by measured clearance
 
-`--speed` (default 125) is the ceiling used in **clear space only**. The planner
+`--speed` (default 118) is the ceiling used in **clear space only**. The planner
 scales down from it in proportion to how far the robot's own body can actually
 travel along the heading it has chosen, so it slows approaching an obstacle
 rather than running flat out until a last-moment stop.
 
 The usable band is narrow in PWM terms but wide in speed terms, because only
-the voltage *above* the stall threshold does any work: roughly 108 PWM is a
-slow crawl and 125 is several times quicker. Below about 108 the loaded chassis
+the voltage *above* the stall threshold does any work: roughly 105 PWM is a
+slow crawl and 118 is a cautious cruise. Below about 105 the loaded chassis
 stops moving entirely, so that is the floor.
 
-Tune with two knobs. `--speed` sets the ceiling. `--min-move-pwm` (default 100)
+Tune with two knobs. `--speed` sets the ceiling. `--min-move-pwm` (default 105)
 is the lowest PWM that turns a loaded wheel; raise it if the robot buzzes
 without moving, lower it if even the crawl is too quick. `MIN_MOVE_PWM` is an
 estimate for this drivetrain, not a measurement of yours.

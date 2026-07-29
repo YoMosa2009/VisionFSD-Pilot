@@ -51,7 +51,14 @@ UNO_BAUD = 115200
 MAX_PWM = 255
 # Lowest PWM that reliably turns a *loaded* wheel.  A deadband measured with
 # the wheels in the air reads far lower than the real one.
-MIN_MOVE_PWM = 100
+# This is the lowest direct PWM measured to turn a loaded wheel.  Do not use
+# on/off torque pulses below it: a small robot has too little inertia to make
+# that feel smooth, and the pulses are audible as stop-start motion.
+MIN_MOVE_PWM = 105
+DEFAULT_CRUISE_PWM = 118
+# Largest direct-PWM rise per planner decision after the initial non-stalling
+# floor.  The Uno applies its own 20 ms output ramp as the final authority.
+MAX_PWM_STEP = 4
 
 # Measured chassis, in metres.  The planner needs its own width because a
 # rectangle fits through a gap that a point always would: this is what lets it
@@ -424,7 +431,7 @@ class AutonomousPolicy:
     def __init__(self, standby_s: float, speed: int, min_move_pwm: int = MIN_MOVE_PWM) -> None:
         self.started_at = time.monotonic()
         self.standby_s = standby_s
-        self.speed = speed
+        self.speed = max(min_move_pwm, speed)
         self.min_move_pwm = min_move_pwm
         self._heading_index: int | None = None
         self.cruise_pwm = 0
@@ -446,9 +453,32 @@ class AutonomousPolicy:
         values = [value for value in (primary, outer) if value is not None]
         return min(values) if values else None
 
+    @staticmethod
+    def _ramp(current: int, target: int) -> int:
+        """Use a direct, non-buzzing motor band with a controlled rise.
+
+        A direct brushed-motor command below MIN_MOVE_PWM only buzzes under the
+        chassis.  Starting at that floor, then rising in small steps, is smooth
+        without the 50 Hz on/off gating that made the prior experiment pulse.
+        Slowing and stopping remain immediate for safety.
+        """
+        if target == 0:
+            return 0
+        direction = 1 if target > 0 else -1
+        target = direction * max(MIN_MOVE_PWM, abs(target))
+        if current == 0:
+            return direction * MIN_MOVE_PWM
+        if (current > 0) != (target > 0):
+            # Brake to zero before reversing; the following decision begins
+            # the other direction at the non-stalling floor.
+            return 0
+        if abs(target) <= abs(current):
+            return target
+        return direction * min(abs(target), abs(current) + MAX_PWM_STEP)
+
     def _set_output(self, label: str, left_pwm: int, right_pwm: int) -> str:
-        self.left_pwm = int(np.clip(left_pwm, -MAX_PWM, MAX_PWM))
-        self.right_pwm = int(np.clip(right_pwm, -MAX_PWM, MAX_PWM))
+        self.left_pwm = self._ramp(self.left_pwm, int(np.clip(left_pwm, -MAX_PWM, MAX_PWM)))
+        self.right_pwm = self._ramp(self.right_pwm, int(np.clip(right_pwm, -MAX_PWM, MAX_PWM)))
         return label
 
     def _choose_turn(self, lidar: SectorClearance, now: float) -> tuple[str, float] | None:
@@ -471,19 +501,24 @@ class AutonomousPolicy:
         return candidate, candidate_score
 
     def _pivot(self, direction: str) -> str:
-        turn_speed = max(MIN_MOVE_PWM + 20, self.speed - 10)
+        # Counter-rotating both wheels at their usable minimum still spins this
+        # tiny chassis too quickly.  Reverse just one track instead: it makes
+        # a deliberate backing arc, uses less current, and stays clear of the
+        # ultrasonic sensor's forward travel guard.
+        turn_speed = self.min_move_pwm
         if direction == "L":
-            return self._set_output("L", -turn_speed, turn_speed)
-        return self._set_output("R", turn_speed, -turn_speed)
+            return self._set_output("L", -turn_speed, 0)
+        return self._set_output("R", 0, -turn_speed)
 
     def _arc(self, direction: str, base_speed: int) -> str:
         # Both tracks stay forward.  This is smoother and uses less peak motor
         # current than repeatedly stopping and pivoting at every obstacle.
-        outer = max(MIN_MOVE_PWM + 10, base_speed)
+        outer = max(self.min_move_pwm, base_speed)
         # Keep both motors above the practical low-PWM region of this cheap
         # chassis.  A very low inner PWM is more likely to stall a wheel than
         # produce a smooth arc, especially as the motor battery weakens.
-        inner = max(MIN_MOVE_PWM, int(outer * 0.62))
+        inner_raw = int(outer * 0.62)
+        inner = inner_raw if inner_raw >= self.min_move_pwm else 0
         if direction == "L":
             return self._set_output("F", inner, outer)
         return self._set_output("F", outer, inner)
@@ -497,7 +532,7 @@ class AutonomousPolicy:
         the floor is set just above the deadband and the ceiling is the
         configured cruise, giving a real several-fold speed range in between.
         """
-        floor = max(self.min_move_pwm + 8, int(self.speed * 0.72))
+        floor = min(self.speed, max(self.min_move_pwm, int(self.speed * 0.90)))
         if limit_m is None:
             return floor
         span = float(np.clip((limit_m - 0.45) / 1.45, 0.0, 1.0))
@@ -519,9 +554,9 @@ class AutonomousPolicy:
             # Well under the deadband, let the wheel coast: that is what makes a
             # genuinely tight arc possible.  Just under it, lift to the floor,
             # because in between the motor only buzzes and sags the pack.
-            if abs(value) < self.min_move_pwm * 0.6:
+            if abs(value) < self.min_move_pwm:
                 return 0
-            return int(math.copysign(max(self.min_move_pwm, abs(value)), value))
+            return int(math.copysign(abs(value), value))
 
         self.cruise_pwm = speed
         return self._set_output("F", wheel(left), wheel(right))
@@ -709,7 +744,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", type=Path, default=PROJECT_ROOT / "models/vehicle_efficientdet_lite0_int8.tflite")
     parser.add_argument("--fallback-model", type=Path, default=PROJECT_ROOT / "models/vehicle_ssd_mobilenet_v1.tflite")
     parser.add_argument("--standby-seconds", type=float, default=25.0)
-    parser.add_argument("--speed", type=int, default=125, choices=range(MIN_MOVE_PWM, MAX_PWM + 1),
+    parser.add_argument("--speed", type=int, default=DEFAULT_CRUISE_PWM, choices=range(MIN_MOVE_PWM, MAX_PWM + 1),
                         metavar=f"{MIN_MOVE_PWM}..{MAX_PWM}",
                         help="Cruise PWM in clear space. The planner slows below this "
                              "in proportion to measured clearance.")

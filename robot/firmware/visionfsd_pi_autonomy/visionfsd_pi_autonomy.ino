@@ -36,14 +36,14 @@ const byte BLOCK_CONFIRM_SAMPLES = 2;
 // near 2.3 V, which spins a free wheel in the air but cannot move the robot on
 // a floor: the motor just sits energised and buzzing.  The Pi still decides the
 // actual speed; this only stops the firmware from being the limit.
-const int DEFAULT_SPEED = 150;
+const int DEFAULT_SPEED = 118;
 const int MAX_SAFE_SPEED = 255;
-
-// Static friction needs more torque to break than motion needs to sustain, so
-// a start from rest gets a brief full-power pulse before settling to the
-// commanded value.  Without it a low cruise command can never get going.
-const unsigned long KICKSTART_MS = 90UL;
-const int KICKSTART_PWM = 220;
+// Direct PWM under this floor buzzes a loaded wheel instead of moving it.  Do
+// not synthesize slow motion by repeatedly pulsing it on/off: that creates the
+// exact audible, stop-start behaviour this robot must avoid.
+const int MIN_EFFECTIVE_PWM = 105;
+const unsigned long OUTPUT_PERIOD_MS = 20UL;
+const int OUTPUT_RAMP_STEP = 4;
 
 char commandBuffer[24];
 byte commandLength = 0;
@@ -53,7 +53,7 @@ int leftOutput = 0;
 int rightOutput = 0;
 int desiredLeft = 0;
 int desiredRight = 0;
-unsigned long kickstartUntil = 0;
+unsigned long lastOutputAt = 0;
 unsigned long lastMotionCommandAt = 0;
 unsigned long lastStatusAt = 0;
 
@@ -76,27 +76,41 @@ void setMotor(byte pinA, byte pinB, byte enablePin, int direction, int speed) {
   analogWrite(enablePin, speed);
 }
 
-// Applies the commanded outputs, boosted while a kickstart pulse is active.
-// Called both when a command arrives and from loop(), so the boost ends on
-// time rather than lasting until the next command happens to turn up.
-void applyOutputs() {
-  int left = desiredLeft;
-  int right = desiredRight;
-  if (millis() < kickstartUntil) {
-    if (left != 0 && abs(left) < KICKSTART_PWM) left = left > 0 ? KICKSTART_PWM : -KICKSTART_PWM;
-    if (right != 0 && abs(right) < KICKSTART_PWM) right = right > 0 ? KICKSTART_PWM : -KICKSTART_PWM;
-  }
-  setMotor(M1_A, M1_B, M1_ENABLE, left > 0 ? +1 : (left < 0 ? -1 : 0), abs(left));
-  setMotor(M2_A, M2_B, M2_ENABLE, right > 0 ? +1 : (right < 0 ? -1 : 0), abs(right));
-  leftOutput = left;
-  rightOutput = right;
+int normaliseDrive(int value) {
+  if (value == 0) return 0;
+  int magnitude = max(MIN_EFFECTIVE_PWM, abs(value));
+  return value > 0 ? magnitude : -magnitude;
+}
+
+int rampOutput(int current, int target) {
+  if (target == 0) return 0;
+  target = normaliseDrive(target);
+  if (current == 0) return target > 0 ? MIN_EFFECTIVE_PWM : -MIN_EFFECTIVE_PWM;
+  if ((current > 0) != (target > 0)) return 0;
+  if (abs(target) <= abs(current)) return target;
+  int magnitude = min(abs(target), abs(current) + OUTPUT_RAMP_STEP);
+  return target > 0 ? magnitude : -magnitude;
+}
+
+void writeOutputs() {
+  setMotor(M1_A, M1_B, M1_ENABLE, leftOutput > 0 ? +1 : (leftOutput < 0 ? -1 : 0), abs(leftOutput));
+  setMotor(M2_A, M2_B, M2_ENABLE, rightOutput > 0 ? +1 : (rightOutput < 0 ? -1 : 0), abs(rightOutput));
+}
+
+void updateOutputs() {
+  if (millis() - lastOutputAt < OUTPUT_PERIOD_MS) return;
+  lastOutputAt = millis();
+  leftOutput = rampOutput(leftOutput, desiredLeft);
+  rightOutput = rampOutput(rightOutput, desiredRight);
+  writeOutputs();
 }
 
 void stopMotors() {
   desiredLeft = 0;
   desiredRight = 0;
-  kickstartUntil = 0;
-  applyOutputs();
+  leftOutput = 0;
+  rightOutput = 0;
+  writeOutputs();
   activeMotion = 'S';
 }
 
@@ -164,15 +178,8 @@ void driveDifferential(int left, int right) {
     Serial.println(F("BLOCKED:FRONT_ULTRASONIC"));
     return;
   }
-  // Breaking away from rest, or reversing a wheel, is where torque is scarce.
-  bool wasStopped = (desiredLeft == 0 && desiredRight == 0);
-  bool reversed = (desiredLeft > 0) != (left > 0) || (desiredRight > 0) != (right > 0);
-  if ((left != 0 || right != 0) && (wasStopped || reversed)) {
-    kickstartUntil = millis() + KICKSTART_MS;
-  }
-  desiredLeft = left;
-  desiredRight = right;
-  applyOutputs();
+  desiredLeft = normaliseDrive(left);
+  desiredRight = normaliseDrive(right);
   activeMotion = describeMotion(left, right);
   lastMotionCommandAt = millis();
 }
@@ -269,7 +276,7 @@ void setup() {
   stopMotors();
   Serial.begin(115200);
   Serial.println(F("VISIONFSD_PI_AUTONOMY_READY"));
-  Serial.println(F("SAFETY:350MS_TIMEOUT,MEDIAN_FRONT_STOP_18CM,DIFFERENTIAL_DRIVE,MAX_PWM_255,KICKSTART_90MS"));
+  Serial.println(F("SAFETY:350MS_TIMEOUT,MEDIAN_FRONT_STOP_18CM,DIRECT_PWM_RAMP,MIN_PWM_105,MAX_PWM_255"));
 }
 
 void loop() {
@@ -284,10 +291,7 @@ void loop() {
       Serial.println(F("BLOCKED:FRONT_ULTRASONIC"));
     }
   }
-  // Ends the kickstart pulse on schedule instead of at the next command.
-  if (activeMotion != 'S') {
-    applyOutputs();
-  }
+  updateOutputs();
   if (activeMotion != 'S' && millis() - lastMotionCommandAt > COMMAND_TIMEOUT_MS) {
     stopMotors();
     Serial.println(F("STOP:COMMAND_TIMEOUT"));
