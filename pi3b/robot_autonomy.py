@@ -33,7 +33,6 @@ from lidar_visualizer import LD19Parser, LivePolarMap
 from robot_slam_lite import LidarSlamLite, SlamLiteState
 from visionfsd_pi import (
     AsyncDetector,
-    Detection,
     LatestCamera,
     SceneObject,
     SceneObjectTracker,
@@ -64,10 +63,15 @@ MAX_PWM_STEP = 4
 # and turn an avoidance arc into a one-wheel spin.  Keep every ordinary forward
 # command inside that band; a close obstacle is handled by a bounded reverse
 # curve, never an in-place pivot.
-MAX_GENTLE_HEADING_DEG = 38.0
-MIN_TURN_MARGIN_PWM = 12
-ESCAPE_REVERSE_SECONDS = 0.45
+MAX_GENTLE_HEADING_DEG = 24.0
+MIN_TURN_MARGIN_PWM = 8
+ESCAPE_TURN_MARGIN_PWM = 6
+ESCAPE_REVERSE_SECONDS = 0.90
 ESCAPE_REAR_CLEARANCE_M = 0.38
+ESCAPE_FRONT_RELEASE_M = 0.50
+ESCAPE_COMMIT_SECONDS = 0.85
+FORWARD_PREFERENCE_CLEARANCE_M = 1.00
+DISPLAY_PERIOD_S = 0.10
 
 # Measured chassis, in metres.  The planner needs its own width because a
 # rectangle fits through a gap that a point always would: this is what lets it
@@ -109,6 +113,7 @@ class SectorClearance:
     # Rear range is used only before a short reverse recovery.  The static Uno
     # ultrasonic sensor faces forward, so reverse motion must be LD19-gated.
     rear_m: float | None = None
+    scan_at: float | None = None
 
     def limit_at(self, heading_deg: float) -> float | None:
         if self.profile is None:
@@ -161,14 +166,38 @@ def corridor_profile(points: list[tuple[int, object]]) -> np.ndarray:
     """
     if not points:
         return np.zeros(STEER_HEADINGS.size, dtype=np.float32)
-    angles = np.fromiter((float(point.angle_deg) for _index, point in points),
-                         dtype=np.float32, count=len(points))
-    ranges = np.fromiter((point.distance_mm / 1000.0 for _index, point in points),
-                         dtype=np.float32, count=len(points))
-    usable = (ranges >= 0.08) & (ranges <= 5.8)
-    if not np.any(usable):
+    # Build robust one-degree bins first.  The old corridor sweep accepted every
+    # isolated return, so one LD19 speckle could make a clear path disappear for
+    # one control cycle and jerk the wheel command.  A physical obstacle normally
+    # occupies adjacent angular bins; require that local support here just as the
+    # fixed-sector clearance calculation does.
+    raw_angles = np.fromiter(
+        (float(point.angle_deg) for _index, point in points),
+        dtype=np.float32,
+        count=len(points),
+    )
+    raw_ranges = np.fromiter(
+        (float(point.distance_mm) / 1000.0 for _index, point in points),
+        dtype=np.float32,
+        count=len(points),
+    )
+    valid = (raw_ranges >= 0.08) & (raw_ranges <= 5.8)
+    binned = np.full(360, np.inf, dtype=np.float32)
+    if np.any(valid):
+        bins = np.rint(raw_angles[valid]).astype(np.int16) % 360
+        np.minimum.at(binned, bins, raw_ranges[valid])
+    binned[~np.isfinite(binned)] = np.nan
+    finite = np.isfinite(binned)
+    tolerance = np.maximum(0.14, binned * 0.22)
+    supported = np.zeros(360, dtype=bool)
+    for offset in (-3, -2, -1, 1, 2, 3):
+        neighbour = np.roll(binned, -offset)
+        supported |= finite & np.isfinite(neighbour) & (np.abs(neighbour - binned) <= tolerance)
+    usable_indices = np.flatnonzero(supported)
+    if usable_indices.size == 0:
         return np.full(STEER_HEADINGS.size, PLANNING_HORIZON_M, dtype=np.float32)
-    angles, ranges = angles[usable], ranges[usable]
+    angles = usable_indices.astype(np.float32)
+    ranges = binned[usable_indices]
 
     delta = np.radians(((angles[None, :] - STEER_HEADINGS[:, None]) + 180.0) % 360.0 - 180.0)
     cos, sin = np.cos(delta), np.sin(delta)
@@ -269,6 +298,8 @@ class LD19Link:
         self._lock = threading.Lock()
         self._running = True
         self._last_packet_at = 0.0
+        self._clearance_stamp = -1.0
+        self._clearance_cache: SectorClearance | None = None
         self._thread = threading.Thread(target=self._read_loop, name="ld19-reader", daemon=True)
         self._thread.start()
 
@@ -305,7 +336,10 @@ class LD19Link:
         points, fresh = self.snapshot()
         if not fresh:
             return SectorClearance(None, None, None, False)
-        return SectorClearance(
+        scan_at = max((float(point.captured_at) for _index, point in points), default=0.0)
+        if self._clearance_cache is not None and scan_at <= self._clearance_stamp:
+            return self._clearance_cache
+        clearance = SectorClearance(
             _sector_clearance(points, 0.0, 20.0),
             _sector_clearance(points, -75.0, 35.0),
             _sector_clearance(points, 75.0, 35.0),
@@ -314,7 +348,11 @@ class LD19Link:
             _sector_clearance(points, 35.0, 20.0),
             corridor_profile(points),
             _sector_clearance(points, 180.0, 25.0),
+            scan_at,
         )
+        self._clearance_stamp = scan_at
+        self._clearance_cache = clearance
+        return clearance
 
     def close(self) -> None:
         self._running = False
@@ -452,6 +490,7 @@ class AutonomousPolicy:
         self._direction_lock_until = 0.0
         self._escape_started_at: float | None = None
         self._escape_until = 0.0
+        self._escape_commit_until = 0.0
         self._arc_active = False
         self._guidance_bias = 0.0
         self.drive_confidence = 0.0
@@ -511,7 +550,7 @@ class AutonomousPolicy:
                 and candidate_score < locked + 0.24):
             return self.turn_command, locked
         self.turn_command = candidate
-        self._direction_lock_until = now + 0.45
+        self._direction_lock_until = now + 1.20
         return candidate, candidate_score
 
     def _reverse_arc(self, direction: str) -> str:
@@ -521,7 +560,7 @@ class AutonomousPolicy:
         both wheels in their loaded movement band gives the LiDAR time to gain
         a little front clearance without a spin or a brake/reverse pulse.
         """
-        outer = min(MAX_PWM, self.min_move_pwm + 12)
+        outer = min(MAX_PWM, self.min_move_pwm + ESCAPE_TURN_MARGIN_PWM)
         inner = self.min_move_pwm
         if direction == "L":
             return self._set_output("L", -outer, -inner)
@@ -552,8 +591,11 @@ class AutonomousPolicy:
         heading = float(np.clip(heading_deg, -MAX_GENTLE_HEADING_DEG, MAX_GENTLE_HEADING_DEG))
         turn_fraction = abs(heading) / MAX_GENTLE_HEADING_DEG
         outer = speed
-        inner = max(self.min_move_pwm,
-                    int(round(speed - (speed - self.min_move_pwm) * turn_fraction)))
+        available_split = min(MIN_TURN_MARGIN_PWM, speed - self.min_move_pwm)
+        inner = max(
+            self.min_move_pwm,
+            int(round(speed - available_split * turn_fraction)),
+        )
         if heading < 0.0:
             left, right = inner, outer
         else:
@@ -573,15 +615,38 @@ class AutonomousPolicy:
         usable = profile >= 0.38
         if not np.any(usable):
             return None
-        best = int(np.argmax(np.where(usable, score, -np.inf)))
+        straight = int(np.argmin(np.abs(STEER_HEADINGS)))
+        # If the body already has a full metre straight ahead, keep making
+        # progress.  Previously a slightly longer side corridor won every scan,
+        # causing the robot to orbit local objects instead of crossing open floor.
+        prefer_straight = profile[straight] >= FORWARD_PREFERENCE_CLEARANCE_M
+        if prefer_straight:
+            best = straight
+        else:
+            best = int(np.argmax(np.where(usable, score, -np.inf)))
         previous = self._heading_index
-        if previous is not None and usable[previous] and best != previous:
+        if not prefer_straight and previous is not None and usable[previous] and best != previous:
             # Only switch for a materially better option, so scan noise cannot
             # make the chassis weave between two near-tied headings.
-            if score[previous] + 0.07 >= score[best]:
+            if score[previous] + 0.14 >= score[best]:
                 best = previous
+            # Do not flip across the centre while the currently chosen side
+            # still contains a viable corridor.  This is the common multi-object
+            # oscillation that looked like indecisive left/right spinning.
+            elif (STEER_HEADINGS[previous] * STEER_HEADINGS[best] < 0.0
+                  and now < self._direction_lock_until):
+                best = previous
+        if previous is None or STEER_HEADINGS[previous] * STEER_HEADINGS[best] < 0.0:
+            self._direction_lock_until = now + 1.20
         self._heading_index = best
         return float(STEER_HEADINGS[best]), float(profile[best])
+
+    def _hold_stop(self, reason: str) -> str:
+        """Stop without clearing the close-obstacle recovery latch."""
+        self.reason = reason
+        self.drive_confidence = 0.0
+        self.cruise_pwm = 0
+        return self._set_output("STOP", 0, 0)
 
     def _set_stop(self, reason: str) -> str:
         self.reason = reason
@@ -591,6 +656,7 @@ class AutonomousPolicy:
         self._heading_index = None
         self._escape_started_at = None
         self._escape_until = 0.0
+        self._escape_commit_until = 0.0
         return self._set_output("STOP", 0, 0)
 
     def decide(self, lidar: SectorClearance, arduino: ArduinoStatus, person: bool, now: float,
@@ -614,24 +680,39 @@ class AutonomousPolicy:
         # could eventually back it into an unseen rear object.
         close_ultrasonic = arduino.front_cm is not None and arduino.front_cm < 22.0
         close_lidar = lidar.front_m < 0.42
-        if close_ultrasonic or close_lidar:
+        recovery_not_released = (
+            self._escape_started_at is not None
+            and lidar.front_m < ESCAPE_FRONT_RELEASE_M
+        )
+        if close_ultrasonic or close_lidar or recovery_not_released:
             if self._escape_started_at is None:
                 choice = self._choose_turn(lidar, now)
                 if choice is None or choice[1] < 0.34:
-                    return self._set_stop("STOP:ESCAPE_SIDE_BLOCKED")
+                    return self._hold_stop("STOP:ESCAPE_SIDE_BLOCKED")
                 self.turn_command = choice[0]
                 self._escape_started_at = now
                 self._escape_until = now + ESCAPE_REVERSE_SECONDS
             if lidar.rear_m is None or lidar.rear_m < ESCAPE_REAR_CLEARANCE_M:
-                return self._set_stop("STOP:ESCAPE_REAR_BLOCKED")
+                return self._hold_stop("STOP:ESCAPE_REAR_BLOCKED")
             if now >= self._escape_until:
-                return self._set_stop("STOP:ESCAPE_NO_FRONT_CLEARANCE")
+                # Preserve the latch.  Resetting it here made the next 30 ms
+                # cycle start another reverse, producing an endless hiccup loop.
+                return self._hold_stop("STOP:ESCAPE_NO_FRONT_CLEARANCE")
             source = "ULTRASONIC" if close_ultrasonic else "LD19"
             self.reason = f"ESCAPE_{source}:{self.turn_command}"
             self.drive_confidence = 0.35
             return self._reverse_arc(self.turn_command)
-        self._escape_started_at = None
-        self._escape_until = 0.0
+        if self._escape_started_at is not None:
+            self._escape_started_at = None
+            self._escape_until = 0.0
+            self._escape_commit_until = now + ESCAPE_COMMIT_SECONDS
+            self._direction_lock_until = self._escape_commit_until
+        if now < self._escape_commit_until:
+            heading = -MAX_GENTLE_HEADING_DEG if self.turn_command == "L" else MAX_GENTLE_HEADING_DEG
+            speed = self._cruise_speed(lidar.front_m)
+            self.reason = f"ESCAPE_COMMIT:{self.turn_command}"
+            self.drive_confidence = 0.50
+            return self._differential(speed, heading)
 
         # With a corridor profile the planner can steer continuously: it knows
         # how far its own body can travel along every heading, so it curves
@@ -692,16 +773,11 @@ class AutonomousPolicy:
         if output != self._last_output or now - self.last_sent_at >= 0.12:
             if link.differential_ready:
                 link.send(f"DRIVE {output[0]} {output[1]}")
-            elif output == (0, 0):
-                link.send("STOP")
-            elif output[0] >= 0 and output[1] >= 0:
-                # Old firmware still avoids the obstacle, but cannot make the
-                # new gentle arc.  This keeps a missed re-flash fail-safe.
-                link.send("L" if output[0] < output[1] else ("R" if output[0] > output[1] else "F"))
-            elif output[0] <= 0 and output[1] <= 0:
-                link.send("B")
             else:
-                link.send("L" if output[0] < output[1] else "R")
+                # The legacy L/R fallback is a counter-rotating pivot and was
+                # responsible for fast spins whenever CAPS DRIVE was missing or
+                # delayed.  Smooth autonomous motion requires current firmware.
+                link.send("STOP")
             self.last_command, self._last_output, self.last_sent_at = command, output, now
 
 
@@ -782,6 +858,8 @@ def main() -> int:
     # The mapper is advisory: obstacle avoidance always uses the current LD19
     # sectors above, never a past map cell or a guessed pose.
     local_map = LidarSlamLite()
+    slam_lite = local_map.state()
+    next_display_at = 0.0
     keep_running = True
 
     def stop(_signum: int, _frame: object) -> None:
@@ -803,14 +881,16 @@ def main() -> int:
             policy.send(arduino, command, now)
             points, _fresh = lidar.snapshot()
             slam_lite = local_map.update(points, policy.left_pwm, policy.right_pwm, now)
-            display_frame = camera.annotated_frame()
-            if not args.no_display and display_frame is not None:
-                panel = draw_dashboard(display_frame, local_map.render(), policy, clearance, status,
-                                       camera.person_in_path(), camera_ready, arduino.differential_ready,
-                                       slam_lite)
-                cv2.imshow(WINDOW_TITLE, panel)
-                if cv2.waitKey(1) & 0xFF in (27, ord("q"), ord("Q")):
-                    break
+            if not args.no_display and now >= next_display_at:
+                next_display_at = now + DISPLAY_PERIOD_S
+                display_frame = camera.annotated_frame()
+                if display_frame is not None:
+                    panel = draw_dashboard(display_frame, local_map.render(), policy, clearance, status,
+                                           camera.person_in_path(), camera_ready, arduino.differential_ready,
+                                           slam_lite)
+                    cv2.imshow(WINDOW_TITLE, panel)
+                    if cv2.waitKey(1) & 0xFF in (27, ord("q"), ord("Q")):
+                        break
             time.sleep(0.03)
     finally:
         arduino.close()
