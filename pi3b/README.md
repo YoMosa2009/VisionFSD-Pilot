@@ -180,19 +180,24 @@ move during that interval. Afterwards its authority order is fixed:
 1. A stale Uno, LD19, or webcam stops the robot; it will not drive blind.
 2. A confirmed person in the camera's forward path stops it. The camera draws
    its confirmed-person boxes in the robot display.
-3. The LD19 begins a gentle, direction-locked arc away from a central obstacle
-   below 86 cm. The arc has separate enter/exit thresholds, so a noisy range
-   measurement does not make it weave between straight and turning. Both motor
-   PWM values stay above the practical low-speed stall region.
-4. At 42 cm (or an ultrasonic return below 22 cm), it uses a short
-   LiDAR-cleared pivot escape instead of remaining stopped in front of the
-   obstacle. It keeps that escape direction briefly unless it becomes unsafe.
+3. The LD19 begins a gentle, direction-locked forward arc away from a central
+   obstacle below 86 cm. Both motor PWM values stay above the practical
+   low-speed stall region; ordinary planning never drops one wheel to zero.
+4. At 42 cm (or an ultrasonic return below 22 cm), it makes one short,
+   LiDAR-cleared reverse curve with both wheels driven. It does not pivot in
+   place. If the rear is not LiDAR-clear, or that bounded recovery does not
+   restore front clearance, it stops.
 5. Uno ultrasonic hard-stop (under 18 cm) always wins and blocks forward
    motor commands even if the Pi fails.
 
 This keeps roles separate: LD19 geometry chooses an open direction, the camera
 prevents movement toward confirmed people, and the Uno enforces the final
 close-range stop. A camera classification never overrides measured range data.
+
+The motor battery in the described 9 V-style holder is not adequate for
+autonomous testing: voltage sag can still cause buzzing, stuttering, or a
+controller reset regardless of this software. Replace it with the kit's rated
+7.4 V 2x18650 pack or a 6xAA NiMH pack before testing this runtime on the floor.
 
 ### LiDAR SLAM-lite local map
 

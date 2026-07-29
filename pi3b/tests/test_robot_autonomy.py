@@ -73,10 +73,25 @@ class AutonomousPolicyTests(unittest.TestCase):
     def test_ultrasonic_wins_over_clear_lidar(self) -> None:
         policy = AutonomousPolicy(0.0, 70)
         blocked = ArduinoStatus(front_cm=15.0, motion="S", received_at=time.monotonic())
-        clear_sides = SectorClearance(2.0, 2.0, 1.0, True, 1.8, 0.8)
+        clear_sides = SectorClearance(2.0, 2.0, 1.0, True, 1.8, 0.8, None, 1.0)
         self.assertEqual(policy.decide(clear_sides, blocked, False, time.monotonic()), "L")
         self.assertLess(policy.left_pwm, 0)
-        self.assertEqual(policy.right_pwm, 0)
+        self.assertLess(policy.right_pwm, 0)
+
+    def test_close_obstacle_never_commands_a_one_wheel_pivot(self) -> None:
+        policy = AutonomousPolicy(0.0, 118)
+        blocked = ArduinoStatus(front_cm=15.0, motion="S", received_at=time.monotonic())
+        clear_sides = SectorClearance(0.30, 1.8, 0.8, True, 1.7, 0.8, None, 1.0)
+        settle(policy, clear_sides, blocked)
+        self.assertLess(policy.left_pwm, 0)
+        self.assertLess(policy.right_pwm, 0)
+        self.assertNotEqual(policy.left_pwm, policy.right_pwm)
+
+    def test_close_obstacle_with_blocked_rear_stops(self) -> None:
+        policy = AutonomousPolicy(0.0, 118)
+        blocked = ArduinoStatus(front_cm=15.0, motion="S", received_at=time.monotonic())
+        clearance = SectorClearance(0.30, 1.8, 0.8, True, 1.7, 0.8, None, 0.20)
+        self.assertEqual(policy.decide(clearance, blocked, False, time.monotonic()), "STOP")
 
     def test_motion_starts_at_the_loaded_wheel_floor_not_a_tiny_pwm(self) -> None:
         policy = AutonomousPolicy(0.0, 118)
@@ -100,12 +115,12 @@ class AutonomousPolicyTests(unittest.TestCase):
         self.assertEqual(policy.decide(clear, self.status, True, time.monotonic()), "STOP")
 
     def test_front_obstacle_turns_toward_clearer_side(self) -> None:
-        policy = AutonomousPolicy(0.0, 70)
-        obstacle = SectorClearance(0.25, 0.7, 1.6, True, 0.7, 1.4)
+        policy = AutonomousPolicy(0.0, 118)
+        obstacle = SectorClearance(0.25, 0.7, 1.6, True, 0.7, 1.4, None, 1.0)
         self.assertEqual(policy.decide(obstacle, self.status, False, time.monotonic()), "R")
 
     def test_midrange_obstacle_uses_forward_arc(self) -> None:
-        policy = AutonomousPolicy(0.0, 70)
+        policy = AutonomousPolicy(0.0, 118)
         obstacle = SectorClearance(0.60, 1.8, 0.7, True, 1.5, 0.7)
         self.assertEqual(settle(policy, obstacle, self.status), "F")
         self.assertLess(policy.left_pwm, policy.right_pwm)
@@ -113,7 +128,7 @@ class AutonomousPolicyTests(unittest.TestCase):
         self.assertIn(policy.left_pwm, (0, MIN_MOVE_PWM))
 
     def test_arc_hysteresis_avoids_threshold_flicker(self) -> None:
-        policy = AutonomousPolicy(0.0, 70)
+        policy = AutonomousPolicy(0.0, 118)
         first = SectorClearance(0.80, 1.5, 0.8, True, 1.4, 0.8)
         settle(policy, first, self.status)
         held = SectorClearance(0.94, 1.5, 0.8, True, 1.4, 0.8)
@@ -121,7 +136,7 @@ class AutonomousPolicyTests(unittest.TestCase):
         self.assertLess(policy.left_pwm, policy.right_pwm)
 
     def test_direction_lock_prevents_small_side_measurement_flip(self) -> None:
-        policy = AutonomousPolicy(0.0, 70)
+        policy = AutonomousPolicy(0.0, 118)
         now = time.monotonic()
         first = SectorClearance(0.70, 1.5, 1.0, True, 1.4, 1.0)
         settle(policy, first, self.status)
@@ -173,6 +188,16 @@ class AutonomousPolicyTests(unittest.TestCase):
         policy = AutonomousPolicy(0.0, 70)
         clear = SectorClearance(1.2, 1.0, 1.0, True)
         self.assertEqual(policy.decide(clear, self.status, False, time.monotonic()), "F")
+
+    def test_wide_open_heading_still_uses_a_forward_arc_not_a_pivot(self) -> None:
+        policy = AutonomousPolicy(0.0, 118)
+        profile = np.zeros(STEER_HEADINGS.size, dtype=np.float32)
+        profile[int(np.argmin(np.abs(STEER_HEADINGS - 72.0)))] = 3.0
+        clearance = SectorClearance(1.0, 2.0, 2.0, True, 2.0, 2.0, profile)
+        self.assertEqual(settle(policy, clearance, self.status), "F")
+        self.assertGreater(policy.left_pwm, 0)
+        self.assertGreater(policy.right_pwm, 0)
+        self.assertGreaterEqual(min(policy.left_pwm, policy.right_pwm), MIN_MOVE_PWM)
 
 
 class CorridorProfileTests(unittest.TestCase):

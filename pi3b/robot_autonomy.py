@@ -59,6 +59,15 @@ DEFAULT_CRUISE_PWM = 118
 # Largest direct-PWM rise per planner decision after the initial non-stalling
 # floor.  The Uno applies its own 20 ms output ramp as the final authority.
 MAX_PWM_STEP = 4
+# At the low 118-PWM clear-space ceiling, the usable band above the loaded-wheel
+# deadband is only 13 PWM counts.  A larger split would stall the inside wheel
+# and turn an avoidance arc into a one-wheel spin.  Keep every ordinary forward
+# command inside that band; a close obstacle is handled by a bounded reverse
+# curve, never an in-place pivot.
+MAX_GENTLE_HEADING_DEG = 38.0
+MIN_TURN_MARGIN_PWM = 12
+ESCAPE_REVERSE_SECONDS = 0.45
+ESCAPE_REAR_CLEARANCE_M = 0.38
 
 # Measured chassis, in metres.  The planner needs its own width because a
 # rectangle fits through a gap that a point always would: this is what lets it
@@ -97,6 +106,9 @@ class SectorClearance:
     # Body-inflated clear travel for each heading in STEER_HEADINGS, metres
     # ahead of the front bumper.  None when no scan was available.
     profile: np.ndarray | None = None
+    # Rear range is used only before a short reverse recovery.  The static Uno
+    # ultrasonic sensor faces forward, so reverse motion must be LD19-gated.
+    rear_m: float | None = None
 
     def limit_at(self, heading_deg: float) -> float | None:
         if self.profile is None:
@@ -301,6 +313,7 @@ class LD19Link:
             _sector_clearance(points, -35.0, 20.0),
             _sector_clearance(points, 35.0, 20.0),
             corridor_profile(points),
+            _sector_clearance(points, 180.0, 25.0),
         )
 
     def close(self) -> None:
@@ -435,9 +448,10 @@ class AutonomousPolicy:
         self.min_move_pwm = min_move_pwm
         self._heading_index: int | None = None
         self.cruise_pwm = 0
-        self.turn_until = 0.0
         self.turn_command = "L"
         self._direction_lock_until = 0.0
+        self._escape_started_at: float | None = None
+        self._escape_until = 0.0
         self._arc_active = False
         self._guidance_bias = 0.0
         self.drive_confidence = 0.0
@@ -500,28 +514,18 @@ class AutonomousPolicy:
         self._direction_lock_until = now + 0.45
         return candidate, candidate_score
 
-    def _pivot(self, direction: str) -> str:
-        # Counter-rotating both wheels at their usable minimum still spins this
-        # tiny chassis too quickly.  Reverse just one track instead: it makes
-        # a deliberate backing arc, uses less current, and stays clear of the
-        # ultrasonic sensor's forward travel guard.
-        turn_speed = self.min_move_pwm
-        if direction == "L":
-            return self._set_output("L", -turn_speed, 0)
-        return self._set_output("R", 0, -turn_speed)
+    def _reverse_arc(self, direction: str) -> str:
+        """Back away in a shallow curve, with both tracks driven.
 
-    def _arc(self, direction: str, base_speed: int) -> str:
-        # Both tracks stay forward.  This is smoother and uses less peak motor
-        # current than repeatedly stopping and pivoting at every obstacle.
-        outer = max(self.min_move_pwm, base_speed)
-        # Keep both motors above the practical low-PWM region of this cheap
-        # chassis.  A very low inner PWM is more likely to stall a wheel than
-        # produce a smooth arc, especially as the motor battery weakens.
-        inner_raw = int(outer * 0.62)
-        inner = inner_raw if inner_raw >= self.min_move_pwm else 0
+        A one-wheel reverse is still a pivot on this short wheelbase.  Keeping
+        both wheels in their loaded movement band gives the LiDAR time to gain
+        a little front clearance without a spin or a brake/reverse pulse.
+        """
+        outer = min(MAX_PWM, self.min_move_pwm + 12)
+        inner = self.min_move_pwm
         if direction == "L":
-            return self._set_output("F", inner, outer)
-        return self._set_output("F", outer, inner)
+            return self._set_output("L", -outer, -inner)
+        return self._set_output("R", -inner, -outer)
 
     def _cruise_speed(self, limit_m: float | None) -> int:
         """Scale speed with how far the body can actually travel.
@@ -539,27 +543,23 @@ class AutonomousPolicy:
         return int(round(floor + span * max(0, self.speed - floor)))
 
     def _differential(self, speed: int, heading_deg: float) -> str:
-        """Turn a desired heading into wheel speeds, respecting the deadband."""
-        turn = float(np.clip(heading_deg / 60.0, -1.0, 1.0)) * 0.55
-        left = speed * (1.0 + turn)
-        right = speed * (1.0 - turn)
-        # Normalise so the outer wheel never exceeds the governed speed.
-        # Scaling the differential *up* instead would make every turn faster
-        # than driving straight, which is both wrong and alarming to watch.
-        peak = max(abs(left), abs(right))
-        if peak > speed:
-            left, right = left * speed / peak, right * speed / peak
-
-        def wheel(value: float) -> int:
-            # Well under the deadband, let the wheel coast: that is what makes a
-            # genuinely tight arc possible.  Just under it, lift to the floor,
-            # because in between the motor only buzzes and sags the pack.
-            if abs(value) < self.min_move_pwm:
-                return 0
-            return int(math.copysign(abs(value), value))
-
-        self.cruise_pwm = speed
-        return self._set_output("F", wheel(left), wheel(right))
+        """Turn only by the usable PWM margin; both wheels stay driven."""
+        # A turn needs actual headroom above the loaded-wheel floor.  At the
+        # floor both PWM values are identical after normalisation, so there is
+        # no steering authority at all.  Preserve a small, direct-PWM margin
+        # instead of dropping the inside track to zero.
+        speed = min(self.speed, max(self.min_move_pwm + MIN_TURN_MARGIN_PWM, speed))
+        heading = float(np.clip(heading_deg, -MAX_GENTLE_HEADING_DEG, MAX_GENTLE_HEADING_DEG))
+        turn_fraction = abs(heading) / MAX_GENTLE_HEADING_DEG
+        outer = speed
+        inner = max(self.min_move_pwm,
+                    int(round(speed - (speed - self.min_move_pwm) * turn_fraction)))
+        if heading < 0.0:
+            left, right = inner, outer
+        else:
+            left, right = outer, inner
+        self.cruise_pwm = outer
+        return self._set_output("F", left, right)
 
     def _heading_from_profile(self, profile: np.ndarray, now: float) -> tuple[float, float] | None:
         """Pick the best heading, preferring straight and resisting flicker."""
@@ -589,6 +589,8 @@ class AutonomousPolicy:
         self.drive_confidence = 0.0
         self.cruise_pwm = 0
         self._heading_index = None
+        self._escape_started_at = None
+        self._escape_until = 0.0
         return self._set_output("STOP", 0, 0)
 
     def decide(self, lidar: SectorClearance, arduino: ArduinoStatus, person: bool, now: float,
@@ -606,26 +608,30 @@ class AutonomousPolicy:
         if lidar.front_m is None:
             return self._set_stop("STOP:LD19_FRONT_UNSEEN")
 
-        # The old policy STOPped when the static ultrasonic saw an obstacle,
-        # which trapped the robot in front of it.  Turning is safe because the
-        # Uno independently blocks only forward motion; the Pi still requires
-        # LD19 clearance before it commands the turn.
+        # The Uno has no rear sensor.  A close front obstacle therefore gets one
+        # bounded LD19-cleared reverse curve, not a pivot.  The old one-wheel
+        # pivot made the chassis spin in place, and repeated recovery attempts
+        # could eventually back it into an unseen rear object.
         close_ultrasonic = arduino.front_cm is not None and arduino.front_cm < 22.0
         close_lidar = lidar.front_m < 0.42
         if close_ultrasonic or close_lidar:
-            choice = self._choose_turn(lidar, now)
-            if choice is None or choice[1] < 0.34:
-                return self._set_stop("STOP:ESCAPE_SIDE_BLOCKED")
-            self.turn_command = choice[0]
-            self.turn_until = max(self.turn_until, now + 0.50)
+            if self._escape_started_at is None:
+                choice = self._choose_turn(lidar, now)
+                if choice is None or choice[1] < 0.34:
+                    return self._set_stop("STOP:ESCAPE_SIDE_BLOCKED")
+                self.turn_command = choice[0]
+                self._escape_started_at = now
+                self._escape_until = now + ESCAPE_REVERSE_SECONDS
+            if lidar.rear_m is None or lidar.rear_m < ESCAPE_REAR_CLEARANCE_M:
+                return self._set_stop("STOP:ESCAPE_REAR_BLOCKED")
+            if now >= self._escape_until:
+                return self._set_stop("STOP:ESCAPE_NO_FRONT_CLEARANCE")
             source = "ULTRASONIC" if close_ultrasonic else "LD19"
             self.reason = f"ESCAPE_{source}:{self.turn_command}"
             self.drive_confidence = 0.35
-            return self._pivot(self.turn_command)
-        if now < self.turn_until:
-            self.reason = f"ESCAPE_TURN:{self.turn_command}"
-            self.drive_confidence = 0.45
-            return self._pivot(self.turn_command)
+            return self._reverse_arc(self.turn_command)
+        self._escape_started_at = None
+        self._escape_until = 0.0
 
         # With a corridor profile the planner can steer continuously: it knows
         # how far its own body can travel along every heading, so it curves
@@ -635,18 +641,12 @@ class AutonomousPolicy:
             choice = self._heading_from_profile(lidar.profile, now)
             if choice is not None:
                 heading, limit = choice
-                if abs(heading) > 50.0:
-                    # Too far off the nose to arc into cleanly; square up first.
-                    self.turn_command = "R" if heading > 0 else "L"
-                    self.turn_until = max(self.turn_until, now + 0.30)
-                    self.reason = f"ALIGN:{heading:+.0f}deg"
-                    self.drive_confidence = 0.4
-                    return self._pivot(self.turn_command)
                 speed = self._cruise_speed(limit)
-                self._arc_active = abs(heading) > 6.0
+                applied_heading = float(np.clip(heading, -MAX_GENTLE_HEADING_DEG, MAX_GENTLE_HEADING_DEG))
+                self._arc_active = abs(applied_heading) > 6.0
                 self.drive_confidence = float(np.clip(limit / 2.0, 0.0, 1.0))
-                self.reason = f"DRIVE:{heading:+.0f}deg {limit:.2f}m pwm{speed}"
-                return self._differential(speed, heading)
+                self.reason = f"DRIVE:{applied_heading:+.0f}deg {limit:.2f}m pwm{speed}"
+                return self._differential(speed, applied_heading)
             return self._set_stop("STOP:NO_CLEAR_CORRIDOR")
 
         # Use different enter/exit distances so a range return hovering near
@@ -662,7 +662,8 @@ class AutonomousPolicy:
                 base = self._cruise_speed(lidar.front_m)
                 self.reason = f"ARC_AVOID:{choice[0]}"
                 self.drive_confidence = 0.55 + 0.25 * progress
-                return self._arc(choice[0], min(self.speed, base))
+                heading = -MAX_GENTLE_HEADING_DEG if choice[0] == "L" else MAX_GENTLE_HEADING_DEG
+                return self._differential(min(self.speed, base), heading)
             return self._set_stop("STOP:ARC_SIDE_BLOCKED")
 
         # Centre gently toward the clearer front quarter.  It is deliberately
