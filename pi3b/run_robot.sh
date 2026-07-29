@@ -25,6 +25,16 @@ fi
 # Keep the last two runs on disk so a boot failure can be read afterwards.
 LOG_DIR="$ROOT/logs"
 mkdir -p "$LOG_DIR"
+if ! command -v flock >/dev/null 2>&1; then
+  echo "Required single-instance utility is missing: flock" >&2
+  exit 1
+fi
+# Raspberry Pi desktop releases may execute both XDG and compositor autostart
+# entries.  Only one process may own the Uno, LD19, and webcam.
+exec 9>"$LOG_DIR/robot.lock"
+if ! flock -n 9; then
+  exit 0
+fi
 LOG="$LOG_DIR/robot.log"
 if [[ -f "$LOG" ]]; then mv -f "$LOG" "$LOG_DIR/robot.previous.log"; fi
 

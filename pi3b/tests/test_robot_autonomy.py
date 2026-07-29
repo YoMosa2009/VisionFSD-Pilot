@@ -19,6 +19,7 @@ from robot_autonomy import (
     ArduinoStatus,
     AutonomousPolicy,
     CameraSafety,
+    LD19Link,
     SectorClearance,
     _sector_clearance,
     corridor_profile,
@@ -315,6 +316,24 @@ class ArduinoLinkTests(unittest.TestCase):
         self.assertEqual(status.right_pwm, 0)
         self.assertTrue(status.blocked)
         self.assertEqual(status.received_at, 123.0)
+
+    def test_ld19_reader_treats_closed_descriptor_as_shutdown(self) -> None:
+        link = object.__new__(LD19Link)
+        link._running = True
+        link._serial = mock.Mock()
+        link._serial.in_waiting = None
+        link._read_loop()
+
+    def test_ld19_close_joins_reader_before_closing_serial(self) -> None:
+        events = []
+        link = object.__new__(LD19Link)
+        link._running = True
+        link._thread = mock.Mock()
+        link._thread.join.side_effect = lambda timeout: events.append(("join", timeout))
+        link._serial = mock.Mock()
+        link._serial.close.side_effect = lambda: events.append(("close", None))
+        link.close()
+        self.assertEqual(events, [("join", 0.5), ("close", None)])
 
 
 class CameraSafetyTests(unittest.TestCase):

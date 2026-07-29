@@ -221,6 +221,13 @@ camera indexes 0 through 7. If no webcam currently delivers frames, the LiDAR
 dashboard remains open in `CAMERA STALE` safe-STOP mode and retries instead of
 terminating the complete robot runtime.
 
+`run_robot.sh` holds a process lock before opening USB devices. This prevents
+XDG and compositor autostart entries from launching two robot processes that
+compete for the same webcam and serial ports. Linux V4L device paths are opened
+directly through the V4L2 backend rather than GStreamer. Robot-mode capture is
+320x240 at 15 FPS because the camera is a safety veto, not a displayed steering
+sensor; this reduces Pi 3B USB buffer and CPU pressure.
+
 ### LiDAR SLAM-lite local map
 
 The LD19-only panel uses a rolling **SLAM-lite** local map. It keeps a 6 m local

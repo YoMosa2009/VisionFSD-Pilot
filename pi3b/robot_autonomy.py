@@ -79,6 +79,9 @@ CAPS_RETRY_S = 0.50
 CAMERA_RETRY_S = 1.0
 CAMERA_START_TIMEOUT_S = 2.0
 CAMERA_AUTO_INDEX_LIMIT = 8
+CAMERA_CAPTURE_WIDTH = 320
+CAMERA_CAPTURE_HEIGHT = 240
+CAMERA_CAPTURE_FPS = 15
 
 # Measured chassis, in metres.  The planner needs its own width because a
 # rectangle fits through a gap that a point always would: this is what lets it
@@ -304,7 +307,7 @@ class ArduinoLink:
         while self._running:
             try:
                 line = self._serial.readline().decode("ascii", "replace").strip()
-            except serial.SerialException:
+            except (serial.SerialException, OSError, TypeError):
                 break
             if not line:
                 continue
@@ -332,13 +335,17 @@ class ArduinoLink:
         return self._supports_differential
 
     def close(self) -> None:
+        self._running = False
         try:
             if self._serial.is_open:
                 self._serial.write(b"STOP\n")
-            self._serial.close()
-        except serial.SerialException:
+        except (serial.SerialException, OSError, TypeError):
             pass
-        self._running = False
+        self._reader.join(timeout=0.5)
+        try:
+            self._serial.close()
+        except (serial.SerialException, OSError, TypeError):
+            pass
 
 
 class LD19Link:
@@ -361,7 +368,7 @@ class LD19Link:
         while self._running:
             try:
                 raw = self._serial.read(max(1, self._serial.in_waiting))
-            except serial.SerialException:
+            except (serial.SerialException, OSError, TypeError):
                 break
             if not raw:
                 continue
@@ -410,9 +417,10 @@ class LD19Link:
 
     def close(self) -> None:
         self._running = False
+        self._thread.join(timeout=0.5)
         try:
             self._serial.close()
-        except serial.SerialException:
+        except (serial.SerialException, OSError, TypeError):
             pass
 
 
@@ -510,7 +518,12 @@ class CameraSafety:
             source = self._camera_sources[self._next_camera_source % len(self._camera_sources)]
             self._next_camera_source += 1
             try:
-                self.camera = LatestCamera(source, 640, 480, 25)
+                self.camera = LatestCamera(
+                    source,
+                    CAMERA_CAPTURE_WIDTH,
+                    CAMERA_CAPTURE_HEIGHT,
+                    CAMERA_CAPTURE_FPS,
+                )
             except Exception as exc:
                 errors.append(f"{source}: {exc}")
                 continue
