@@ -44,6 +44,14 @@ from visionfsd_pi import (
 PROJECT_ROOT = Path(__file__).resolve().parent
 WINDOW_TITLE = "VisionFSD Pi Robot - standby"
 UNO_BAUD = 115200
+# The L298N bridge on this shield drops roughly 2 V, so a 7.9 V pack puts at
+# most about 5.6 V across a motor at full duty.  Capping PWM at 105 meant 41%
+# of that, near 2.3 V: enough to spin a free wheel on blocks, not enough to
+# move the loaded chassis on a floor, where the motor just sits buzzing.
+MAX_PWM = 255
+# Lowest PWM that reliably turns a *loaded* wheel.  A deadband measured with
+# the wheels in the air reads far lower than the real one.
+MIN_MOVE_PWM = 105
 LD19_BAUD = 230400
 
 
@@ -259,8 +267,8 @@ class LocalLidarMap:
         # Conservative commanded-motion dead reckoning.  It makes the map
         # follow gradual differential turns, but deliberately never feeds the
         # movement planner: this chassis has no encoders or IMU.
-        linear = ((left_pwm + right_pwm) * 0.5 / 105.0) * 0.12
-        turn_rate = ((left_pwm - right_pwm) / 105.0) * 104.0
+        linear = ((left_pwm + right_pwm) * 0.5 / MAX_PWM) * 0.30
+        turn_rate = ((left_pwm - right_pwm) / MAX_PWM) * 140.0
         self.heading = (self.heading + turn_rate * elapsed) % 360.0
         self.x += math.sin(math.radians(self.heading)) * linear * elapsed
         self.y -= math.cos(math.radians(self.heading)) * linear * elapsed
@@ -381,8 +389,8 @@ class AutonomousPolicy:
         return min(values) if values else None
 
     def _set_output(self, label: str, left_pwm: int, right_pwm: int) -> str:
-        self.left_pwm = int(np.clip(left_pwm, -105, 105))
-        self.right_pwm = int(np.clip(right_pwm, -105, 105))
+        self.left_pwm = int(np.clip(left_pwm, -MAX_PWM, MAX_PWM))
+        self.right_pwm = int(np.clip(right_pwm, -MAX_PWM, MAX_PWM))
         return label
 
     def _choose_turn(self, lidar: SectorClearance, now: float) -> tuple[str, float] | None:
@@ -405,7 +413,7 @@ class AutonomousPolicy:
         return candidate, candidate_score
 
     def _pivot(self, direction: str) -> str:
-        turn_speed = max(55, self.speed - 10)
+        turn_speed = max(MIN_MOVE_PWM + 20, self.speed - 10)
         if direction == "L":
             return self._set_output("L", -turn_speed, turn_speed)
         return self._set_output("R", turn_speed, -turn_speed)
@@ -413,11 +421,11 @@ class AutonomousPolicy:
     def _arc(self, direction: str, base_speed: int) -> str:
         # Both tracks stay forward.  This is smoother and uses less peak motor
         # current than repeatedly stopping and pivoting at every obstacle.
-        outer = max(58, base_speed)
+        outer = max(MIN_MOVE_PWM + 10, base_speed)
         # Keep both motors above the practical low-PWM region of this cheap
         # chassis.  A very low inner PWM is more likely to stall a wheel than
         # produce a smooth arc, especially as the motor battery weakens.
-        inner = max(48, int(outer * 0.62))
+        inner = max(MIN_MOVE_PWM, int(outer * 0.62))
         if direction == "L":
             return self._set_output("F", inner, outer)
         return self._set_output("F", outer, inner)
@@ -474,7 +482,7 @@ class AutonomousPolicy:
             choice = self._choose_turn(lidar, now)
             if choice is not None and choice[1] >= 0.42:
                 progress = float(np.clip((lidar.front_m - 0.42) / 0.63, 0.0, 1.0))
-                base = int(max(56, self.speed * (0.78 + 0.22 * progress)))
+                base = int(max(MIN_MOVE_PWM, self.speed * (0.78 + 0.22 * progress)))
                 self.reason = f"ARC_AVOID:{choice[0]}"
                 self.drive_confidence = 0.55 + 0.25 * progress
                 return self._arc(choice[0], min(self.speed, base))
@@ -559,7 +567,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", type=Path, default=PROJECT_ROOT / "models/vehicle_efficientdet_lite0_int8.tflite")
     parser.add_argument("--fallback-model", type=Path, default=PROJECT_ROOT / "models/vehicle_ssd_mobilenet_v1.tflite")
     parser.add_argument("--standby-seconds", type=float, default=25.0)
-    parser.add_argument("--speed", type=int, default=70, choices=range(45, 91))
+    parser.add_argument("--speed", type=int, default=150, choices=range(MIN_MOVE_PWM, MAX_PWM + 1),
+                        metavar=f"{MIN_MOVE_PWM}..{MAX_PWM}",
+                        help="Cruise PWM. Below about 120 a loaded chassis stalls on carpet.")
     parser.add_argument("--threads", type=int, default=2, choices=(1, 2, 3))
     parser.add_argument("--fov", type=float, default=70.0)
     parser.add_argument("--lidar-front-offset-deg", type=float, default=0.0,

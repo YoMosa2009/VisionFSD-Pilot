@@ -23,8 +23,19 @@ const unsigned long COMMAND_TIMEOUT_MS = 350UL;
 const unsigned long STATUS_PERIOD_MS = 250UL;
 const unsigned long ECHO_TIMEOUT_US = 26000UL;
 const int FORWARD_STOP_DISTANCE_CM = 18;
-const int DEFAULT_SPEED = 70;
-const int MAX_SAFE_SPEED = 105;
+// The L298N bridge on this shield drops roughly 2 V, so a 7.9 V pack puts at
+// most about 5.6 V across a motor at full duty.  A 105 cap meant 41% of that,
+// near 2.3 V, which spins a free wheel in the air but cannot move the robot on
+// a floor: the motor just sits energised and buzzing.  The Pi still decides the
+// actual speed; this only stops the firmware from being the limit.
+const int DEFAULT_SPEED = 150;
+const int MAX_SAFE_SPEED = 255;
+
+// Static friction needs more torque to break than motion needs to sustain, so
+// a start from rest gets a brief full-power pulse before settling to the
+// commanded value.  Without it a low cruise command can never get going.
+const unsigned long KICKSTART_MS = 90UL;
+const int KICKSTART_PWM = 220;
 
 char commandBuffer[24];
 byte commandLength = 0;
@@ -32,6 +43,9 @@ char activeMotion = 'S';
 int driveSpeed = DEFAULT_SPEED;
 int leftOutput = 0;
 int rightOutput = 0;
+int desiredLeft = 0;
+int desiredRight = 0;
+unsigned long kickstartUntil = 0;
 unsigned long lastMotionCommandAt = 0;
 unsigned long lastStatusAt = 0;
 
@@ -47,12 +61,28 @@ void setMotor(byte pinA, byte pinB, byte enablePin, int direction, int speed) {
   analogWrite(enablePin, speed);
 }
 
+// Applies the commanded outputs, boosted while a kickstart pulse is active.
+// Called both when a command arrives and from loop(), so the boost ends on
+// time rather than lasting until the next command happens to turn up.
+void applyOutputs() {
+  int left = desiredLeft;
+  int right = desiredRight;
+  if (millis() < kickstartUntil) {
+    if (left != 0 && abs(left) < KICKSTART_PWM) left = left > 0 ? KICKSTART_PWM : -KICKSTART_PWM;
+    if (right != 0 && abs(right) < KICKSTART_PWM) right = right > 0 ? KICKSTART_PWM : -KICKSTART_PWM;
+  }
+  setMotor(M1_A, M1_B, M1_ENABLE, left > 0 ? +1 : (left < 0 ? -1 : 0), abs(left));
+  setMotor(M2_A, M2_B, M2_ENABLE, right > 0 ? +1 : (right < 0 ? -1 : 0), abs(right));
+  leftOutput = left;
+  rightOutput = right;
+}
+
 void stopMotors() {
-  setMotor(M1_A, M1_B, M1_ENABLE, 0, 0);
-  setMotor(M2_A, M2_B, M2_ENABLE, 0, 0);
+  desiredLeft = 0;
+  desiredRight = 0;
+  kickstartUntil = 0;
+  applyOutputs();
   activeMotion = 'S';
-  leftOutput = 0;
-  rightOutput = 0;
 }
 
 long frontDistanceCentimetres() {
@@ -85,10 +115,15 @@ void driveDifferential(int left, int right) {
     Serial.println(F("BLOCKED:FRONT_ULTRASONIC"));
     return;
   }
-  setMotor(M1_A, M1_B, M1_ENABLE, left > 0 ? +1 : (left < 0 ? -1 : 0), abs(left));
-  setMotor(M2_A, M2_B, M2_ENABLE, right > 0 ? +1 : (right < 0 ? -1 : 0), abs(right));
-  leftOutput = left;
-  rightOutput = right;
+  // Breaking away from rest, or reversing a wheel, is where torque is scarce.
+  bool wasStopped = (desiredLeft == 0 && desiredRight == 0);
+  bool reversed = (desiredLeft > 0) != (left > 0) || (desiredRight > 0) != (right > 0);
+  if ((left != 0 || right != 0) && (wasStopped || reversed)) {
+    kickstartUntil = millis() + KICKSTART_MS;
+  }
+  desiredLeft = left;
+  desiredRight = right;
+  applyOutputs();
   activeMotion = describeMotion(left, right);
   lastMotionCommandAt = millis();
 }
@@ -188,6 +223,10 @@ void setup() {
 
 void loop() {
   readSerial();
+  // Ends the kickstart pulse on schedule instead of at the next command.
+  if (activeMotion != 'S') {
+    applyOutputs();
+  }
   if (activeMotion != 'S' && millis() - lastMotionCommandAt > COMMAND_TIMEOUT_MS) {
     stopMotors();
     Serial.println(F("STOP:COMMAND_TIMEOUT"));

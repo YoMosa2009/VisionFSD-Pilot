@@ -104,11 +104,34 @@ Flash this separate sketch to the Uno first:
 
 It is intentionally different from the earlier manual-drive sketch: the
 ultrasonic sensor is static and front-facing, the servo is unused/detached to
-avoid its continuous battery draw, motor PWM is capped at 105, and every
-motion command expires after 350 ms. The Pi sends bounded differential motor
-commands, allowing gentle forward arcs instead of only straight/pivot motion.
-The Uno blocks forward travel below 18 cm even if the Pi crashes or sends a
-bad command. **Re-flash this sketch after each robot-firmware update.**
+avoid its continuous battery draw, and every motion command expires after
+350 ms. The Pi sends bounded differential motor commands, allowing gentle
+forward arcs instead of only straight/pivot motion. The Uno blocks forward
+travel below 18 cm even if the Pi crashes or sends a bad command.
+**Re-flash this sketch after each robot-firmware update.**
+
+### Motor power and why PWM is not capped low
+
+The shield's L298N bridge drops roughly 2 V, so a 7.9 V pack puts at most about
+5.6 V across a motor at full duty. An earlier 105/255 cap therefore delivered
+around 2.3 V. That is enough to spin a free wheel with the robot on blocks and
+**not** enough to move the loaded chassis on a floor: the motor sits energised
+and buzzing, the robot creeps, pauses and stutters, and the battery sags for no
+useful work. Full 8-bit range is now available and the Pi decides the actual
+speed, defaulting to 150.
+
+For the same reason the practical deadband is measured loaded, not in the air.
+`MIN_MOVE_PWM` is 105: any commanded wheel value is either zero or above it,
+because in between the motor only buzzes.
+
+A start from rest also gets a brief 90 ms full-power pulse, because static
+friction takes more torque to break than motion takes to sustain. Without it a
+low cruise command can never get the robot going at all.
+
+If the robot still stutters on carpet, raise `--speed` before suspecting the
+planner. A 9 V PP3 alkaline is not a usable motor supply here: its internal
+resistance collapses under an amp of motor current. Use the kit's 2x18650
+holder (7.4 V) or 6x AA NiMH.
 
 Run a supervised first test on blocks, wheels free, then on an empty floor:
 

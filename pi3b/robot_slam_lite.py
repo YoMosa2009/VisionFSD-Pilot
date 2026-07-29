@@ -124,8 +124,8 @@ class LidarSlamLite:
         self._last_motion_at = now
         # These deliberately conservative values are only a prediction used by
         # the visual local map.  They are not odometry and never control drive.
-        linear_mps = ((left_pwm + right_pwm) * 0.5 / 105.0) * 0.10
-        turn_rate_dps = ((left_pwm - right_pwm) / 105.0) * 96.0
+        linear_mps = ((left_pwm + right_pwm) * 0.5 / 255.0) * 0.26
+        turn_rate_dps = ((left_pwm - right_pwm) / 255.0) * 130.0
         yaw_delta = turn_rate_dps * elapsed
         self.heading = (self.heading + yaw_delta) % 360.0
         self._yaw_since_scan += yaw_delta

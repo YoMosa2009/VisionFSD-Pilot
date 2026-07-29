@@ -7,7 +7,7 @@ import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from robot_autonomy import ArduinoStatus, AutonomousPolicy, SectorClearance
+from robot_autonomy import MAX_PWM, MIN_MOVE_PWM, ArduinoStatus, AutonomousPolicy, SectorClearance
 
 
 class AutonomousPolicyTests(unittest.TestCase):
@@ -69,10 +69,31 @@ class AutonomousPolicyTests(unittest.TestCase):
         self.assertLess(policy.left_pwm, policy.right_pwm)
 
     def test_arc_keeps_both_motors_out_of_low_pwm_stall_range(self) -> None:
-        policy = AutonomousPolicy(0.0, 70)
+        policy = AutonomousPolicy(0.0, 150)
         obstacle = SectorClearance(0.50, 1.6, 0.8, True, 1.5, 0.8)
         policy.decide(obstacle, self.status, False, time.monotonic())
-        self.assertGreaterEqual(min(policy.left_pwm, policy.right_pwm), 48)
+        self.assertGreaterEqual(min(policy.left_pwm, policy.right_pwm), MIN_MOVE_PWM)
+
+    def test_every_motion_clears_the_loaded_stall_floor(self) -> None:
+        """A wheel that turns freely in the air still stalls under the chassis.
+
+        Any commanded motion must therefore be either zero or genuinely above
+        the loaded deadband; in between, the motor only buzzes and sags the
+        battery, which is what made the robot creep and pause on the floor.
+        """
+        scenarios = [
+            SectorClearance(2.0, 2.0, 2.0, True, 2.0, 2.0),      # open cruise
+            SectorClearance(0.50, 1.6, 0.8, True, 1.5, 0.8),     # arc
+            SectorClearance(0.25, 0.7, 1.6, True, 0.7, 1.4),     # pivot escape
+            SectorClearance(1.2, 0.6, 1.9, True, 0.6, 1.8),      # guided forward
+        ]
+        for index, clearance in enumerate(scenarios):
+            policy = AutonomousPolicy(0.0, 150)
+            policy.decide(clearance, self.status, False, time.monotonic())
+            for value in (policy.left_pwm, policy.right_pwm):
+                self.assertTrue(value == 0 or abs(value) >= MIN_MOVE_PWM,
+                                f"scenario {index} produced stalling PWM {value}")
+                self.assertLessEqual(abs(value), MAX_PWM)
 
     def test_stale_camera_stops_after_standby(self) -> None:
         policy = AutonomousPolicy(0.0, 70)
