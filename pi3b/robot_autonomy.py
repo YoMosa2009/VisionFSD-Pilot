@@ -58,20 +58,23 @@ DEFAULT_CRUISE_PWM = 118
 # Largest direct-PWM rise per planner decision after the initial non-stalling
 # floor.  The Uno applies its own 20 ms output ramp as the final authority.
 MAX_PWM_STEP = 4
-# At the low 118-PWM clear-space ceiling, the usable band above the loaded-wheel
-# deadband is only 13 PWM counts.  A larger split would stall the inside wheel
-# and turn an avoidance arc into a one-wheel spin.  Keep every ordinary forward
-# command inside that band; a close obstacle is handled by a bounded reverse
-# curve, never an in-place pivot.
-MAX_GENTLE_HEADING_DEG = 24.0
-MIN_TURN_MARGIN_PWM = 8
-ESCAPE_TURN_MARGIN_PWM = 6
-ESCAPE_REVERSE_SECONDS = 0.90
+# Straight cruise stays low, but a useful forward arc needs more than the old
+# eight-PWM split.  Bounded outer-wheel headroom supplies yaw while the inside
+# wheel remains at the loaded floor; neither wheel counter-rotates.
+MAX_GENTLE_HEADING_DEG = 40.0
+MAX_TURN_SPLIT_PWM = 28
+MAX_STEERING_STEP_DEG = 5.0
+CORRIDOR_STEERING_GAIN = 1.6
+ESCAPE_TURN_MARGIN_PWM = 24
+ESCAPE_REVERSE_SECONDS = 0.70
 ESCAPE_REAR_CLEARANCE_M = 0.38
-ESCAPE_FRONT_RELEASE_M = 0.50
-ESCAPE_COMMIT_SECONDS = 0.85
-FORWARD_PREFERENCE_CLEARANCE_M = 1.00
+ESCAPE_FRONT_RELEASE_M = 0.68
+ESCAPE_COMMIT_SECONDS = 1.00
+FORWARD_PREFERENCE_CLEARANCE_M = 1.10
+CLOSE_LIDAR_M = 0.52
+CLOSE_ULTRASONIC_CM = 30.0
 DISPLAY_PERIOD_S = 0.10
+TELEMETRY_PERIOD_S = 1.0
 CAPS_RETRY_S = 0.50
 CAMERA_RETRY_S = 1.0
 CAMERA_START_TIMEOUT_S = 2.0
@@ -82,13 +85,13 @@ CAMERA_AUTO_INDEX_LIMIT = 8
 # steer around an object rather than treat one sector as blocked.
 ROBOT_WIDTH_M = 0.14
 ROBOT_LENGTH_M = 0.15
-SAFETY_MARGIN_M = 0.04
+SAFETY_MARGIN_M = 0.06
 CORRIDOR_HALF_WIDTH_M = ROBOT_WIDTH_M / 2.0 + SAFETY_MARGIN_M
 FRONT_OVERHANG_M = ROBOT_LENGTH_M / 2.0
 PLANNING_HORIZON_M = 3.0
 # Candidate headings for the corridor sweep, symmetric so straight ahead is
 # itself an option rather than falling between two near-tied neighbours.
-STEER_HEADINGS = np.arange(-72.0, 72.1, 4.0, dtype=np.float32)
+STEER_HEADINGS = np.arange(-72.0, 72.1, 2.0, dtype=np.float32)
 _STEER_RADIANS = np.radians(STEER_HEADINGS)
 LD19_BAUD = 230400
 
@@ -141,7 +144,11 @@ def _sector_clearance(points: list[tuple[int, object]], centre_deg: float, half_
     lone speckle, which otherwise makes a lightweight robot twitch or spin.
     """
     samples = sorted(
-        (float(point.angle_deg), point.distance_mm / 1000.0)
+        (
+            float(point.angle_deg),
+            point.distance_mm / 1000.0,
+            int(getattr(point, "confidence", 0)),
+        )
         for _index, point in points
         if abs(_signed_angle(point.angle_deg - centre_deg)) <= half_width_deg
         # Keep the useful indoor portion of the LD19's range.  The live map
@@ -150,14 +157,17 @@ def _sector_clearance(points: list[tuple[int, object]], centre_deg: float, half_
         and 0.08 <= point.distance_mm / 1000.0 <= 5.8
     )
     clustered: list[float] = []
-    for angle, distance in samples:
+    for angle, distance, confidence in samples:
         neighbours = [
             other_distance
-            for other_angle, other_distance in samples
+            for other_angle, other_distance, _other_confidence in samples
             if abs(_signed_angle(other_angle - angle)) <= 3.0
             and abs(other_distance - distance) <= max(0.14, distance * 0.22)
         ]
-        if len(neighbours) >= 2:
+        # A thin chair leg can occupy one angular bin.  Preserve a strong close
+        # return even without a neighbour; farther isolated returns remain
+        # rejected so a distant speckle cannot steer the chassis.
+        if len(neighbours) >= 2 or (distance <= 1.20 and confidence >= 80):
             clustered.append(float(np.median(neighbours)))
     return min(clustered) if clustered else None
 
@@ -188,6 +198,11 @@ def corridor_profile(points: list[tuple[int, object]]) -> np.ndarray:
         dtype=np.float32,
         count=len(points),
     )
+    raw_confidences = np.fromiter(
+        (float(getattr(point, "confidence", 0)) for _index, point in points),
+        dtype=np.float32,
+        count=len(points),
+    )
     valid = (raw_ranges >= 0.08) & (raw_ranges <= 5.8)
     binned = np.full(360, np.inf, dtype=np.float32)
     if np.any(valid):
@@ -200,6 +215,12 @@ def corridor_profile(points: list[tuple[int, object]]) -> np.ndarray:
     for offset in (-3, -2, -1, 1, 2, 3):
         neighbour = np.roll(binned, -offset)
         supported |= finite & np.isfinite(neighbour) & (np.abs(neighbour - binned) <= tolerance)
+    # Do not erase a high-confidence close return merely because the object is
+    # narrower than the LD19's adjacent angular samples.
+    close_confirmed = valid & (raw_ranges <= 1.20) & (raw_confidences >= 80)
+    if np.any(close_confirmed):
+        close_bins = np.rint(raw_angles[close_confirmed]).astype(np.int16) % 360
+        supported[close_bins] = True
     usable_indices = np.flatnonzero(supported)
     if usable_indices.size == 0:
         return np.full(STEER_HEADINGS.size, PLANNING_HORIZON_M, dtype=np.float32)
@@ -598,6 +619,7 @@ class AutonomousPolicy:
         self._escape_commit_until = 0.0
         self._arc_active = False
         self._guidance_bias = 0.0
+        self._steering_deg = 0.0
         self.drive_confidence = 0.0
         self.last_command = "STOP"
         self.left_pwm = 0
@@ -611,8 +633,7 @@ class AutonomousPolicy:
         values = [value for value in (primary, outer) if value is not None]
         return min(values) if values else None
 
-    @staticmethod
-    def _ramp(current: int, target: int) -> int:
+    def _ramp(self, current: int, target: int) -> int:
         """Use a direct, non-buzzing motor band with a controlled rise.
 
         A direct brushed-motor command below MIN_MOVE_PWM only buzzes under the
@@ -623,15 +644,16 @@ class AutonomousPolicy:
         if target == 0:
             return 0
         direction = 1 if target > 0 else -1
-        target = direction * max(MIN_MOVE_PWM, abs(target))
+        target = direction * max(self.min_move_pwm, abs(target))
         if current == 0:
-            return direction * MIN_MOVE_PWM
+            return direction * self.min_move_pwm
         if (current > 0) != (target > 0):
             # Brake to zero before reversing; the following decision begins
             # the other direction at the non-stalling floor.
             return 0
-        if abs(target) <= abs(current):
-            return target
+        if abs(target) < abs(current):
+            magnitude = max(abs(target), abs(current) - MAX_PWM_STEP)
+            return direction * magnitude
         return direction * min(abs(target), abs(current) + MAX_PWM_STEP)
 
     def _set_output(self, label: str, left_pwm: int, right_pwm: int) -> str:
@@ -687,20 +709,24 @@ class AutonomousPolicy:
         return int(round(floor + span * max(0, self.speed - floor)))
 
     def _differential(self, speed: int, heading_deg: float) -> str:
-        """Turn only by the usable PWM margin; both wheels stay driven."""
-        # A turn needs actual headroom above the loaded-wheel floor.  At the
-        # floor both PWM values are identical after normalisation, so there is
-        # no steering authority at all.  Preserve a small, direct-PWM margin
-        # instead of dropping the inside track to zero.
-        speed = min(self.speed, max(self.min_move_pwm + MIN_TURN_MARGIN_PWM, speed))
-        heading = float(np.clip(heading_deg, -MAX_GENTLE_HEADING_DEG, MAX_GENTLE_HEADING_DEG))
-        turn_fraction = abs(heading) / MAX_GENTLE_HEADING_DEG
-        outer = speed
-        available_split = min(MIN_TURN_MARGIN_PWM, speed - self.min_move_pwm)
-        inner = max(
-            self.min_move_pwm,
-            int(round(speed - available_split * turn_fraction)),
+        """Apply a smooth but useful forward arc with both wheels powered."""
+        target_heading = float(
+            np.clip(heading_deg, -MAX_GENTLE_HEADING_DEG, MAX_GENTLE_HEADING_DEG)
         )
+        steering_delta = float(np.clip(
+            target_heading - self._steering_deg,
+            -MAX_STEERING_STEP_DEG,
+            MAX_STEERING_STEP_DEG,
+        ))
+        self._steering_deg += steering_delta
+        heading = self._steering_deg
+        turn_fraction = abs(heading) / MAX_GENTLE_HEADING_DEG
+        requested_split = int(round(MAX_TURN_SPLIT_PWM * turn_fraction))
+        # The old eight-PWM split produced a turn radius too large to avoid an
+        # obstacle detected one metre ahead.  Add only the headroom needed for
+        # steering, keeping the inside wheel above its measured loaded floor.
+        outer = min(MAX_PWM, max(speed, self.min_move_pwm + requested_split))
+        inner = max(self.min_move_pwm, outer - requested_split)
         if heading < 0.0:
             left, right = inner, outer
         else:
@@ -716,7 +742,7 @@ class AutonomousPolicy:
         # The straight-line cost has to be large relative to the saturated
         # clearance, or a flat wall ahead always makes some oblique heading
         # look better and the robot veers off instead of closing on it.
-        score = np.minimum(profile, 1.5) - np.abs(STEER_HEADINGS) / 90.0 * 1.10
+        score = np.minimum(profile, 1.5) - np.abs(STEER_HEADINGS) / 90.0 * 0.65
         usable = profile >= 0.38
         if not np.any(usable):
             return None
@@ -751,6 +777,7 @@ class AutonomousPolicy:
         self.reason = reason
         self.drive_confidence = 0.0
         self.cruise_pwm = 0
+        self._steering_deg = 0.0
         return self._set_output("STOP", 0, 0)
 
     def _set_stop(self, reason: str) -> str:
@@ -758,6 +785,7 @@ class AutonomousPolicy:
         self._arc_active = False
         self.drive_confidence = 0.0
         self.cruise_pwm = 0
+        self._steering_deg = 0.0
         self._heading_index = None
         self._escape_started_at = None
         self._escape_until = 0.0
@@ -783,11 +811,17 @@ class AutonomousPolicy:
         # bounded LD19-cleared reverse curve, not a pivot.  The old one-wheel
         # pivot made the chassis spin in place, and repeated recovery attempts
         # could eventually back it into an unseen rear object.
-        close_ultrasonic = arduino.front_cm is not None and arduino.front_cm < 22.0
-        close_lidar = lidar.front_m < 0.42
+        straight_clearance = lidar.front_m
+        if lidar.profile is not None:
+            straight_index = int(np.argmin(np.abs(STEER_HEADINGS)))
+            straight_clearance = float(lidar.profile[straight_index])
+        close_ultrasonic = (
+            arduino.front_cm is not None and arduino.front_cm < CLOSE_ULTRASONIC_CM
+        )
+        close_lidar = straight_clearance < CLOSE_LIDAR_M
         recovery_not_released = (
             self._escape_started_at is not None
-            and lidar.front_m < ESCAPE_FRONT_RELEASE_M
+            and straight_clearance < ESCAPE_FRONT_RELEASE_M
         )
         if close_ultrasonic or close_lidar or recovery_not_released:
             if self._escape_started_at is None:
@@ -828,7 +862,14 @@ class AutonomousPolicy:
             if choice is not None:
                 heading, limit = choice
                 speed = self._cruise_speed(limit)
-                applied_heading = float(np.clip(heading, -MAX_GENTLE_HEADING_DEG, MAX_GENTLE_HEADING_DEG))
+                # Corridor headings describe a straight swept pose, while the
+                # chassis reaches that pose along an arc.  Lead the requested
+                # yaw so the arc itself stays outside the inflated obstacle.
+                applied_heading = float(np.clip(
+                    heading * CORRIDOR_STEERING_GAIN,
+                    -MAX_GENTLE_HEADING_DEG,
+                    MAX_GENTLE_HEADING_DEG,
+                ))
                 self._arc_active = abs(applied_heading) > 6.0
                 self.drive_confidence = float(np.clip(limit / 2.0, 0.0, 1.0))
                 self.reason = f"DRIVE:{applied_heading:+.0f}deg {limit:.2f}m pwm{speed}"
@@ -837,7 +878,7 @@ class AutonomousPolicy:
 
         # Use different enter/exit distances so a range return hovering near
         # one threshold cannot make the chassis alternate between arc/straight.
-        if lidar.front_m < 0.86:
+        if lidar.front_m < 1.00:
             self._arc_active = True
         elif lidar.front_m > 1.05:
             self._arc_active = False
@@ -967,6 +1008,7 @@ def main() -> int:
     local_map = LidarSlamLite()
     slam_lite = local_map.state()
     next_display_at = 0.0
+    next_telemetry_at = 0.0
     keep_running = True
 
     def stop(_signum: int, _frame: object) -> None:
@@ -989,6 +1031,17 @@ def main() -> int:
             policy.send(arduino, command, now)
             points, _fresh = lidar.snapshot()
             slam_lite = local_map.update(points, policy.left_pwm, policy.right_pwm, now)
+            if now >= next_telemetry_at:
+                next_telemetry_at = now + TELEMETRY_PERIOD_S
+                front = "--" if clearance.front_m is None else f"{clearance.front_m:.2f}"
+                ultra = "--" if status.front_cm is None else f"{status.front_cm:.0f}"
+                print(
+                    f"NAV reason={policy.reason} front_m={front} ultra_cm={ultra} "
+                    f"cmd={policy.left_pwm}/{policy.right_pwm} "
+                    f"actual={status.left_pwm}/{status.right_pwm} blocked={int(status.blocked)} "
+                    f"lidar={int(clearance.fresh)} camera={int(camera_ready)} "
+                    f"drive_caps={int(arduino.differential_ready)}"
+                )
             if not args.no_display and now >= next_display_at:
                 next_display_at = now + DISPLAY_PERIOD_S
                 panel = draw_dashboard(local_map.render(size=640), policy, clearance, status,

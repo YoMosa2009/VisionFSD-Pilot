@@ -41,6 +41,9 @@ done
   echo "version: $(tr -d '\r\n' < "$ROOT/VERSION" 2>/dev/null)"
   echo "serial: $(ls /dev/ttyACM* /dev/ttyUSB* 2>/dev/null | tr '\n' ' ')"
   echo "display: DISPLAY=${DISPLAY:-unset} WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-unset}"
+  if command -v vcgencmd >/dev/null 2>&1; then
+    echo "power: $(vcgencmd get_throttled 2>/dev/null || echo unavailable)"
+  fi
 } >> "$LOG"
 
 # 118 is a cautious clear-space ceiling.  The planner scales down only to the
@@ -57,7 +60,7 @@ ARGS=(
 
 # With a terminal attached, print straight to it so errors are visible now.
 if [[ -t 1 ]]; then
-  exec "$PYTHON" "${ARGS[@]}"
+  exec "$PYTHON" -u "${ARGS[@]}"
 fi
 exec >>"$LOG" 2>&1
-exec "$PYTHON" "${ARGS[@]}"
+exec "$PYTHON" -u "${ARGS[@]}"

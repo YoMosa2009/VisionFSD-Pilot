@@ -149,24 +149,27 @@ estimate for this drivetrain, not a measurement of yours.
 ### Corridor profile: how it steers around things
 
 Rather than five fixed sectors, the LD19 returns are swept into a **body-inflated
-corridor profile**: for each of 37 candidate headings the planner computes how
+corridor profile**: for each of 73 candidate headings the planner computes how
 far a rectangle of the robot's own width can travel before anything enters its
 path. That is what lets it say "there is a 0.5 m gap 20 degrees to the right,
 3 m deep" — something a five-sector summary structurally cannot express, and
 the reason it can now curve around an object instead of treating a whole side
 as blocked.
 
-The chosen heading comes from that profile, preferring straight ahead, with a
-switch margin so scan noise cannot make it weave between two near-tied options.
-Headings within 50 degrees become a smooth arc; anything wider squares up with
-a brief pivot first. Turning output is normalised so the outer wheel never
-exceeds the governed speed, because scaling a turn *up* makes every corner
-faster than driving straight.
+The chosen heading comes from that profile, preferring straight ahead when it
+has at least 1.1 m of clear travel, with a switch margin so scan noise cannot
+make it weave between two near-tied options. The selected corridor receives
+arc-lead compensation because a differential-drive chassis cannot instantly
+assume a new straight heading. Avoidance uses a forward arc with both wheels
+powered, never a fast counter-rotating pivot. The outer wheel receives bounded
+steering headroom while the inside wheel remains at or above its loaded floor.
 
-If the robot still stutters on carpet, raise `--speed` before suspecting the
-planner. A 9 V PP3 alkaline is not a usable motor supply here: its internal
-resistance collapses under an amp of motor current. Use the kit's 2x18650
-holder (7.4 V) or 6x AA NiMH.
+The runtime writes one `NAV` telemetry line per second to
+`pi3b/logs/robot.log`. If commanded and Uno-reported PWM drop to zero during a
+hiccup, the same line identifies the safety gate that stopped it. If both stay
+nonzero while the wheels cut out, the fault is in motor power or wiring. A 9 V
+PP3-style battery is not a usable sustained motor supply here; its voltage can
+look normal at idle and collapse under motor current.
 
 Run a supervised first test on blocks, wheels free, then on an empty floor:
 
@@ -181,12 +184,13 @@ move during that interval. Afterwards its authority order is fixed:
 2. A confirmed person in the camera's forward path stops it. Camera inference
    remains a safety gate, but camera frames are not rendered in the robot
    display to reduce Pi 3B display work.
-3. The LD19 begins a direction-locked forward arc away from a central obstacle
-   below 86 cm. Turning is capped to a small PWM split, both motors stay above
-   the loaded-wheel stall region, and an isolated LiDAR speckle cannot change
-   the corridor plan. A clear one-metre forward corridor is preferred over a
-   merely longer side corridor so the robot keeps making forward progress.
-4. At 42 cm (or an ultrasonic return below 22 cm), it makes one short,
+3. The LD19 begins a direction-locked forward arc when the straight inflated
+   corridor drops below 1.1 m. Steering can use up to a 28-PWM wheel split,
+   both motors stay above the loaded-wheel stall region, and steering changes
+   are slew-limited. A high-confidence close return is retained even when a
+   thin obstacle occupies only one angular bin; distant weak speckle is ignored.
+4. At 52 cm of body-path clearance (or an ultrasonic return below 30 cm), it
+   makes one short,
    LiDAR-cleared reverse curve with both wheels driven. It does not pivot in
    place. If the rear is not LiDAR-clear, or that bounded recovery does not
    restore front clearance, it stops and latches that stop instead of repeating
@@ -220,9 +224,11 @@ terminating the complete robot runtime.
 ### LiDAR SLAM-lite local map
 
 The LD19-only panel uses a rolling **SLAM-lite** local map. It keeps a 6 m local
-occupancy sketch at about 3.3 cm per cell, integrates every valid current scan
-return with vectorized NumPy operations, and compares successive scans in 180
-two-degree angular bins. Metre range rings make nearby geometry easier to read.
+occupancy sketch at 2.5 cm per cell, integrates every valid current scan return
+with vectorized NumPy operations, and compares successive scans in 360
+one-degree angular bins. Bright current-scan points remain distinct from the
+fading dead-reckoned history. Metre range rings make nearby geometry easier to
+read.
 A heading correction is applied only when that comparison has enough
 non-ambiguous support; otherwise it stays with conservative commanded-motion
 prediction. This increases useful local detail without turning a map estimate

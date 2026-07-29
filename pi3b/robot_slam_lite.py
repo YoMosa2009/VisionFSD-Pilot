@@ -30,18 +30,18 @@ class SlamLiteState:
 class LidarSlamLite:
     """A Pi 3B-friendly, advisory local LiDAR mapper.
 
-    The angular matcher uses 180 two-degree bins and tests nearby shifts.
+    The angular matcher uses 360 one-degree bins and tests nearby shifts.
     Vectorized scan integration keeps this inexpensive beside camera inference, while
     preserving more useful LD19 geometry and rejecting ambiguous matches
     instead of inventing a pose.
     """
 
-    BIN_COUNT = 180
+    BIN_COUNT = 360
     BIN_DEGREES = 360.0 / BIN_COUNT
-    MIN_MATCH_BINS = 45
+    MIN_MATCH_BINS = 75
     MAX_SCAN_AGE_S = 0.35
 
-    def __init__(self, cells: int = 180, metres: float = 6.0) -> None:
+    def __init__(self, cells: int = 240, metres: float = 6.0) -> None:
         self.cells = cells
         self.metres = metres
         self.grid = np.zeros((cells, cells), dtype=np.uint8)
@@ -56,6 +56,7 @@ class LidarSlamLite:
         self._last_correction = 0.0
         self._matched = False
         self._map_updates = 0
+        self._latest_hits = np.empty((0, 2), dtype=np.int32)
 
     @staticmethod
     def _signed_angle(angle: float) -> float:
@@ -63,20 +64,35 @@ class LidarSlamLite:
 
     @classmethod
     def bins_from_points(cls, points: Iterable[tuple[int, object]]) -> tuple[np.ndarray, float]:
-        """Build robust two-degree range bins and return the newest timestamp."""
-        buckets: list[list[float]] = [[] for _ in range(cls.BIN_COUNT)]
-        newest = -1.0
-        for _index, point in points:
-            distance = float(point.distance_mm) / 1000.0
-            if not 0.10 <= distance <= 5.8:
-                continue
-            bin_index = int((float(point.angle_deg) % 360.0) / cls.BIN_DEGREES) % cls.BIN_COUNT
-            buckets[bin_index].append(distance)
-            newest = max(newest, float(point.captured_at))
-        values = np.full(cls.BIN_COUNT, np.nan, dtype=np.float32)
-        for index, samples in enumerate(buckets):
-            if samples:
-                values[index] = float(np.median(samples))
+        """Build robust one-degree range bins and return the newest timestamp."""
+        point_list = list(points)
+        values = np.full(cls.BIN_COUNT, np.inf, dtype=np.float32)
+        if not point_list:
+            values.fill(np.nan)
+            return values, -1.0
+        distances = np.fromiter(
+            (float(point.distance_mm) / 1000.0 for _index, point in point_list),
+            dtype=np.float32,
+            count=len(point_list),
+        )
+        angles = np.fromiter(
+            (float(point.angle_deg) for _index, point in point_list),
+            dtype=np.float32,
+            count=len(point_list),
+        )
+        stamps = np.fromiter(
+            (float(point.captured_at) for _index, point in point_list),
+            dtype=np.float64,
+            count=len(point_list),
+        )
+        valid = (distances >= 0.10) & (distances <= 5.8)
+        if not np.any(valid):
+            values.fill(np.nan)
+            return values, -1.0
+        bins = ((angles[valid] % 360.0) / cls.BIN_DEGREES).astype(np.int16) % cls.BIN_COUNT
+        np.minimum.at(values, bins, distances[valid])
+        values[~np.isfinite(values)] = np.nan
+        newest = float(np.max(stamps[valid]))
         return values, newest
 
     def _align_yaw(self, current: np.ndarray, expected_delta_deg: float) -> tuple[float, float, bool]:
@@ -88,22 +104,31 @@ class LidarSlamLite:
         """
         if self._previous_bins is None:
             return 0.0, 0.0, False
-        choices: list[tuple[float, int, int]] = []
-        for shift in range(-12, 13):
-            shifted_previous = np.roll(self._previous_bins, shift)
-            valid = np.isfinite(current) & np.isfinite(shifted_previous)
-            count = int(np.count_nonzero(valid))
-            if count < self.MIN_MATCH_BINS:
-                continue
-            # Median absolute range error is robust to a moving person or a
-            # newly seen chair occupying only part of the scan.
-            residual = float(np.median(np.abs(current[valid] - shifted_previous[valid])))
-            choices.append((residual, shift, count))
-        if len(choices) < 2:
+        shifts = np.arange(-12, 13, dtype=np.int16)
+        shifted = np.stack(
+            [np.roll(self._previous_bins, int(shift)) for shift in shifts],
+            axis=0,
+        )
+        valid = np.isfinite(current)[None, :] & np.isfinite(shifted)
+        counts = np.count_nonzero(valid, axis=1)
+        eligible = np.flatnonzero(counts >= self.MIN_MATCH_BINS)
+        if eligible.size < 2:
             return 0.0, 0.0, False
-        choices.sort(key=lambda item: item[0])
-        best_residual, best_shift, count = choices[0]
-        runner_residual = choices[1][0]
+        # Evaluate every nearby yaw shift in one NumPy operation.  Median
+        # absolute range error remains robust to a moving person or a newly
+        # seen chair, without a Python median loop on the Pi.
+        residual_matrix = np.where(
+            valid[eligible],
+            np.abs(shifted[eligible] - current[None, :]),
+            np.nan,
+        )
+        residuals = np.nanmedian(residual_matrix, axis=1)
+        order = np.argsort(residuals)
+        best_row = int(eligible[order[0]])
+        best_residual = float(residuals[order[0]])
+        runner_residual = float(residuals[order[1]])
+        best_shift = int(shifts[best_row])
+        count = int(counts[best_row])
         separation = runner_residual - best_residual
         confidence = float(np.clip((separation / 0.035) * (count / self.BIN_COUNT), 0.0, 1.0))
         observed_delta = -best_shift * self.BIN_DEGREES
@@ -154,7 +179,12 @@ class LidarSlamLite:
             cols = ((self.x + np.sin(radians) * distances) * scale).astype(np.int32)
             rows = ((self.y - np.cos(radians) * distances) * scale).astype(np.int32)
             inside = (rows >= 0) & (rows < self.cells) & (cols >= 0) & (cols < self.cells)
-            np.add.at(accumulator, (rows[inside], cols[inside]), 12)
+            hit_rows = rows[inside]
+            hit_cols = cols[inside]
+            self._latest_hits = np.column_stack((hit_rows, hit_cols))
+            np.add.at(accumulator, (hit_rows, hit_cols), 12)
+        else:
+            self._latest_hits = np.empty((0, 2), dtype=np.int32)
         self.grid = np.minimum(accumulator, 255).astype(np.uint8)
         self._map_updates += 1
 
@@ -187,6 +217,22 @@ class LidarSlamLite:
     def render(self, size: int = 500) -> np.ndarray:
         image = cv2.resize(self.grid, (size, size), interpolation=cv2.INTER_NEAREST)
         panel = cv2.applyColorMap(image, cv2.COLORMAP_BONE)
+        if self._latest_hits.size:
+            hit_y = np.clip(
+                ((self._latest_hits[:, 0] + 0.5) * size / self.cells).astype(np.int32),
+                1,
+                size - 2,
+            )
+            hit_x = np.clip(
+                ((self._latest_hits[:, 1] + 0.5) * size / self.cells).astype(np.int32),
+                1,
+                size - 2,
+            )
+            # Bright current-scan points stay metrically sharper than the
+            # fading dead-reckoned history underneath them.
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    panel[hit_y + dy, hit_x + dx] = (0, 220, 255)
         px = int(np.clip(self.x / self.metres * size, 0, size - 1))
         py = int(np.clip(self.y / self.metres * size, 0, size - 1))
         pixels_per_metre = size / self.metres

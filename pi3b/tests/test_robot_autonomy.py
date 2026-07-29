@@ -20,6 +20,7 @@ from robot_autonomy import (
     AutonomousPolicy,
     CameraSafety,
     SectorClearance,
+    _sector_clearance,
     corridor_profile,
 )
 
@@ -27,9 +28,10 @@ from robot_autonomy import (
 class _Return:
     """Minimal stand-in for an LD19 point."""
 
-    def __init__(self, angle_deg: float, distance_mm: int) -> None:
+    def __init__(self, angle_deg: float, distance_mm: int, confidence: int = 90) -> None:
         self.angle_deg = angle_deg
         self.distance_mm = distance_mm
+        self.confidence = confidence
 
 
 def wall_scene(front_m: float, gap: tuple[int, int] | None = None, span: int = 75):
@@ -109,7 +111,7 @@ class AutonomousPolicyTests(unittest.TestCase):
         close = SectorClearance(0.30, 1.8, 0.8, True, 1.7, 0.8, None, 1.0)
         policy.decide(close, blocked, False, now)
         clear_status = ArduinoStatus(front_cm=80.0, motion="S", received_at=now)
-        released = SectorClearance(0.65, 1.8, 0.8, True, 1.7, 0.8, None, 1.0)
+        released = SectorClearance(0.75, 1.8, 0.8, True, 1.7, 0.8, None, 1.0)
         self.assertEqual(policy.decide(released, clear_status, False, now + 0.20), "F")
         # Direction reversals intentionally pass through one zero-output cycle.
         policy.decide(released, clear_status, False, now + 0.23)
@@ -220,26 +222,26 @@ class AutonomousPolicyTests(unittest.TestCase):
 
     def test_wide_open_heading_still_uses_a_forward_arc_not_a_pivot(self) -> None:
         policy = AutonomousPolicy(0.0, 118)
-        profile = np.zeros(STEER_HEADINGS.size, dtype=np.float32)
+        profile = np.full(STEER_HEADINGS.size, 0.70, dtype=np.float32)
         profile[int(np.argmin(np.abs(STEER_HEADINGS - 72.0)))] = 3.0
         clearance = SectorClearance(1.0, 2.0, 2.0, True, 2.0, 2.0, profile)
         self.assertEqual(settle(policy, clearance, self.status), "F")
         self.assertGreater(policy.left_pwm, 0)
         self.assertGreater(policy.right_pwm, 0)
         self.assertGreaterEqual(min(policy.left_pwm, policy.right_pwm), MIN_MOVE_PWM)
-        self.assertLessEqual(abs(policy.left_pwm - policy.right_pwm), 8)
+        self.assertGreaterEqual(abs(policy.left_pwm - policy.right_pwm), 24)
 
     def test_multi_object_profile_cannot_immediately_flip_turn_direction(self) -> None:
         policy = AutonomousPolicy(0.0, 118)
         now = time.monotonic()
-        left_profile = np.full(STEER_HEADINGS.size, 0.20, dtype=np.float32)
+        left_profile = np.full(STEER_HEADINGS.size, 0.60, dtype=np.float32)
         left_profile[int(np.argmin(np.abs(STEER_HEADINGS + 28.0)))] = 2.0
         left = SectorClearance(0.70, 1.8, 1.6, True, 1.7, 1.5, left_profile)
         for index in range(4):
             policy.decide(left, self.status, False, now + index * 0.03)
         self.assertLess(policy.left_pwm, policy.right_pwm)
 
-        right_profile = np.full(STEER_HEADINGS.size, 0.20, dtype=np.float32)
+        right_profile = np.full(STEER_HEADINGS.size, 0.60, dtype=np.float32)
         right_profile[int(np.argmin(np.abs(STEER_HEADINGS + 28.0)))] = 0.50
         right_profile[int(np.argmin(np.abs(STEER_HEADINGS - 28.0)))] = 2.5
         right = SectorClearance(0.70, 1.0, 2.0, True, 0.8, 1.9, right_profile)
@@ -256,7 +258,7 @@ class AutonomousPolicyTests(unittest.TestCase):
 
     def test_planner_returns_to_forward_progress_when_straight_opens(self) -> None:
         policy = AutonomousPolicy(0.0, 118)
-        side_profile = np.full(STEER_HEADINGS.size, 0.20, dtype=np.float32)
+        side_profile = np.full(STEER_HEADINGS.size, 0.60, dtype=np.float32)
         side_profile[int(np.argmin(np.abs(STEER_HEADINGS + 28.0)))] = 2.0
         side = SectorClearance(0.70, 2.0, 0.7, True, 2.0, 0.7, side_profile)
         settle(policy, side, self.status)
@@ -377,10 +379,16 @@ class CorridorProfileTests(unittest.TestCase):
         self.assertGreater(float(straight), 2.0)
 
     def test_isolated_lidar_speckle_does_not_block_a_clear_corridor(self) -> None:
-        speckle = [(0, _Return(0, 180))]
+        speckle = [(0, _Return(0, 180, confidence=20))]
         profile = corridor_profile(speckle)
         straight = profile[int(np.argmin(np.abs(STEER_HEADINGS)))]
         self.assertGreater(float(straight), 2.0)
+
+    def test_strong_close_single_return_blocks_a_thin_obstacle(self) -> None:
+        thin_leg = [(0, _Return(0, 500, confidence=120))]
+        profile = corridor_profile(thin_leg)
+        straight = profile[int(np.argmin(np.abs(STEER_HEADINGS)))]
+        self.assertLess(float(straight), 0.50)
 
 
 class SpeedGovernorTests(unittest.TestCase):
@@ -390,29 +398,29 @@ class SpeedGovernorTests(unittest.TestCase):
     def _drive(self, front_m: float, speed: int = 118) -> AutonomousPolicy:
         policy = AutonomousPolicy(0.0, speed)
         clearance = SectorClearance(front_m, 2.0, 2.0, True, 2.0, 2.0,
-                                    corridor_profile(wall_scene(front_m)))
+                                    np.full(STEER_HEADINGS.size, front_m, dtype=np.float32))
         settle(policy, clearance, self.status)
         return policy
 
     def test_speed_rises_with_clearance(self) -> None:
         """The reported failure: one flat-out speed regardless of surroundings."""
-        speeds = [max(self._drive(d).left_pwm, self._drive(d).right_pwm)
+        speeds = [(self._drive(d).left_pwm + self._drive(d).right_pwm) / 2.0
                   for d in (0.80, 1.20, 1.60, 2.40)]
         self.assertEqual(speeds, sorted(speeds), f"not monotonic: {speeds}")
         self.assertLess(speeds[0], speeds[-1])
 
-    def test_cruise_never_exceeds_the_configured_ceiling(self) -> None:
+    def test_straight_cruise_never_exceeds_the_configured_ceiling(self) -> None:
         for front_m in (0.80, 1.20, 2.00, 3.00):
             policy = self._drive(front_m, speed=118)
-            self.assertLessEqual(max(abs(policy.left_pwm), abs(policy.right_pwm)), 118)
+            if policy.left_pwm == policy.right_pwm:
+                self.assertLessEqual(policy.left_pwm, 118)
 
-    def test_turning_is_never_faster_than_driving_straight(self) -> None:
-        """Scaling a turn up rather than down makes every corner alarming."""
+    def test_turning_adds_yaw_without_increasing_average_speed(self) -> None:
         policy = AutonomousPolicy(0.0, 118)
         clearance = SectorClearance(0.80, 2.0, 2.0, True, 2.0, 2.0,
                                     corridor_profile(wall_scene(0.80, gap=(12, 28))))
         settle(policy, clearance, self.status)
-        self.assertLessEqual(max(policy.left_pwm, policy.right_pwm), 118)
+        self.assertLessEqual((policy.left_pwm + policy.right_pwm) / 2.0, 119.0)
         self.assertNotEqual(policy.left_pwm, policy.right_pwm)
 
     def test_governed_output_still_clears_the_stall_floor(self) -> None:
@@ -421,6 +429,61 @@ class SpeedGovernorTests(unittest.TestCase):
             for value in (policy.left_pwm, policy.right_pwm):
                 self.assertTrue(value == 0 or abs(value) >= MIN_MOVE_PWM,
                                 f"{front_m} m produced stalling PWM {value}")
+
+
+class NavigationSimulationTests(unittest.TestCase):
+    def test_closed_loop_arc_clears_a_central_obstacle(self) -> None:
+        """Approximate kinematics catch a planner that only commands wide arcs."""
+        policy = AutonomousPolicy(0.0, 118)
+        x = y = heading = 0.0
+        obstacle_x, obstacle_y, obstacle_radius = 0.0, 1.2, 0.20
+        collided = False
+
+        for step in range(120):
+            points = []
+            for angle_deg in range(0, 360, 2):
+                distance = 3.5
+                ray = heading + math.radians(angle_deg)
+                dx, dy = math.sin(ray), math.cos(ray)
+                ox, oy = x - obstacle_x, y - obstacle_y
+                b = 2.0 * (ox * dx + oy * dy)
+                c = ox * ox + oy * oy - obstacle_radius * obstacle_radius
+                discriminant = b * b - 4.0 * c
+                if discriminant >= 0.0:
+                    hit = (-b - math.sqrt(discriminant)) / 2.0
+                    if 0.08 <= hit < distance:
+                        distance = hit
+                points.append((
+                    angle_deg,
+                    _Return(angle_deg, int(distance * 1000), confidence=120),
+                ))
+
+            clearance = SectorClearance(
+                _sector_clearance(points, 0.0, 20.0),
+                _sector_clearance(points, -75.0, 35.0),
+                _sector_clearance(points, 75.0, 35.0),
+                True,
+                _sector_clearance(points, -35.0, 20.0),
+                _sector_clearance(points, 35.0, 20.0),
+                corridor_profile(points),
+                _sector_clearance(points, 180.0, 25.0),
+            )
+            now = policy.started_at + step * 0.1
+            status = ArduinoStatus(front_cm=None, motion="S", received_at=now)
+            policy.decide(clearance, status, False, now, True)
+
+            left_speed = policy.left_pwm / 255.0 * 0.26
+            right_speed = policy.right_pwm / 255.0 * 0.26
+            linear_speed = (left_speed + right_speed) / 2.0
+            heading += ((left_speed - right_speed) / 0.14) * 0.1
+            x += math.sin(heading) * linear_speed * 0.1
+            y += math.cos(heading) * linear_speed * 0.1
+            if math.hypot(x - obstacle_x, y - obstacle_y) <= obstacle_radius + 0.10:
+                collided = True
+                break
+
+        self.assertFalse(collided)
+        self.assertGreater(y, 1.25)
 
 
 if __name__ == "__main__":
