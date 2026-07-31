@@ -138,10 +138,13 @@ no-motion standby, uses hysteresis and direction locking for stable LiDAR-guided
 arcs, and uses a bounded reverse-turn-commit recovery sequence when a close
 obstacle blocks forward progress. It then resumes live corridor planning instead
 of latching a terminal stop. A Pi-connected MPU-6050 bounds recovery turns by
-measured short-term yaw and supplies yaw to the rolling local map; LD19 scan
-matching provides cautious heading correction. The map remains advisory rather
-than true SLAM because the kit has no wheel encoders or absolute position
-reference.
+measured short-term yaw and supplies yaw to an 8 m occupancy map. The runtime
+marks observed free space, selects reachable unexplored frontiers, plans a
+collision-inflated grid route, and uses its next waypoint as long-horizon
+guidance. Current LD19 geometry still authorizes every motor direction. LD19
+scan matching supplies cautious yaw and translation correction, but this remains
+estimated navigation rather than true metric SLAM because the kit has no wheel
+encoders, loop closure, or absolute position reference.
 
 It is not vehicle autonomy and is not robust room-scale SLAM. Do not run it
 unsupervised, near stairs, pets, people, or property that can be damaged.

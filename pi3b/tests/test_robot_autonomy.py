@@ -521,7 +521,12 @@ class SpeedGovernorTests(unittest.TestCase):
         policy = AutonomousPolicy(0.0, speed)
         clearance = SectorClearance(front_m, 2.0, 2.0, True, 2.0, 2.0,
                                     np.full(STEER_HEADINGS.size, front_m, dtype=np.float32))
-        settle(policy, clearance, self.status)
+        status = ArduinoStatus(
+            front_cm=80.0,
+            motion="S",
+            received_at=time.monotonic(),
+        )
+        settle(policy, clearance, status)
         return policy
 
     def test_speed_rises_with_clearance(self) -> None:

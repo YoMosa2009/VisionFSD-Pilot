@@ -184,12 +184,18 @@ move during that interval. Afterwards its authority order is fixed:
 2. A confirmed person in the camera's forward path stops it. Camera inference
    remains a safety gate, but camera frames are not rendered in the robot
    display to reduce Pi 3B display work.
-3. The LD19 begins a direction-locked forward arc when the straight inflated
+3. During standby, the mapper distinguishes observed free space from unknown
+   space and persistent obstacle returns. Every 0.75 seconds a frontier planner
+   selects a reachable unexplored boundary, plans around inflated obstacles,
+   and supplies a persistent waypoint heading. When all current frontiers are
+   exhausted, it patrols the least-visited reachable mapped space.
+4. The LD19 begins a direction-locked forward arc when the straight inflated
    corridor drops below 1.1 m. Steering can use up to a 28-PWM wheel split,
    both motors stay above the loaded-wheel stall region, and steering changes
    are slew-limited. A high-confidence close return is retained even when a
    thin obstacle occupies only one angular bin; distant weak speckle is ignored.
-4. At 52 cm of body-path clearance (or an ultrasonic return below 30 cm), it
+   The frontier heading only biases among currently safe full-body corridors.
+5. At 52 cm of body-path clearance (or an ultrasonic return below 30 cm), it
    runs a finite recovery sequence: a short LiDAR-cleared reverse curve with
    both wheels driven, a slow one-wheel reverse turn toward the best full
    body-width LiDAR corridor, then a short forward commit and immediate return
@@ -199,9 +205,9 @@ move during that interval. Afterwards its authority order is fixed:
    the opposite side once. It stops as `STOP:BOXED_IN` when neither bounded
    attempt has a safe side/rear path, and automatically rechecks materially
    changed geometry.
-5. Uno ultrasonic hard-stop (under 18 cm) always wins and blocks forward
+6. Uno ultrasonic hard-stop (under 18 cm) always wins and blocks forward
    motor commands even if the Pi fails.
-6. A live, calibrated MPU-6050 supplies measured yaw rate to the local mapper
+7. A live, calibrated MPU-6050 supplies measured yaw rate to the local mapper
    and recovery controller, and progressively removes steering split above
    38 deg/s, reaching zero additional split at 55 deg/s. If the IMU is absent
    or stale, navigation continues with bounded time/command-yaw fallback instead
@@ -221,8 +227,9 @@ waiting for `CAPS DRIVE`; those commands are fast counter-rotating pivots. It
 holds STOP unless the dashboard reports `UNO DIFFERENTIAL`. The Pi retries the
 capability request every 0.5 seconds until it receives that exact response.
 The LiDAR-only dashboard shows commanded PWM, Uno-reported actual PWM, the Uno
-ultrasonic `blocked` flag, and `MPU-6050 CALIBRATING/LIVE/STALE` so a software
-STOP is distinguishable from a motor-power or sensor problem.
+ultrasonic `blocked` flag, `MPU-6050 CALIBRATING/LIVE/STALE`, frontier/patrol
+mode, target bearing/range, frontier count, and observed-map coverage so a
+software STOP is distinguishable from a motor-power or sensor problem.
 
 Camera startup defaults to `auto`. The runtime tries stable V4L by-id paths and
 camera indexes 0 through 7. If no webcam currently delivers frames, the LiDAR
@@ -269,26 +276,34 @@ accelerometer is not integrated into position because chassis vibration,
 gravity error, and the front/side mounting offset would create rapid drift.
 The MPU-6050 has no magnetometer, so it cannot provide absolute heading.
 
-### LiDAR + IMU SLAM-lite local map
+### LiDAR + IMU exploration map
 
-The LD19-only panel uses a rolling **SLAM-lite** local map. It keeps a 6 m local
-occupancy sketch at 2.5 cm per cell, integrates every valid current scan return
-with vectorized NumPy operations, and compares successive scans in 360
-one-degree angular bins. Bright current-scan points remain distinct from the
-fading dead-reckoned history. Metre range rings make nearby geometry easier to
-read.
-A heading correction is applied only when that comparison has enough
-non-ambiguous support. Between accepted LD19 matches, a live MPU-6050 supplies
+The LD19-only panel keeps an 8 m occupancy map at 2.5 cm per cell. Every valid
+scan marks both obstacle endpoints and the observed free ray leading to each
+endpoint. Repeated free observations clear stale hit evidence; persistent hits
+remain obstacles. Bright current-scan points remain distinct from mapped
+history, while dark known-free cells are distinguishable from unknown space.
+Metre range rings make nearby geometry easier to read.
+
+The frontier explorer inflates obstacles by the robot body and safety margin,
+finds the free-space component connected to the robot, clusters reachable
+free/unknown boundaries, and runs bounded A* to the selected target. It guides
+the local planner toward a look-ahead waypoint. If no reachable frontier
+remains, it patrols low-visit mapped cells to expose missed openings. Planning
+runs at 0.75-second intervals to stay within Pi 3B CPU limits.
+
+A heading correction is applied only when successive 360-bin LD19 scans have
+enough non-ambiguous support. Between accepted matches, a live MPU-6050 supplies
 measured yaw rate; if it is unavailable, the mapper uses conservative
-commanded-motion prediction. This increases useful local detail without
-turning a map estimate into a motor-control input.
+commanded-motion prediction. Bounded scan-to-map correlation also corrects
+small translation errors when a moving scan uniquely agrees with established
+obstacle geometry.
 
-This is intentionally advisory. The current LiDAR sectors remain the only
-range input to steering and safety—the map cannot command the motors. Without
-wheel encoders or an absolute heading/position reference, it is not global
-localization, true metric SLAM, loop closure, or a guarantee of room coverage.
-It is useful for a steadier local map and for showing when LiDAR heading
-agreement is weak.
+The estimated map supplies exploration intent, not safety permission. Current
+LD19 body-width corridors remain the range authority for steering, and the Uno
+ultrasonic remains the final forward hard stop. Without wheel encoders, loop
+closure, or an absolute position reference, this is not true metric SLAM and
+cannot guarantee complete coverage or recovery from accumulated pose drift.
 
 The LD19's 0-degree direction must physically point forward. If your mount is
 rotated, set its correction before launching, for example:

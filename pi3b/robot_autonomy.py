@@ -30,6 +30,7 @@ import serial
 from serial.tools import list_ports
 
 from lidar_visualizer import LD19Parser, LivePolarMap
+from robot_explorer import ExplorationState, FrontierExplorer
 from robot_imu import IMUState, MPU6050Link
 from robot_slam_lite import LidarSlamLite, SlamLiteState
 from visionfsd_pi import (
@@ -654,11 +655,15 @@ class AutonomousPolicy:
         self.imu_yaw_rate_dps: float | None = None
         self.imu_yaw_deg: float | None = None
         self.imu_limited = False
+        self.exploration = ExplorationState()
 
     def observe_imu(self, state: IMUState) -> None:
         ready = state.connected and state.calibrated and state.fresh
         self.imu_yaw_rate_dps = state.gyro_z_dps if ready else None
         self.imu_yaw_deg = state.yaw_deg if ready else None
+
+    def observe_exploration(self, state: ExplorationState) -> None:
+        self.exploration = state
 
     def _limit_turn_split(self, requested_split: int) -> int:
         """Reduce differential steering when measured yaw is already too fast."""
@@ -742,7 +747,25 @@ class AutonomousPolicy:
             return None
         scores = {"L": left, "R": right}
         locked = scores.get(self.turn_command)
-        candidate = "L" if right is None or (left is not None and left >= right) else "R"
+        exploration_turn: str | None = None
+        if self.exploration.active and abs(self.exploration.heading_error_deg) >= 12.0:
+            exploration_turn = (
+                "L" if self.exploration.heading_error_deg < 0.0 else "R"
+            )
+        if (
+            exploration_turn is not None
+            and scores.get(exploration_turn) is not None
+            and left is not None
+            and right is not None
+            and abs(left - right) < 0.30
+        ):
+            candidate = exploration_turn
+        else:
+            candidate = (
+                "L"
+                if right is None or (left is not None and left >= right)
+                else "R"
+            )
         candidate_score = scores[candidate] or 0.0
         # Keep an already-selected escape/arc side unless it became unsafe or
         # the other side is materially clearer.  This stops scan-to-scan
@@ -998,6 +1021,15 @@ class AutonomousPolicy:
         # clearance, or a flat wall ahead always makes some oblique heading
         # look better and the robot veers off instead of closing on it.
         score = np.minimum(profile, 1.5) - np.abs(STEER_HEADINGS) / 90.0 * 0.65
+        exploration_heading: float | None = None
+        if self.exploration.active:
+            exploration_heading = float(np.clip(
+                self.exploration.heading_error_deg,
+                float(STEER_HEADINGS[0]),
+                float(STEER_HEADINGS[-1]),
+            ))
+            goal_error = np.abs(STEER_HEADINGS - exploration_heading)
+            score += np.clip(1.0 - goal_error / 90.0, 0.0, 1.0) * 0.82
         usable = profile >= 0.38
         if not np.any(usable):
             return None
@@ -1005,7 +1037,13 @@ class AutonomousPolicy:
         # If the body already has a full metre straight ahead, keep making
         # progress.  Previously a slightly longer side corridor won every scan,
         # causing the robot to orbit local objects instead of crossing open floor.
-        prefer_straight = profile[straight] >= FORWARD_PREFERENCE_CLEARANCE_M
+        prefer_straight = (
+            profile[straight] >= FORWARD_PREFERENCE_CLEARANCE_M
+            and (
+                exploration_heading is None
+                or abs(exploration_heading) < 10.0
+            )
+        )
         if prefer_straight:
             best = straight
         else:
@@ -1102,7 +1140,17 @@ class AutonomousPolicy:
                 ))
                 self._arc_active = abs(applied_heading) > 6.0
                 self.drive_confidence = float(np.clip(limit / 2.0, 0.0, 1.0))
-                self.reason = f"DRIVE:{applied_heading:+.0f}deg {limit:.2f}m pwm{speed}"
+                if self.exploration.active:
+                    self.reason = (
+                        f"EXPLORE_{self.exploration.mode}:"
+                        f"{applied_heading:+.0f}deg "
+                        f"target{self.exploration.target_distance_m:.1f}m"
+                    )
+                else:
+                    self.reason = (
+                        f"DRIVE:{applied_heading:+.0f}deg "
+                        f"{limit:.2f}m pwm{speed}"
+                    )
                 return self._differential(speed, applied_heading)
             return self._start_escape(lidar, now, "NO_CORRIDOR")
 
@@ -1162,7 +1210,7 @@ def draw_dashboard(local_map: np.ndarray, policy: AutonomousPolicy,
                    camera_ready: bool, differential_ready: bool,
                    imu: IMUState, slam_lite: SlamLiteState) -> np.ndarray:
     panel = local_map.copy()
-    cv2.rectangle(panel, (0, 0), (panel.shape[1], 158), (14, 22, 31), -1)
+    cv2.rectangle(panel, (0, 0), (panel.shape[1], 182), (14, 22, 31), -1)
     front = "--" if clearance.front_m is None else f"{clearance.front_m:.2f}m"
     front_left = "--" if clearance.front_left_m is None else f"{clearance.front_left_m:.2f}m"
     front_right = "--" if clearance.front_right_m is None else f"{clearance.front_right_m:.2f}m"
@@ -1198,11 +1246,28 @@ def draw_dashboard(local_map: np.ndarray, policy: AutonomousPolicy,
         imu_color = (90, 235, 130)
     cv2.putText(panel, f"MPU-6050 {imu_state}", (12, 121),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.37, imu_color, 1, cv2.LINE_AA)
+    exploration = policy.exploration
+    exploration_state = (
+        f"{exploration.mode} target {exploration.target_distance_m:.1f}m "
+        f"bearing {exploration.heading_error_deg:+.0f}deg "
+        f"frontiers {exploration.frontier_count} "
+        f"coverage {exploration.coverage_ratio * 100:.0f}%"
+    )
+    cv2.putText(
+        panel,
+        f"EXPLORATION {exploration_state}",
+        (12, 145),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.35,
+        (225, 190, 235) if exploration.active else (150, 170, 190),
+        1,
+        cv2.LINE_AA,
+    )
     match = "MATCH" if slam_lite.matched else "PREDICT"
     cv2.putText(panel,
-                f"NAV CONFIDENCE {policy.drive_confidence:.2f}   SLAM-LITE {match} "
-                f"yaw {slam_lite.yaw_confidence:.2f} correction {slam_lite.yaw_correction_deg:+.1f}deg",
-                (12, 145), cv2.FONT_HERSHEY_SIMPLEX, 0.37, (185, 205, 225), 1, cv2.LINE_AA)
+                f"NAV CONFIDENCE {policy.drive_confidence:.2f}   POSE {match} "
+                f"yaw {slam_lite.yaw_confidence:.2f} xy {slam_lite.translation_confidence:.2f}",
+                (12, 169), cv2.FONT_HERSHEY_SIMPLEX, 0.37, (185, 205, 225), 1, cv2.LINE_AA)
     return panel
 
 
@@ -1260,10 +1325,12 @@ def main() -> int:
         f"camera request={args.camera}, IMU={'disabled' if imu is None else hex(args.imu_address)}"
     )
     policy = AutonomousPolicy(args.standby_seconds, args.speed, args.min_move_pwm)
-    # The mapper is advisory: obstacle avoidance always uses the current LD19
-    # sectors above, never a past map cell or a guessed pose.
+    # The map supplies a long-horizon exploration heading.  Current LD19
+    # geometry remains the authority that decides whether motion is safe.
     local_map = LidarSlamLite()
+    explorer = FrontierExplorer()
     slam_lite = local_map.state()
+    exploration = ExplorationState()
     imu_state = IMUState(error="disabled") if imu is None else imu.state()
     next_display_at = 0.0
     next_telemetry_at = 0.0
@@ -1301,8 +1368,6 @@ def main() -> int:
             clearance = lidar.clearance()
             status = arduino.status()
             camera_ready = camera.ready(now)
-            command = policy.decide(clearance, status, camera.person_in_path(), now, camera_ready)
-            policy.send(arduino, command, now)
             points, _fresh = lidar.snapshot()
             imu_yaw_rate = (
                 imu_state.gyro_z_dps
@@ -1312,6 +1377,26 @@ def main() -> int:
             slam_lite = local_map.update(
                 points, policy.left_pwm, policy.right_pwm, now, imu_yaw_rate
             )
+            exploration = explorer.update(
+                local_map.grid,
+                local_map.observed,
+                local_map.visits,
+                local_map.x,
+                local_map.y,
+                local_map.heading,
+                local_map.metres,
+                slam_lite.map_updates,
+                now,
+            )
+            policy.observe_exploration(exploration)
+            command = policy.decide(
+                clearance,
+                status,
+                camera.person_in_path(),
+                now,
+                camera_ready,
+            )
+            policy.send(arduino, command, now)
             if now >= next_telemetry_at:
                 next_telemetry_at = now + TELEMETRY_PERIOD_S
                 front = "--" if clearance.front_m is None else f"{clearance.front_m:.2f}"
@@ -1323,13 +1408,38 @@ def main() -> int:
                     f"lidar={int(clearance.fresh)} camera={int(camera_ready)} "
                     f"drive_caps={int(arduino.differential_ready)} "
                     f"imu={int(imu_state.fresh)} imu_cal={int(imu_state.calibrated)} "
-                    f"gyro_z={imu_state.gyro_z_dps:+.1f}"
+                    f"gyro_z={imu_state.gyro_z_dps:+.1f} "
+                    f"explore={exploration.mode} "
+                    f"target_m={exploration.target_distance_m:.2f} "
+                    f"bearing={exploration.heading_error_deg:+.0f}"
                 )
             if not args.no_display and now >= next_display_at:
                 next_display_at = now + DISPLAY_PERIOD_S
-                panel = draw_dashboard(local_map.render(size=640), policy, clearance, status,
-                                       camera.person_in_path(), camera_ready,
-                                       arduino.differential_ready, imu_state, slam_lite)
+                target_xy = (
+                    None
+                    if exploration.target_x_m is None or exploration.target_y_m is None
+                    else (exploration.target_x_m, exploration.target_y_m)
+                )
+                waypoint_xy = (
+                    None
+                    if exploration.waypoint_x_m is None or exploration.waypoint_y_m is None
+                    else (exploration.waypoint_x_m, exploration.waypoint_y_m)
+                )
+                panel = draw_dashboard(
+                    local_map.render(
+                        size=640,
+                        target_xy=target_xy,
+                        waypoint_xy=waypoint_xy,
+                    ),
+                    policy,
+                    clearance,
+                    status,
+                    camera.person_in_path(),
+                    camera_ready,
+                    arduino.differential_ready,
+                    imu_state,
+                    slam_lite,
+                )
                 cv2.imshow(WINDOW_TITLE, panel)
                 if cv2.waitKey(1) & 0xFF in (27, ord("q"), ord("Q")):
                     break

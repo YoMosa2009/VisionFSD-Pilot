@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import pathlib
 import sys
 import unittest
@@ -70,6 +71,48 @@ class SlamLiteTests(unittest.TestCase):
         mapper._integrate_points(points)
         self.assertGreaterEqual(int(np.count_nonzero(mapper.grid)), len(points))
         self.assertEqual(mapper._latest_hits.shape[0], len(points))
+
+    def test_scan_rays_mark_free_space_as_observed(self) -> None:
+        mapper = LidarSlamLite(cells=120, metres=3.0)
+        points = [
+            (index, LidarPoint(float(angle), 1000, 90, 1.0))
+            for index, angle in enumerate((-45, 0, 45))
+        ]
+        mapper._integrate_points(points)
+
+        self.assertGreater(int(np.count_nonzero(mapper.observed)), 60)
+        self.assertGreater(int(np.count_nonzero(mapper.visits)), 1)
+
+    def test_scan_to_map_translation_corrects_predicted_position(self) -> None:
+        mapper = LidarSlamLite(cells=320, metres=8.0)
+        mapper._map_updates = 3
+        true_x = true_y = 4.0
+        points = []
+        scale = mapper.cells / mapper.metres
+        for index, angle in enumerate(range(0, 360, 10)):
+            distance = (
+                1.3
+                + 0.25 * math.sin(math.radians(angle * 2))
+                + 0.12 * math.cos(math.radians(angle * 5))
+            )
+            points.append((
+                index,
+                LidarPoint(float(angle), int(distance * 1000), 100, 1.0),
+            ))
+            radians = math.radians(angle)
+            col = int((true_x + math.sin(radians) * distance) * scale)
+            row = int((true_y - math.cos(radians) * distance) * scale)
+            mapper.grid[row, col] = 255
+
+        mapper.x = true_x + 0.075
+        mapper.y = true_y
+        delta_x, delta_y, confidence, accepted = mapper._align_translation(points)
+
+        self.assertTrue(accepted)
+        self.assertLess(delta_x, 0.0)
+        self.assertAlmostEqual(delta_x, -0.075, places=2)
+        self.assertAlmostEqual(delta_y, 0.0, places=2)
+        self.assertGreater(confidence, 0.5)
 
     def test_live_imu_rate_replaces_commanded_yaw_prediction(self) -> None:
         mapper = LidarSlamLite()
