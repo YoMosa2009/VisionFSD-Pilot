@@ -120,6 +120,14 @@ class SlamLiteTests(unittest.TestCase):
         mapper.integrate_motion(0, 0, 1.1, imu_yaw_rate_dps=30.0)
         self.assertAlmostEqual(mapper.heading, 357.0, places=3)
         self.assertTrue(mapper._using_imu)
+        self.assertEqual(mapper.state().yaw_source, "IMU+LD19")
+
+    def test_missing_imu_reports_command_plus_ld19_yaw(self) -> None:
+        mapper = LidarSlamLite()
+        mapper.integrate_motion(105, 0, 1.0)
+        mapper.integrate_motion(105, 0, 1.1, imu_yaw_rate_dps=None)
+
+        self.assertEqual(mapper.state().yaw_source, "COMMAND+LD19")
 
 
 if __name__ == "__main__":

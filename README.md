@@ -146,6 +146,11 @@ scan matching supplies cautious yaw and translation correction, but this remains
 estimated navigation rather than true metric SLAM because the kit has no wheel
 encoders, loop closure, or absolute position reference.
 
+If the MPU-6050 is missing or stale, the same occupancy, frontier, A*, waypoint,
+patrol, and live-corridor stack remains active. Turn prediction uses differential
+motor commands and is corrected by successive LD19 scans; recovery turns use
+that corrected map heading instead of relying only on elapsed time.
+
 It is not vehicle autonomy and is not robust room-scale SLAM. Do not run it
 unsupervised, near stairs, pets, people, or property that can be damaged.
 Details, firmware location, boot behaviour, and the one-command Pi update are

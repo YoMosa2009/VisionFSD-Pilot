@@ -25,6 +25,7 @@ from robot_autonomy import (
     corridor_profile,
 )
 from robot_imu import IMUState
+from robot_slam_lite import SlamLiteState
 
 
 class _Return:
@@ -127,6 +128,41 @@ class AutonomousPolicyTests(unittest.TestCase):
         policy.decide(released, clear_status, False, now + 0.80)
         policy.decide(released, clear_status, False, now + 0.83)
         self.assertEqual(policy.reason, "ESCAPE_COMMIT:L")
+        self.assertGreater(policy.left_pwm, 0)
+        self.assertGreater(policy.right_pwm, 0)
+
+    def test_ld19_pose_bounds_recovery_when_imu_is_missing(self) -> None:
+        policy = AutonomousPolicy(0.0, 118)
+        now = time.monotonic()
+        blocked = ArduinoStatus(front_cm=15.0, motion="S", received_at=now)
+        close = SectorClearance(0.30, 1.8, 0.8, True, 1.7, 0.8, None, 1.0)
+        policy.observe_imu(IMUState(error="missing"))
+        policy.observe_pose(SlamLiteState(
+            heading_deg=0.0,
+            yaw_confidence=0.5,
+            yaw_correction_deg=0.0,
+            matched=True,
+            map_updates=10,
+            yaw_source="COMMAND+LD19",
+        ))
+        policy.decide(close, blocked, False, now)
+        policy.decide(close, blocked, False, now + 0.71)
+
+        released = SectorClearance(0.75, 1.8, 0.8, True, 1.7, 0.8, None, 1.0)
+        clear_status = ArduinoStatus(front_cm=80.0, motion="S", received_at=now)
+        policy.observe_pose(SlamLiteState(
+            heading_deg=35.0,
+            yaw_confidence=0.5,
+            yaw_correction_deg=0.0,
+            matched=True,
+            map_updates=11,
+            yaw_source="COMMAND+LD19",
+        ))
+        policy.decide(released, clear_status, False, now + 0.80)
+        policy.decide(released, clear_status, False, now + 0.83)
+
+        self.assertEqual(policy.reason, "ESCAPE_COMMIT:L")
+        self.assertEqual(policy._escape_turn_yaw_source, "LD19+COMMAND")
         self.assertGreater(policy.left_pwm, 0)
         self.assertGreater(policy.right_pwm, 0)
 

@@ -655,6 +655,9 @@ class AutonomousPolicy:
         self.imu_yaw_rate_dps: float | None = None
         self.imu_yaw_deg: float | None = None
         self.imu_limited = False
+        self.pose_heading_deg: float | None = None
+        self.pose_yaw_source = "COMMAND+LD19"
+        self._escape_turn_yaw_source = "TIME"
         self.exploration = ExplorationState()
 
     def observe_imu(self, state: IMUState) -> None:
@@ -664,6 +667,26 @@ class AutonomousPolicy:
 
     def observe_exploration(self, state: ExplorationState) -> None:
         self.exploration = state
+
+    def observe_pose(self, state: SlamLiteState) -> None:
+        self.pose_heading_deg = (
+            state.heading_deg if state.map_updates >= 2 else None
+        )
+        self.pose_yaw_source = state.yaw_source
+
+    def _turn_reference_yaw_deg(self) -> tuple[float | None, str]:
+        if self.imu_yaw_deg is not None:
+            return self.imu_yaw_deg, "IMU"
+        if self.pose_heading_deg is not None:
+            return self.pose_heading_deg, "LD19+COMMAND"
+        return None, "TIME"
+
+    def _yaw_for_source(self, source: str) -> float | None:
+        if source == "IMU":
+            return self.imu_yaw_deg
+        if source == "LD19+COMMAND":
+            return self.pose_heading_deg
+        return None
 
     def _limit_turn_split(self, requested_split: int) -> int:
         """Reduce differential steering when measured yaw is already too fast."""
@@ -805,6 +828,7 @@ class AutonomousPolicy:
         self._escape_phase = "IDLE"
         self._escape_phase_until = 0.0
         self._escape_turn_start_yaw_deg = None
+        self._escape_turn_yaw_source = "TIME"
         self._escape_attempt = 0
         self._escape_blocked_direction = None
         self._escape_blocked_side_score = 0.0
@@ -836,7 +860,10 @@ class AutonomousPolicy:
     def _start_escape_turn(self, now: float) -> None:
         self._escape_phase = "TURN"
         self._escape_phase_until = now + ESCAPE_TURN_TIMEOUT_S
-        self._escape_turn_start_yaw_deg = self.imu_yaw_deg
+        (
+            self._escape_turn_start_yaw_deg,
+            self._escape_turn_yaw_source,
+        ) = self._turn_reference_yaw_deg()
 
     def _start_escape_commit(self, now: float) -> None:
         self._escape_phase = "COMMIT"
@@ -844,9 +871,15 @@ class AutonomousPolicy:
         self._direction_lock_until = self._escape_phase_until
 
     def _turn_progress_deg(self) -> float | None:
-        if self.imu_yaw_deg is None or self._escape_turn_start_yaw_deg is None:
+        current_yaw = self._yaw_for_source(self._escape_turn_yaw_source)
+        if (
+            current_yaw is None
+            or self._escape_turn_start_yaw_deg is None
+        ):
             return None
-        return abs(self._yaw_delta_deg(self.imu_yaw_deg, self._escape_turn_start_yaw_deg))
+        return abs(self._yaw_delta_deg(
+            current_yaw, self._escape_turn_start_yaw_deg
+        ))
 
     def _retry_opposite_escape(self, lidar: SectorClearance, now: float) -> bool:
         if self._escape_attempt >= 2:
@@ -944,7 +977,11 @@ class AutonomousPolicy:
                     return self._reverse_arc(self.turn_command)
                 return self._mark_escape_blocked(lidar, now)
             else:
-                progress_label = "time" if progress is None else f"{progress:.0f}deg"
+                progress_label = (
+                    "TIME"
+                    if progress is None
+                    else f"{self._escape_turn_yaw_source} {progress:.0f}deg"
+                )
                 self.reason = f"ESCAPE_TURN:{self.turn_command} {progress_label}"
                 self.drive_confidence = 0.30
                 return self._pivot_crawl(self.turn_command)
@@ -1232,13 +1269,13 @@ def draw_dashboard(local_map: np.ndarray, policy: AutonomousPolicy,
                 f"ACTUAL {status.left_pwm:+d}/{status.right_pwm:+d}  BLOCKED {'YES' if status.blocked else 'NO'}",
                 (12, 97), cv2.FONT_HERSHEY_SIMPLEX, 0.35, drive_color, 1, cv2.LINE_AA)
     if not imu.connected:
-        imu_state = "MISSING - COMMAND YAW FALLBACK"
+        imu_state = "MISSING - LD19+COMMAND POSE ACTIVE"
         imu_color = (80, 190, 245)
     elif not imu.calibrated:
         imu_state = f"CALIBRATING {imu.calibration_progress * 100:.0f}%"
         imu_color = (80, 190, 245)
     elif not imu.fresh:
-        imu_state = "STALE - COMMAND YAW FALLBACK"
+        imu_state = "STALE - LD19+COMMAND POSE ACTIVE"
         imu_color = (70, 95, 255)
     else:
         limiter = " RATE LIMIT" if policy.imu_limited else ""
@@ -1266,7 +1303,8 @@ def draw_dashboard(local_map: np.ndarray, policy: AutonomousPolicy,
     match = "MATCH" if slam_lite.matched else "PREDICT"
     cv2.putText(panel,
                 f"NAV CONFIDENCE {policy.drive_confidence:.2f}   POSE {match} "
-                f"yaw {slam_lite.yaw_confidence:.2f} xy {slam_lite.translation_confidence:.2f}",
+                f"{slam_lite.yaw_source} yaw {slam_lite.yaw_confidence:.2f} "
+                f"xy {slam_lite.translation_confidence:.2f}",
                 (12, 169), cv2.FONT_HERSHEY_SIMPLEX, 0.37, (185, 205, 225), 1, cv2.LINE_AA)
     return panel
 
@@ -1356,7 +1394,10 @@ def main() -> int:
                 )
                 if imu_state.error != last_imu_error:
                     if imu_state.error:
-                        print(f"MPU-6050 unavailable; command-yaw fallback: {imu_state.error}")
+                        print(
+                            "MPU-6050 unavailable; LD19+command pose active: "
+                            f"{imu_state.error}"
+                        )
                     elif last_imu_error:
                         print("MPU-6050 reconnected; calibrating while stationary")
                     last_imu_error = imu_state.error
@@ -1377,6 +1418,7 @@ def main() -> int:
             slam_lite = local_map.update(
                 points, policy.left_pwm, policy.right_pwm, now, imu_yaw_rate
             )
+            policy.observe_pose(slam_lite)
             exploration = explorer.update(
                 local_map.grid,
                 local_map.observed,
@@ -1409,6 +1451,7 @@ def main() -> int:
                     f"drive_caps={int(arduino.differential_ready)} "
                     f"imu={int(imu_state.fresh)} imu_cal={int(imu_state.calibrated)} "
                     f"gyro_z={imu_state.gyro_z_dps:+.1f} "
+                    f"pose_yaw={slam_lite.yaw_source} "
                     f"explore={exploration.mode} "
                     f"target_m={exploration.target_distance_m:.2f} "
                     f"bearing={exploration.heading_error_deg:+.0f}"

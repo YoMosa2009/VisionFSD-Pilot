@@ -95,12 +95,11 @@ class FrontierExplorerTests(unittest.TestCase):
         assert choice is not None
         self.assertLess(choice[0], 0.0)
 
-    def test_closed_loop_exploration_covers_multiple_room_axes(self) -> None:
+    def test_closed_loop_no_imu_exploration_covers_multiple_room_axes(self) -> None:
         policy = AutonomousPolicy(0.0, 118)
         mapper = LidarSlamLite()
         explorer = FrontierExplorer()
         x = y = heading = 0.0
-        previous_turn_rate_dps = 0.0
         positions: list[tuple[float, float]] = []
         collided = False
 
@@ -161,8 +160,9 @@ class FrontierExplorerTests(unittest.TestCase):
                 policy.left_pwm,
                 policy.right_pwm,
                 now,
-                imu_yaw_rate_dps=-previous_turn_rate_dps,
+                imu_yaw_rate_dps=None,
             )
+            policy.observe_pose(slam)
             exploration = explorer.update(
                 mapper.grid,
                 mapper.observed,
@@ -175,13 +175,7 @@ class FrontierExplorerTests(unittest.TestCase):
                 now,
             )
             policy.observe_exploration(exploration)
-            policy.observe_imu(IMUState(
-                connected=True,
-                calibrated=True,
-                fresh=True,
-                yaw_deg=-math.degrees(heading),
-                gyro_z_dps=-previous_turn_rate_dps,
-            ))
+            policy.observe_imu(IMUState(error="missing"))
             status = ArduinoStatus(
                 front_cm=None if clearance.front_m is None else clearance.front_m * 100.0,
                 motion="S",
@@ -193,7 +187,6 @@ class FrontierExplorerTests(unittest.TestCase):
             right_speed = policy.right_pwm / 255.0 * 0.26
             linear_speed = (left_speed + right_speed) / 2.0
             turn_rate = (left_speed - right_speed) / 0.14
-            previous_turn_rate_dps = math.degrees(turn_rate)
             heading += turn_rate * 0.1
             x += math.sin(heading) * linear_speed * 0.1
             y += math.cos(heading) * linear_speed * 0.1

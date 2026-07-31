@@ -210,8 +210,9 @@ move during that interval. Afterwards its authority order is fixed:
 7. A live, calibrated MPU-6050 supplies measured yaw rate to the local mapper
    and recovery controller, and progressively removes steering split above
    38 deg/s, reaching zero additional split at 55 deg/s. If the IMU is absent
-   or stale, navigation continues with bounded time/command-yaw fallback instead
-   of refusing to move.
+   or stale, navigation continues with command-predicted yaw corrected by
+   successive LD19 scans. Recovery turns use that corrected pose heading when
+   available, retaining the same 2.4-second hard timeout as the final bound.
 
 This keeps roles separate: LD19 geometry chooses an open direction, the camera
 prevents movement toward confirmed people, and the Uno enforces the final
@@ -268,8 +269,8 @@ export VISIONFSD_IMU_MOUNT_YAW_DEG=180
 The first stationary seconds of the existing 25-second standby calibrate gyro
 bias. Keep the chassis still until the dashboard changes from
 `MPU-6050 CALIBRATING` to `MPU-6050 LIVE`. Calibration rejects samples with
-excessive motion. The IMU is advisory: disconnecting it changes the dashboard
-to command-yaw fallback rather than creating a no-motion boot failure.
+excessive motion. The IMU is optional: disconnecting it changes the dashboard
+to `LD19+COMMAND POSE ACTIVE` rather than creating a no-motion boot failure.
 
 The gyro improves short-term turn measurement and smooths excessive yaw. Its
 accelerometer is not integrated into position because chassis vibration,
@@ -304,6 +305,13 @@ LD19 body-width corridors remain the range authority for steering, and the Uno
 ultrasonic remains the final forward hard stop. Without wheel encoders, loop
 closure, or an absolute position reference, this is not true metric SLAM and
 cannot guarantee complete coverage or recovery from accumulated pose drift.
+
+All mapping and exploration features remain enabled without the MPU-6050:
+free/occupied/unknown mapping, translation correlation, frontier detection,
+inflated-grid A*, persistent waypoints, patrol, live-corridor overrides, and
+reverse/turn/replan recovery. The degraded yaw source is shown as
+`COMMAND+LD19`; it is less accurate during feature-poor or rapidly changing
+scenes than live IMU yaw, but it does not disable autonomous movement.
 
 The LD19's 0-degree direction must physically point forward. If your mount is
 rotated, set its correction before launching, for example:

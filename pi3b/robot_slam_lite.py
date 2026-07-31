@@ -30,6 +30,7 @@ class SlamLiteState:
     translation_correction_m: float = 0.0
     translation_matched: bool = False
     observed_cells: int = 0
+    yaw_source: str = "COMMAND+LD19"
 
 
 class LidarSlamLite:
@@ -418,6 +419,7 @@ class LidarSlamLite:
             self._translation_correction_m,
             self._translation_matched,
             int(np.count_nonzero(self.observed)),
+            "IMU+LD19" if self._using_imu else "COMMAND+LD19",
         )
 
     def render(
@@ -472,7 +474,7 @@ class LidarSlamLite:
         cv2.circle(panel, (px, py), 8, (80, 240, 100), -1, cv2.LINE_AA)
         cv2.arrowedLine(panel, (px, py), tip, (255, 255, 255), 2, cv2.LINE_AA, tipLength=0.35)
         label = "LIDAR+IMU EXPLORATION MAP - ESTIMATED POSE"
-        yaw_source = "IMU" if self._using_imu else "COMMAND"
+        yaw_source = "IMU+LD19" if self._using_imu else "COMMAND+LD19"
         detail = (
             f"{self.metres / self.cells * 100:.1f} cm/cell  scans {self._map_updates}  "
             f"yaw {yaw_source} {self._yaw_confidence:.2f}  "
