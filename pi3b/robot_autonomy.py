@@ -71,6 +71,11 @@ ESCAPE_REVERSE_SECONDS = 0.70
 ESCAPE_REAR_CLEARANCE_M = 0.38
 ESCAPE_FRONT_RELEASE_M = 0.68
 ESCAPE_COMMIT_SECONDS = 1.00
+ESCAPE_MIN_TURN_DEG = 28.0
+ESCAPE_TARGET_TURN_DEG = 58.0
+ESCAPE_MAX_TURN_DEG = 88.0
+ESCAPE_TURN_TIMEOUT_S = 2.40
+ESCAPE_TURN_SIDE_CLEARANCE_M = 0.28
 FORWARD_PREFERENCE_CLEARANCE_M = 1.10
 CLOSE_LIDAR_M = 0.52
 CLOSE_ULTRASONIC_CM = 30.0
@@ -630,9 +635,12 @@ class AutonomousPolicy:
         self.cruise_pwm = 0
         self.turn_command = "L"
         self._direction_lock_until = 0.0
-        self._escape_started_at: float | None = None
-        self._escape_until = 0.0
-        self._escape_commit_until = 0.0
+        self._escape_phase = "IDLE"
+        self._escape_phase_until = 0.0
+        self._escape_turn_start_yaw_deg: float | None = None
+        self._escape_attempt = 0
+        self._escape_blocked_direction: str | None = None
+        self._escape_blocked_side_score = 0.0
         self._arc_active = False
         self._guidance_bias = 0.0
         self._steering_deg = 0.0
@@ -644,12 +652,13 @@ class AutonomousPolicy:
         self.last_sent_at = 0.0
         self.reason = "BOOT_STANDBY"
         self.imu_yaw_rate_dps: float | None = None
+        self.imu_yaw_deg: float | None = None
         self.imu_limited = False
 
     def observe_imu(self, state: IMUState) -> None:
-        self.imu_yaw_rate_dps = (
-            state.gyro_z_dps if state.connected and state.calibrated and state.fresh else None
-        )
+        ready = state.connected and state.calibrated and state.fresh
+        self.imu_yaw_rate_dps = state.gyro_z_dps if ready else None
+        self.imu_yaw_deg = state.yaw_deg if ready else None
 
     def _limit_turn_split(self, requested_split: int) -> int:
         """Reduce differential steering when measured yaw is already too fast."""
@@ -701,9 +710,34 @@ class AutonomousPolicy:
         self.right_pwm = self._ramp(self.right_pwm, int(np.clip(right_pwm, -MAX_PWM, MAX_PWM)))
         return label
 
+    def _raw_turn_side_score(
+        self, lidar: SectorClearance, direction: str
+    ) -> float | None:
+        return (
+            self._side_score(lidar.front_left_m, lidar.left_m)
+            if direction == "L"
+            else self._side_score(lidar.front_right_m, lidar.right_m)
+        )
+
+    def _turn_side_score(self, lidar: SectorClearance, direction: str) -> float | None:
+        """Use the full corridor sweep without ignoring a close side return."""
+        sector_score = self._raw_turn_side_score(lidar, direction)
+        if lidar.profile is None:
+            return sector_score
+        mask = STEER_HEADINGS <= -20.0 if direction == "L" else STEER_HEADINGS >= 20.0
+        corridor_score = float(np.max(lidar.profile[mask]))
+        if not np.isfinite(corridor_score):
+            return sector_score
+        if (
+            sector_score is not None
+            and sector_score < ESCAPE_TURN_SIDE_CLEARANCE_M
+        ):
+            return sector_score
+        return corridor_score
+
     def _choose_turn(self, lidar: SectorClearance, now: float) -> tuple[str, float] | None:
-        left = self._side_score(lidar.front_left_m, lidar.left_m)
-        right = self._side_score(lidar.front_right_m, lidar.right_m)
+        left = self._turn_side_score(lidar, "L")
+        right = self._turn_side_score(lidar, "R")
         if left is None and right is None:
             return None
         scores = {"L": left, "R": right}
@@ -733,6 +767,184 @@ class AutonomousPolicy:
         if direction == "L":
             return self._set_output("L", -outer, -inner)
         return self._set_output("R", -inner, -outer)
+
+    def _pivot_crawl(self, direction: str) -> str:
+        """Rotate slowly around one stopped wheel, never as an endless pivot."""
+        if direction == "L":
+            return self._set_output("L", -self.min_move_pwm, 0)
+        return self._set_output("R", 0, -self.min_move_pwm)
+
+    @staticmethod
+    def _yaw_delta_deg(current: float, start: float) -> float:
+        return (current - start + 180.0) % 360.0 - 180.0
+
+    def _reset_escape(self) -> None:
+        self._escape_phase = "IDLE"
+        self._escape_phase_until = 0.0
+        self._escape_turn_start_yaw_deg = None
+        self._escape_attempt = 0
+        self._escape_blocked_direction = None
+        self._escape_blocked_side_score = 0.0
+
+    def _mark_escape_blocked(self, lidar: SectorClearance, now: float) -> str:
+        self._escape_phase = "BLOCKED"
+        self._escape_phase_until = now + 0.50
+        self._escape_turn_start_yaw_deg = None
+        self._escape_blocked_direction = self.turn_command
+        raw_score = self._raw_turn_side_score(lidar, self.turn_command)
+        self._escape_blocked_side_score = 0.0 if raw_score is None else raw_score
+        return self._hold_stop("STOP:BOXED_IN")
+
+    def _start_escape(self, lidar: SectorClearance, now: float, source: str) -> str:
+        choice = self._choose_turn(lidar, now)
+        if choice is None or choice[1] < 0.34:
+            return self._mark_escape_blocked(lidar, now)
+        if lidar.rear_m is None or lidar.rear_m < ESCAPE_REAR_CLEARANCE_M:
+            return self._hold_stop("STOP:ESCAPE_REAR_BLOCKED")
+        self.turn_command = choice[0]
+        self._escape_phase = "REVERSE"
+        self._escape_phase_until = now + ESCAPE_REVERSE_SECONDS
+        self._escape_turn_start_yaw_deg = None
+        self._escape_attempt = 1
+        self.reason = f"ESCAPE_REVERSE_{source}:{self.turn_command}"
+        self.drive_confidence = 0.35
+        return self._reverse_arc(self.turn_command)
+
+    def _start_escape_turn(self, now: float) -> None:
+        self._escape_phase = "TURN"
+        self._escape_phase_until = now + ESCAPE_TURN_TIMEOUT_S
+        self._escape_turn_start_yaw_deg = self.imu_yaw_deg
+
+    def _start_escape_commit(self, now: float) -> None:
+        self._escape_phase = "COMMIT"
+        self._escape_phase_until = now + ESCAPE_COMMIT_SECONDS
+        self._direction_lock_until = self._escape_phase_until
+
+    def _turn_progress_deg(self) -> float | None:
+        if self.imu_yaw_deg is None or self._escape_turn_start_yaw_deg is None:
+            return None
+        return abs(self._yaw_delta_deg(self.imu_yaw_deg, self._escape_turn_start_yaw_deg))
+
+    def _retry_opposite_escape(self, lidar: SectorClearance, now: float) -> bool:
+        if self._escape_attempt >= 2:
+            return False
+        opposite = "R" if self.turn_command == "L" else "L"
+        score = self._turn_side_score(lidar, opposite)
+        if score is None or score < 0.42:
+            return False
+        if lidar.rear_m is None or lidar.rear_m < ESCAPE_REAR_CLEARANCE_M:
+            return False
+        self.turn_command = opposite
+        self._direction_lock_until = now + 1.20
+        self._escape_phase = "REVERSE"
+        self._escape_phase_until = now + ESCAPE_REVERSE_SECONDS
+        self._escape_turn_start_yaw_deg = None
+        self._escape_attempt += 1
+        return True
+
+    def _continue_escape(
+        self,
+        lidar: SectorClearance,
+        arduino: ArduinoStatus,
+        straight_clearance: float,
+        now: float,
+    ) -> str | None:
+        close_ultrasonic = (
+            arduino.front_cm is not None and arduino.front_cm < CLOSE_ULTRASONIC_CM
+        )
+
+        if self._escape_phase == "BLOCKED":
+            if not close_ultrasonic and straight_clearance >= ESCAPE_FRONT_RELEASE_M:
+                self._reset_escape()
+                return None
+            choice = self._choose_turn(lidar, now)
+            raw_score = (
+                None
+                if choice is None
+                else self._raw_turn_side_score(lidar, choice[0])
+            )
+            geometry_improved = (
+                choice is not None
+                and choice[1] >= 0.42
+                and raw_score is not None
+                and raw_score >= 0.30
+                and (
+                    choice[0] != self._escape_blocked_direction
+                    or raw_score >= self._escape_blocked_side_score + 0.12
+                )
+            )
+            rear_clear = (
+                lidar.rear_m is not None
+                and lidar.rear_m >= ESCAPE_REAR_CLEARANCE_M
+            )
+            if now >= self._escape_phase_until and geometry_improved and rear_clear:
+                self.turn_command = choice[0]
+                self._escape_phase = "REVERSE"
+                self._escape_phase_until = now + ESCAPE_REVERSE_SECONDS
+                self._escape_attempt = 1
+                self.reason = f"ESCAPE_GEOMETRY_CHANGED:{self.turn_command}"
+                self.drive_confidence = 0.25
+                return self._reverse_arc(self.turn_command)
+            return self._hold_stop("STOP:BOXED_IN")
+
+        if self._escape_phase == "REVERSE":
+            if lidar.rear_m is None or lidar.rear_m < ESCAPE_REAR_CLEARANCE_M:
+                return self._hold_stop("STOP:ESCAPE_REAR_BLOCKED")
+            if (
+                now < self._escape_phase_until
+                and straight_clearance < ESCAPE_FRONT_RELEASE_M
+            ):
+                self.reason = f"ESCAPE_REVERSE:{self.turn_command}"
+                self.drive_confidence = 0.35
+                return self._reverse_arc(self.turn_command)
+            self._start_escape_turn(now)
+
+        if self._escape_phase == "TURN":
+            selected_side = self._turn_side_score(lidar, self.turn_command)
+            progress = self._turn_progress_deg()
+            turn_clear = not close_ultrasonic and straight_clearance >= ESCAPE_FRONT_RELEASE_M
+            minimum_turn_complete = progress is None or progress >= ESCAPE_MIN_TURN_DEG
+            target_turn_complete = progress is not None and progress >= ESCAPE_TARGET_TURN_DEG
+            if turn_clear and minimum_turn_complete:
+                self._start_escape_commit(now)
+            elif target_turn_complete and not close_ultrasonic and straight_clearance >= CLOSE_LIDAR_M:
+                self._start_escape_commit(now)
+            elif (
+                (progress is not None and progress >= ESCAPE_MAX_TURN_DEG)
+                or now >= self._escape_phase_until
+                or selected_side is None
+                or selected_side < ESCAPE_TURN_SIDE_CLEARANCE_M
+            ):
+                if self._retry_opposite_escape(lidar, now):
+                    self.reason = f"ESCAPE_RETRY:{self.turn_command}"
+                    self.drive_confidence = 0.25
+                    return self._reverse_arc(self.turn_command)
+                return self._mark_escape_blocked(lidar, now)
+            else:
+                progress_label = "time" if progress is None else f"{progress:.0f}deg"
+                self.reason = f"ESCAPE_TURN:{self.turn_command} {progress_label}"
+                self.drive_confidence = 0.30
+                return self._pivot_crawl(self.turn_command)
+
+        if self._escape_phase == "COMMIT":
+            if close_ultrasonic or straight_clearance < CLOSE_LIDAR_M:
+                self._start_escape_turn(now)
+                self.reason = f"ESCAPE_REPLAN:{self.turn_command}"
+                self.drive_confidence = 0.25
+                return self._pivot_crawl(self.turn_command)
+            if now < self._escape_phase_until:
+                heading = (
+                    -MAX_GENTLE_HEADING_DEG
+                    if self.turn_command == "L"
+                    else MAX_GENTLE_HEADING_DEG
+                )
+                speed = self._cruise_speed(straight_clearance)
+                self.reason = f"ESCAPE_COMMIT:{self.turn_command}"
+                self.drive_confidence = 0.50
+                return self._differential(speed, heading)
+            self._reset_escape()
+
+        return None
 
     def _cruise_speed(self, limit_m: float | None) -> int:
         """Scale speed with how far the body can actually travel.
@@ -832,9 +1044,7 @@ class AutonomousPolicy:
         self.cruise_pwm = 0
         self._steering_deg = 0.0
         self._heading_index = None
-        self._escape_started_at = None
-        self._escape_until = 0.0
-        self._escape_commit_until = 0.0
+        self._reset_escape()
         return self._set_output("STOP", 0, 0)
 
     def decide(self, lidar: SectorClearance, arduino: ArduinoStatus, person: bool, now: float,
@@ -852,10 +1062,9 @@ class AutonomousPolicy:
         if lidar.front_m is None:
             return self._set_stop("STOP:LD19_FRONT_UNSEEN")
 
-        # The Uno has no rear sensor.  A close front obstacle therefore gets one
-        # bounded LD19-cleared reverse curve, not a pivot.  The old one-wheel
-        # pivot made the chassis spin in place, and repeated recovery attempts
-        # could eventually back it into an unseen rear object.
+        # Close obstacles enter a bounded recovery state machine.  Reverse
+        # clearance comes from the LD19, turn completion comes from the IMU when
+        # available, and every phase has a finite endpoint.
         straight_clearance = lidar.front_m
         if lidar.profile is not None:
             straight_index = int(np.argmin(np.abs(STEER_HEADINGS)))
@@ -864,39 +1073,15 @@ class AutonomousPolicy:
             arduino.front_cm is not None and arduino.front_cm < CLOSE_ULTRASONIC_CM
         )
         close_lidar = straight_clearance < CLOSE_LIDAR_M
-        recovery_not_released = (
-            self._escape_started_at is not None
-            and straight_clearance < ESCAPE_FRONT_RELEASE_M
-        )
-        if close_ultrasonic or close_lidar or recovery_not_released:
-            if self._escape_started_at is None:
-                choice = self._choose_turn(lidar, now)
-                if choice is None or choice[1] < 0.34:
-                    return self._hold_stop("STOP:ESCAPE_SIDE_BLOCKED")
-                self.turn_command = choice[0]
-                self._escape_started_at = now
-                self._escape_until = now + ESCAPE_REVERSE_SECONDS
-            if lidar.rear_m is None or lidar.rear_m < ESCAPE_REAR_CLEARANCE_M:
-                return self._hold_stop("STOP:ESCAPE_REAR_BLOCKED")
-            if now >= self._escape_until:
-                # Preserve the latch.  Resetting it here made the next 30 ms
-                # cycle start another reverse, producing an endless hiccup loop.
-                return self._hold_stop("STOP:ESCAPE_NO_FRONT_CLEARANCE")
+        if self._escape_phase != "IDLE":
+            recovery_command = self._continue_escape(
+                lidar, arduino, straight_clearance, now
+            )
+            if recovery_command is not None:
+                return recovery_command
+        if close_ultrasonic or close_lidar:
             source = "ULTRASONIC" if close_ultrasonic else "LD19"
-            self.reason = f"ESCAPE_{source}:{self.turn_command}"
-            self.drive_confidence = 0.35
-            return self._reverse_arc(self.turn_command)
-        if self._escape_started_at is not None:
-            self._escape_started_at = None
-            self._escape_until = 0.0
-            self._escape_commit_until = now + ESCAPE_COMMIT_SECONDS
-            self._direction_lock_until = self._escape_commit_until
-        if now < self._escape_commit_until:
-            heading = -MAX_GENTLE_HEADING_DEG if self.turn_command == "L" else MAX_GENTLE_HEADING_DEG
-            speed = self._cruise_speed(lidar.front_m)
-            self.reason = f"ESCAPE_COMMIT:{self.turn_command}"
-            self.drive_confidence = 0.50
-            return self._differential(speed, heading)
+            return self._start_escape(lidar, now, source)
 
         # With a corridor profile the planner can steer continuously: it knows
         # how far its own body can travel along every heading, so it curves
@@ -919,7 +1104,7 @@ class AutonomousPolicy:
                 self.drive_confidence = float(np.clip(limit / 2.0, 0.0, 1.0))
                 self.reason = f"DRIVE:{applied_heading:+.0f}deg {limit:.2f}m pwm{speed}"
                 return self._differential(speed, applied_heading)
-            return self._set_stop("STOP:NO_CLEAR_CORRIDOR")
+            return self._start_escape(lidar, now, "NO_CORRIDOR")
 
         # Use different enter/exit distances so a range return hovering near
         # one threshold cannot make the chassis alternate between arc/straight.
@@ -936,7 +1121,7 @@ class AutonomousPolicy:
                 self.drive_confidence = 0.55 + 0.25 * progress
                 heading = -MAX_GENTLE_HEADING_DEG if choice[0] == "L" else MAX_GENTLE_HEADING_DEG
                 return self._differential(min(self.speed, base), heading)
-            return self._set_stop("STOP:ARC_SIDE_BLOCKED")
+            return self._start_escape(lidar, now, "ARC_BLOCKED")
 
         # Centre gently toward the clearer front quarter.  It is deliberately
         # capped so a noisy far-wall measurement cannot cause a sharp turn.

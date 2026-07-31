@@ -94,7 +94,7 @@ class AutonomousPolicyTests(unittest.TestCase):
         self.assertLess(policy.right_pwm, 0)
         self.assertNotEqual(policy.left_pwm, policy.right_pwm)
 
-    def test_close_obstacle_recovery_does_not_restart_after_timeout(self) -> None:
+    def test_close_obstacle_transitions_from_reverse_to_bounded_turn(self) -> None:
         policy = AutonomousPolicy(0.0, 118)
         now = time.monotonic()
         blocked = ArduinoStatus(front_cm=15.0, motion="S", received_at=now)
@@ -103,8 +103,94 @@ class AutonomousPolicyTests(unittest.TestCase):
         for index in range(48):
             policy.decide(clearance, blocked, False, now + index * 0.03)
             outputs.append((policy.left_pwm, policy.right_pwm))
-        first_stop = next(index for index, output in enumerate(outputs) if index > 0 and output == (0, 0))
-        self.assertTrue(all(output == (0, 0) for output in outputs[first_stop:]))
+        self.assertTrue(any(left < 0 and right < 0 for left, right in outputs[:24]))
+        self.assertTrue(any((left < 0) != (right < 0) for left, right in outputs[24:]))
+        self.assertNotEqual(outputs[-1], (0, 0))
+        self.assertTrue(policy.reason.startswith("ESCAPE_TURN:L"))
+
+    def test_imu_turn_angle_releases_recovery_into_forward_commit(self) -> None:
+        policy = AutonomousPolicy(0.0, 118)
+        now = time.monotonic()
+        blocked = ArduinoStatus(front_cm=15.0, motion="S", received_at=now)
+        close = SectorClearance(0.30, 1.8, 0.8, True, 1.7, 0.8, None, 1.0)
+        policy.observe_imu(IMUState(
+            connected=True, calibrated=True, fresh=True, yaw_deg=0.0
+        ))
+        policy.decide(close, blocked, False, now)
+        policy.decide(close, blocked, False, now + 0.71)
+
+        released = SectorClearance(0.75, 1.8, 0.8, True, 1.7, 0.8, None, 1.0)
+        clear_status = ArduinoStatus(front_cm=80.0, motion="S", received_at=now)
+        policy.observe_imu(IMUState(
+            connected=True, calibrated=True, fresh=True, yaw_deg=35.0
+        ))
+        policy.decide(released, clear_status, False, now + 0.80)
+        policy.decide(released, clear_status, False, now + 0.83)
+        self.assertEqual(policy.reason, "ESCAPE_COMMIT:L")
+        self.assertGreater(policy.left_pwm, 0)
+        self.assertGreater(policy.right_pwm, 0)
+
+    def test_escape_turn_stops_at_hard_angle_when_no_exit_exists(self) -> None:
+        policy = AutonomousPolicy(0.0, 118)
+        now = time.monotonic()
+        blocked = ArduinoStatus(front_cm=15.0, motion="S", received_at=now)
+        no_right_exit = SectorClearance(
+            0.30, 1.8, 0.20, True, 1.7, 0.20, None, 1.0
+        )
+        policy.observe_imu(IMUState(
+            connected=True, calibrated=True, fresh=True, yaw_deg=0.0
+        ))
+        policy.decide(no_right_exit, blocked, False, now)
+        policy.decide(no_right_exit, blocked, False, now + 0.71)
+        policy.observe_imu(IMUState(
+            connected=True, calibrated=True, fresh=True, yaw_deg=90.0
+        ))
+        self.assertEqual(
+            policy.decide(no_right_exit, blocked, False, now + 0.80), "STOP"
+        )
+        self.assertEqual(policy.reason, "STOP:BOXED_IN")
+        changed_geometry = SectorClearance(
+            0.30, 0.20, 1.6, True, 0.20, 1.5, None, 1.0
+        )
+        self.assertEqual(
+            policy.decide(changed_geometry, blocked, False, now + 1.30), "R"
+        )
+        self.assertEqual(policy.reason, "ESCAPE_GEOMETRY_CHANGED:R")
+
+    def test_boxed_stop_rechecks_geometry_and_recovers_when_side_opens(self) -> None:
+        policy = AutonomousPolicy(0.0, 118)
+        now = time.monotonic()
+        blocked = ArduinoStatus(front_cm=15.0, motion="S", received_at=now)
+        boxed = SectorClearance(0.30, 0.20, 0.20, True, 0.20, 0.20, None, 1.0)
+        self.assertEqual(policy.decide(boxed, blocked, False, now), "STOP")
+        opened = SectorClearance(0.30, 1.5, 0.20, True, 1.4, 0.20, None, 1.0)
+        self.assertEqual(policy.decide(opened, blocked, False, now + 0.53), "L")
+        self.assertLess(policy.left_pwm, 0)
+        self.assertLess(policy.right_pwm, 0)
+
+    def test_corridor_profile_cannot_override_a_blocked_turn_side(self) -> None:
+        policy = AutonomousPolicy(0.0, 118)
+        now = time.monotonic()
+        blocked = ArduinoStatus(front_cm=15.0, motion="S", received_at=now)
+        misleading_profile = np.full(
+            STEER_HEADINGS.shape, 3.0, dtype=np.float32
+        )
+        clearance = SectorClearance(
+            0.30, 0.20, 1.4, True, 0.20, 1.3, misleading_profile, 1.0
+        )
+        self.assertEqual(policy.decide(clearance, blocked, False, now), "R")
+        self.assertEqual(policy.turn_command, "R")
+
+    def test_no_body_width_corridor_stops_as_boxed_in(self) -> None:
+        policy = AutonomousPolicy(0.0, 118)
+        now = time.monotonic()
+        status = ArduinoStatus(front_cm=80.0, motion="S", received_at=now)
+        no_corridor = SectorClearance(
+            0.60, 1.5, 0.70, True, 1.4, 0.70,
+            np.full(STEER_HEADINGS.shape, 0.30, dtype=np.float32), 1.0,
+        )
+        self.assertEqual(policy.decide(no_corridor, status, False, now), "STOP")
+        self.assertEqual(policy.reason, "STOP:BOXED_IN")
 
     def test_recovery_commits_to_selected_side_after_front_clears(self) -> None:
         policy = AutonomousPolicy(0.0, 118)
@@ -468,6 +554,73 @@ class SpeedGovernorTests(unittest.TestCase):
 
 
 class NavigationSimulationTests(unittest.TestCase):
+    def test_close_obstacle_recovery_turns_and_resumes_exploration(self) -> None:
+        """A close obstacle must not leave the policy permanently stopped."""
+        policy = AutonomousPolicy(0.0, 118)
+        x = y = heading = 0.0
+        obstacle_x, obstacle_y, obstacle_radius = 0.0, 0.45, 0.16
+        moved_after_recovery = False
+        entered_turn = False
+        collided = False
+
+        for step in range(160):
+            points = []
+            for angle_deg in range(0, 360, 2):
+                distance = 3.5
+                ray = heading + math.radians(angle_deg)
+                dx, dy = math.sin(ray), math.cos(ray)
+                ox, oy = x - obstacle_x, y - obstacle_y
+                b = 2.0 * (ox * dx + oy * dy)
+                c = ox * ox + oy * oy - obstacle_radius * obstacle_radius
+                discriminant = b * b - 4.0 * c
+                if discriminant >= 0.0:
+                    hit = (-b - math.sqrt(discriminant)) / 2.0
+                    if 0.08 <= hit < distance:
+                        distance = hit
+                points.append((
+                    angle_deg,
+                    _Return(angle_deg, int(distance * 1000), confidence=120),
+                ))
+
+            clearance = SectorClearance(
+                _sector_clearance(points, 0.0, 20.0),
+                _sector_clearance(points, -75.0, 35.0),
+                _sector_clearance(points, 75.0, 35.0),
+                True,
+                _sector_clearance(points, -35.0, 20.0),
+                _sector_clearance(points, 35.0, 20.0),
+                corridor_profile(points),
+                _sector_clearance(points, 180.0, 25.0),
+            )
+            now = policy.started_at + step * 0.1
+            policy.observe_imu(IMUState(
+                connected=True,
+                calibrated=True,
+                fresh=True,
+                yaw_deg=-math.degrees(heading),
+            ))
+            front_cm = None if clearance.front_m is None else clearance.front_m * 100.0
+            status = ArduinoStatus(front_cm=front_cm, motion="S", received_at=now)
+            policy.decide(clearance, status, False, now, True)
+            entered_turn = entered_turn or policy.reason.startswith("ESCAPE_TURN")
+            if entered_turn and policy.left_pwm > 0 and policy.right_pwm > 0:
+                moved_after_recovery = True
+
+            left_speed = policy.left_pwm / 255.0 * 0.26
+            right_speed = policy.right_pwm / 255.0 * 0.26
+            linear_speed = (left_speed + right_speed) / 2.0
+            heading += ((left_speed - right_speed) / 0.14) * 0.1
+            x += math.sin(heading) * linear_speed * 0.1
+            y += math.cos(heading) * linear_speed * 0.1
+            if math.hypot(x - obstacle_x, y - obstacle_y) <= obstacle_radius + 0.10:
+                collided = True
+                break
+
+        self.assertFalse(collided)
+        self.assertTrue(entered_turn)
+        self.assertTrue(moved_after_recovery)
+        self.assertGreater(math.hypot(x, y), 0.65)
+
     def test_closed_loop_arc_clears_a_central_obstacle(self) -> None:
         """Approximate kinematics catch a planner that only commands wide arcs."""
         policy = AutonomousPolicy(0.0, 118)

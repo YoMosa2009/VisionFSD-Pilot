@@ -190,18 +190,22 @@ move during that interval. Afterwards its authority order is fixed:
    are slew-limited. A high-confidence close return is retained even when a
    thin obstacle occupies only one angular bin; distant weak speckle is ignored.
 4. At 52 cm of body-path clearance (or an ultrasonic return below 30 cm), it
-   makes one short,
-   LiDAR-cleared reverse curve with both wheels driven. It does not pivot in
-   place. If the rear is not LiDAR-clear, or that bounded recovery does not
-   restore front clearance, it stops and latches that stop instead of repeating
-   the reverse maneuver. Once clear, it briefly commits to the selected escape
-   side so new scan noise cannot immediately send it back toward the obstacle.
+   runs a finite recovery sequence: a short LiDAR-cleared reverse curve with
+   both wheels driven, a slow one-wheel reverse turn toward the best full
+   body-width LiDAR corridor, then a short forward commit and immediate return
+   to live corridor planning. A calibrated MPU-6050 releases the turn after
+   measured yaw reaches the clear corridor and hard-limits each turn to
+   88 degrees; a 2.4-second bound applies if IMU yaw is unavailable. It may try
+   the opposite side once. It stops as `STOP:BOXED_IN` when neither bounded
+   attempt has a safe side/rear path, and automatically rechecks materially
+   changed geometry.
 5. Uno ultrasonic hard-stop (under 18 cm) always wins and blocks forward
    motor commands even if the Pi fails.
 6. A live, calibrated MPU-6050 supplies measured yaw rate to the local mapper
-   and progressively removes steering split above 38 deg/s, reaching zero
-   additional split at 55 deg/s. If the IMU is absent or stale, navigation
-   continues with bounded command-yaw fallback instead of refusing to move.
+   and recovery controller, and progressively removes steering split above
+   38 deg/s, reaching zero additional split at 55 deg/s. If the IMU is absent
+   or stale, navigation continues with bounded time/command-yaw fallback instead
+   of refusing to move.
 
 This keeps roles separate: LD19 geometry chooses an open direction, the camera
 prevents movement toward confirmed people, and the Uno enforces the final

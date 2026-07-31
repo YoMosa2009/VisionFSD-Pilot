@@ -135,11 +135,13 @@ as an independent near-field stop, and the webcam as both a live-frame safety
 gate and a confirmed-person veto. The Pi sends bounded differential motor
 commands/status over the Uno's normal USB cable. It starts with a 25-second
 no-motion standby, uses hysteresis and direction locking for stable LiDAR-guided
-arcs, and uses a short LiDAR-cleared reverse curve only for close escape
-manoeuvres. A Pi-connected MPU-6050 supplies measured short-term yaw for turn
-rate limiting and the rolling local map; LD19 scan matching provides cautious
-heading correction. The map remains advisory rather than true SLAM because the
-kit has no wheel encoders or absolute position reference.
+arcs, and uses a bounded reverse-turn-commit recovery sequence when a close
+obstacle blocks forward progress. It then resumes live corridor planning instead
+of latching a terminal stop. A Pi-connected MPU-6050 bounds recovery turns by
+measured short-term yaw and supplies yaw to the rolling local map; LD19 scan
+matching provides cautious heading correction. The map remains advisory rather
+than true SLAM because the kit has no wheel encoders or absolute position
+reference.
 
 It is not vehicle autonomy and is not robust room-scale SLAM. Do not run it
 unsupervised, near stairs, pets, people, or property that can be damaged.
