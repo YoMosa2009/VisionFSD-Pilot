@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import pathlib
 import sys
+import time
 import unittest
 
 import cv2
@@ -25,6 +26,61 @@ from robot_slam_lite import LidarSlamLite
 
 
 class FrontierExplorerTests(unittest.TestCase):
+    def test_astar_abandons_work_after_control_loop_deadline(self) -> None:
+        free = np.ones((220, 220), dtype=bool)
+        free[:, 110] = False
+        path = FrontierExplorer._astar(
+            free,
+            (110, 30),
+            (110, 190),
+            deadline=time.perf_counter() - 0.001,
+        )
+        self.assertIsNone(path)
+
+    def test_cached_route_waypoint_advances_between_full_replans(self) -> None:
+        free = np.ones((80, 80), dtype=bool)
+        path = [(40, col) for col in range(10, 61)]
+        first = FrontierExplorer._select_waypoint(path, (40, 10), 10.0, free)
+        advanced = FrontierExplorer._select_waypoint(path, (40, 16), 10.0, free)
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(advanced)
+        self.assertGreater(advanced[1], first[1])
+
+    def test_timed_out_replan_keeps_last_safe_route(self) -> None:
+        cells = 120
+        metres = 6.0
+        grid = np.zeros((cells, cells), dtype=np.uint8)
+        observed = np.zeros_like(grid)
+        visits = np.zeros((cells, cells), dtype=np.uint16)
+        cv2.circle(observed, (60, 60), 32, 255, -1)
+        explorer = FrontierExplorer()
+        first = explorer.update(
+            grid, observed, visits, 3.0, 3.0, 0.0, metres, 10, 1.0
+        )
+        self.assertTrue(first.active)
+
+        explorer.PLAN_TIME_BUDGET_S = 0.0
+        retained = explorer.update(
+            grid, observed, visits, 3.0, 3.0, 0.0, metres, 11, 2.0
+        )
+        self.assertTrue(retained.active)
+        self.assertEqual(retained.target_x_m, first.target_x_m)
+        self.assertEqual(retained.target_y_m, first.target_y_m)
+
+    def test_pose_inside_inflation_reconnects_to_nearby_known_free_space(self) -> None:
+        cells = 120
+        metres = 6.0
+        grid = np.zeros((cells, cells), dtype=np.uint8)
+        observed = np.full_like(grid, 255)
+        visits = np.zeros((cells, cells), dtype=np.uint16)
+        grid[60, 63] = 255
+        explorer = FrontierExplorer()
+        state = explorer.update(
+            grid, observed, visits, 3.0, 3.0, 0.0, metres, 10, 1.0
+        )
+        self.assertTrue(state.active)
+        self.assertEqual(state.mode, "PATROL")
+
     def test_reachable_unknown_boundary_becomes_frontier_target(self) -> None:
         cells = 120
         metres = 6.0

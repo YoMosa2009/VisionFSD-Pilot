@@ -65,7 +65,7 @@ MAX_PWM_STEP = 4
 # wheel remains at the loaded floor; neither wheel counter-rotates.
 MAX_GENTLE_HEADING_DEG = 40.0
 MAX_TURN_SPLIT_PWM = 28
-MAX_STEERING_STEP_DEG = 5.0
+MAX_STEERING_STEP_DEG = 2.5
 CORRIDOR_STEERING_GAIN = 1.6
 ESCAPE_TURN_MARGIN_PWM = 24
 ESCAPE_REVERSE_SECONDS = 0.70
@@ -77,6 +77,7 @@ ESCAPE_TARGET_TURN_DEG = 58.0
 ESCAPE_MAX_TURN_DEG = 88.0
 ESCAPE_TURN_TIMEOUT_S = 2.40
 ESCAPE_TURN_SIDE_CLEARANCE_M = 0.28
+ESCAPE_DIRECT_TURN_CLEARANCE_M = 0.55
 FORWARD_PREFERENCE_CLEARANCE_M = 1.10
 CLOSE_LIDAR_M = 0.52
 CLOSE_ULTRASONIC_CM = 30.0
@@ -842,11 +843,34 @@ class AutonomousPolicy:
         self._escape_blocked_side_score = 0.0 if raw_score is None else raw_score
         return self._hold_stop("STOP:BOXED_IN")
 
+    def _can_turn_without_reverse(
+        self,
+        lidar: SectorClearance,
+        direction: str,
+        score: float | None = None,
+    ) -> bool:
+        if score is None:
+            score = self._turn_side_score(lidar, direction)
+        raw_score = self._raw_turn_side_score(lidar, direction)
+        return (
+            score is not None
+            and score >= ESCAPE_DIRECT_TURN_CLEARANCE_M
+            and raw_score is not None
+            and raw_score >= ESCAPE_DIRECT_TURN_CLEARANCE_M
+        )
+
     def _start_escape(self, lidar: SectorClearance, now: float, source: str) -> str:
         choice = self._choose_turn(lidar, now)
         if choice is None or choice[1] < 0.34:
             return self._mark_escape_blocked(lidar, now)
         if lidar.rear_m is None or lidar.rear_m < ESCAPE_REAR_CLEARANCE_M:
+            if self._can_turn_without_reverse(lidar, choice[0], choice[1]):
+                self.turn_command = choice[0]
+                self._escape_attempt = 1
+                self._start_escape_turn(now)
+                self.reason = f"ESCAPE_DIRECT_TURN_{source}:{self.turn_command}"
+                self.drive_confidence = 0.30
+                return self._pivot_crawl(self.turn_command)
             return self._hold_stop("STOP:ESCAPE_REAR_BLOCKED")
         self.turn_command = choice[0]
         self._escape_phase = "REVERSE"
@@ -933,14 +957,24 @@ class AutonomousPolicy:
                 lidar.rear_m is not None
                 and lidar.rear_m >= ESCAPE_REAR_CLEARANCE_M
             )
-            if now >= self._escape_phase_until and geometry_improved and rear_clear:
+            if (
+                choice is not None
+                and now >= self._escape_phase_until
+                and geometry_improved
+            ):
                 self.turn_command = choice[0]
-                self._escape_phase = "REVERSE"
-                self._escape_phase_until = now + ESCAPE_REVERSE_SECONDS
                 self._escape_attempt = 1
-                self.reason = f"ESCAPE_GEOMETRY_CHANGED:{self.turn_command}"
-                self.drive_confidence = 0.25
-                return self._reverse_arc(self.turn_command)
+                if rear_clear:
+                    self._escape_phase = "REVERSE"
+                    self._escape_phase_until = now + ESCAPE_REVERSE_SECONDS
+                    self.reason = f"ESCAPE_GEOMETRY_CHANGED:{self.turn_command}"
+                    self.drive_confidence = 0.25
+                    return self._reverse_arc(self.turn_command)
+                if self._can_turn_without_reverse(lidar, choice[0], choice[1]):
+                    self._start_escape_turn(now)
+                    self.reason = f"ESCAPE_OPENING_TURN:{self.turn_command}"
+                    self.drive_confidence = 0.25
+                    return self._pivot_crawl(self.turn_command)
             return self._hold_stop("STOP:BOXED_IN")
 
         if self._escape_phase == "REVERSE":
@@ -1288,7 +1322,8 @@ def draw_dashboard(local_map: np.ndarray, policy: AutonomousPolicy,
         f"{exploration.mode} target {exploration.target_distance_m:.1f}m "
         f"bearing {exploration.heading_error_deg:+.0f}deg "
         f"frontiers {exploration.frontier_count} "
-        f"coverage {exploration.coverage_ratio * 100:.0f}%"
+        f"coverage {exploration.coverage_ratio * 100:.0f}% "
+        f"plan {exploration.planning_ms:.0f}ms"
     )
     cv2.putText(
         panel,
@@ -1419,6 +1454,18 @@ def main() -> int:
                 points, policy.left_pwm, policy.right_pwm, now, imu_yaw_rate
             )
             policy.observe_pose(slam_lite)
+            # Make the safety decision and refresh the Uno watchdog before the
+            # advisory global planner runs.  A bounded but non-trivial A* search
+            # must never turn route computation into periodic motor dropouts.
+            control_now = time.monotonic()
+            command = policy.decide(
+                clearance,
+                status,
+                camera.person_in_path(),
+                control_now,
+                camera_ready,
+            )
+            policy.send(arduino, command, control_now)
             exploration = explorer.update(
                 local_map.grid,
                 local_map.observed,
@@ -1428,17 +1475,9 @@ def main() -> int:
                 local_map.heading,
                 local_map.metres,
                 slam_lite.map_updates,
-                now,
+                control_now,
             )
             policy.observe_exploration(exploration)
-            command = policy.decide(
-                clearance,
-                status,
-                camera.person_in_path(),
-                now,
-                camera_ready,
-            )
-            policy.send(arduino, command, now)
             if now >= next_telemetry_at:
                 next_telemetry_at = now + TELEMETRY_PERIOD_S
                 front = "--" if clearance.front_m is None else f"{clearance.front_m:.2f}"
@@ -1454,7 +1493,8 @@ def main() -> int:
                     f"pose_yaw={slam_lite.yaw_source} "
                     f"explore={exploration.mode} "
                     f"target_m={exploration.target_distance_m:.2f} "
-                    f"bearing={exploration.heading_error_deg:+.0f}"
+                    f"bearing={exploration.heading_error_deg:+.0f} "
+                    f"plan_ms={exploration.planning_ms:.1f}"
                 )
             if not args.no_display and now >= next_display_at:
                 next_display_at = now + DISPLAY_PERIOD_S

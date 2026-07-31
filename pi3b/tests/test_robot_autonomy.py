@@ -243,11 +243,38 @@ class AutonomousPolicyTests(unittest.TestCase):
         self.assertGreater(policy.left_pwm, 0)
         self.assertGreater(policy.right_pwm, 0)
 
-    def test_close_obstacle_with_blocked_rear_stops(self) -> None:
+    def test_close_obstacle_with_blocked_rear_uses_clear_side_opening(self) -> None:
         policy = AutonomousPolicy(0.0, 118)
         blocked = ArduinoStatus(front_cm=15.0, motion="S", received_at=time.monotonic())
         clearance = SectorClearance(0.30, 1.8, 0.8, True, 1.7, 0.8, None, 0.20)
+        self.assertEqual(policy.decide(clearance, blocked, False, time.monotonic()), "L")
+        self.assertLess(policy.left_pwm, 0)
+        self.assertEqual(policy.right_pwm, 0)
+
+    def test_close_obstacle_stops_when_rear_and_both_turn_sweeps_are_blocked(self) -> None:
+        policy = AutonomousPolicy(0.0, 118)
+        blocked = ArduinoStatus(front_cm=15.0, motion="S", received_at=time.monotonic())
+        clearance = SectorClearance(0.30, 0.24, 0.23, True, 0.22, 0.21, None, 0.20)
         self.assertEqual(policy.decide(clearance, blocked, False, time.monotonic()), "STOP")
+
+    def test_no_imu_side_opening_turn_flows_directly_into_forward_commit(self) -> None:
+        policy = AutonomousPolicy(0.0, 118)
+        now = time.monotonic()
+        policy.observe_pose(SlamLiteState(0.0, 0.8, 0.0, True, 10))
+        blocked = ArduinoStatus(front_cm=15.0, motion="S", received_at=now)
+        opening = SectorClearance(0.30, 1.8, 0.24, True, 1.7, 0.23, None, 0.20)
+        self.assertEqual(policy.decide(opening, blocked, False, now), "L")
+
+        policy.observe_pose(SlamLiteState(-32.0, 0.8, 0.0, True, 11))
+        clear = SectorClearance(0.90, 1.6, 0.35, True, 1.5, 0.34, None, 0.22)
+        released = ArduinoStatus(front_cm=90.0, motion="S", received_at=now + 0.4)
+        command = policy.decide(clear, released, False, now + 0.4)
+        self.assertEqual(command, "F")
+        released = ArduinoStatus(front_cm=90.0, motion="S", received_at=now + 0.45)
+        command = policy.decide(clear, released, False, now + 0.45)
+        self.assertEqual(command, "F")
+        self.assertGreater(policy.left_pwm, 0)
+        self.assertGreater(policy.right_pwm, 0)
 
     def test_motion_starts_at_the_loaded_wheel_floor_not_a_tiny_pwm(self) -> None:
         policy = AutonomousPolicy(0.0, 118)

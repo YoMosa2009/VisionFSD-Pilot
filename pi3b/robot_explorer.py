@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import heapq
 import math
+import time
 
 import cv2
 import numpy as np
@@ -20,6 +21,7 @@ class ExplorationState:
     mode: str = "BUILDING_MAP"
     heading_error_deg: float = 0.0
     target_distance_m: float = 0.0
+    waypoint_distance_m: float = 0.0
     frontier_count: int = 0
     coverage_ratio: float = 0.0
     target_x_m: float | None = None
@@ -27,20 +29,23 @@ class ExplorationState:
     waypoint_x_m: float | None = None
     waypoint_y_m: float | None = None
     replans: int = 0
+    planning_ms: float = 0.0
 
 
 class FrontierExplorer:
     """Select reachable unknown-space boundaries on a bounded occupancy map."""
 
-    REPLAN_PERIOD_S = 0.75
+    REPLAN_PERIOD_S = 0.60
     MIN_MAP_UPDATES = 8
     OCCUPIED_THRESHOLD = 28
     ROBOT_CLEARANCE_M = 0.14
     MIN_FRONTIER_CELLS = 4
     MIN_TARGET_DISTANCE_M = 0.45
-    WAYPOINT_LOOKAHEAD_M = 0.55
+    WAYPOINT_LOOKAHEAD_M = 0.85
     TARGET_REACHED_M = 0.30
-    MAX_ASTAR_VISITS = 35_000
+    MAX_ASTAR_VISITS = 12_000
+    PLAN_TIME_BUDGET_S = 0.045
+    ROBOT_RECONNECT_M = 0.30
 
     def __init__(self) -> None:
         self._next_replan_at = 0.0
@@ -50,6 +55,9 @@ class FrontierExplorer:
         self._coverage_ratio = 0.0
         self._mode = "BUILDING_MAP"
         self._replans = 0
+        self._path_cells: list[tuple[int, int]] = []
+        self._route_free: np.ndarray | None = None
+        self._planning_ms = 0.0
 
     @staticmethod
     def _relative_heading_deg(
@@ -81,7 +89,10 @@ class FrontierExplorer:
         free: np.ndarray,
         start: tuple[int, int],
         goal: tuple[int, int],
+        deadline: float | None = None,
     ) -> list[tuple[int, int]] | None:
+        if deadline is not None and time.perf_counter() >= deadline:
+            return None
         if start == goal:
             return [start]
         if cls._line_is_clear(free, start, goal):
@@ -109,6 +120,8 @@ class FrontierExplorer:
         visited = 0
         found = False
         while queue and visited < cls.MAX_ASTAR_VISITS:
+            if visited % 64 == 0 and deadline is not None and time.perf_counter() >= deadline:
+                return None
             _estimate, cost, row, col = heapq.heappop(queue)
             if closed[row, col]:
                 continue
@@ -200,7 +213,13 @@ class FrontierExplorer:
                 target[0] - robot[0], target[1] - robot[1]
             ) / scale
             visit_penalty = float(visits[target]) * 0.025
-            persistence = 0.55 if self._target_cell == target else 0.0
+            persistence = 0.0
+            if self._target_cell is not None:
+                previous_distance = math.hypot(
+                    self._target_cell[0] - target[0],
+                    self._target_cell[1] - target[1],
+                ) / scale
+                persistence = max(0.0, 0.70 - previous_distance * 1.75)
             score = (
                 math.log1p(area) * 0.85
                 + min(distance, 3.0) * 0.18
@@ -236,6 +255,60 @@ class FrontierExplorer:
         candidates.sort(reverse=True)
         return candidates[:12]
 
+    @staticmethod
+    def _nearest_free_cell(
+        free: np.ndarray,
+        robot: tuple[int, int],
+        radius_cells: int,
+    ) -> tuple[int, int] | None:
+        if free[robot]:
+            return robot
+        row_min = max(0, robot[0] - radius_cells)
+        row_max = min(free.shape[0], robot[0] + radius_cells + 1)
+        col_min = max(0, robot[1] - radius_cells)
+        col_max = min(free.shape[1], robot[1] + radius_cells + 1)
+        rows, cols = np.nonzero(free[row_min:row_max, col_min:col_max])
+        if rows.size == 0:
+            return None
+        rows = rows + row_min
+        cols = cols + col_min
+        distances = (rows - robot[0]) ** 2 + (cols - robot[1]) ** 2
+        nearest = int(np.argmin(distances))
+        if float(distances[nearest]) > float(radius_cells * radius_cells):
+            return None
+        return int(rows[nearest]), int(cols[nearest])
+
+    @classmethod
+    def _select_waypoint(
+        cls,
+        path: list[tuple[int, int]],
+        robot: tuple[int, int],
+        scale: float,
+        free: np.ndarray,
+    ) -> tuple[int, int] | None:
+        if not path:
+            return None
+        distances_sq = np.fromiter(
+            (
+                (cell[0] - robot[0]) ** 2 + (cell[1] - robot[1]) ** 2
+                for cell in path
+            ),
+            dtype=np.float32,
+            count=len(path),
+        )
+        closest = int(np.argmin(distances_sq))
+        lookahead_cells = cls.WAYPOINT_LOOKAHEAD_M * scale
+        waypoint = path[closest]
+        for cell in path[closest + 1:]:
+            distance = math.hypot(cell[0] - robot[0], cell[1] - robot[1])
+            if distance > lookahead_cells:
+                break
+            if cls._line_is_clear(free, robot, cell):
+                waypoint = cell
+        if waypoint == path[closest] and closest + 1 < len(path):
+            waypoint = path[closest + 1]
+        return waypoint
+
     def _state(
         self,
         x_m: float,
@@ -249,11 +322,13 @@ class FrontierExplorer:
                 frontier_count=self._frontier_count,
                 coverage_ratio=self._coverage_ratio,
                 replans=self._replans,
+                planning_ms=self._planning_ms,
             )
         target_x = (self._target_cell[1] + 0.5) / scale
         target_y = (self._target_cell[0] + 0.5) / scale
         waypoint_x = (self._waypoint_cell[1] + 0.5) / scale
         waypoint_y = (self._waypoint_cell[0] + 0.5) / scale
+        waypoint_distance = math.hypot(waypoint_x - x_m, waypoint_y - y_m)
         return ExplorationState(
             active=True,
             mode=self._mode,
@@ -261,6 +336,7 @@ class FrontierExplorer:
                 x_m, y_m, heading_deg, waypoint_x, waypoint_y
             ),
             target_distance_m=math.hypot(target_x - x_m, target_y - y_m),
+            waypoint_distance_m=waypoint_distance,
             frontier_count=self._frontier_count,
             coverage_ratio=self._coverage_ratio,
             target_x_m=target_x,
@@ -268,6 +344,7 @@ class FrontierExplorer:
             waypoint_x_m=waypoint_x,
             waypoint_y_m=waypoint_y,
             replans=self._replans,
+            planning_ms=self._planning_ms,
         )
 
     def update(
@@ -283,6 +360,14 @@ class FrontierExplorer:
         now: float,
     ) -> ExplorationState:
         scale = grid.shape[0] / metres
+        robot = (
+            int(np.clip(round(y_m * scale), 0, grid.shape[0] - 1)),
+            int(np.clip(round(x_m * scale), 0, grid.shape[1] - 1)),
+        )
+        if self._path_cells and self._route_free is not None:
+            self._waypoint_cell = self._select_waypoint(
+                self._path_cells, robot, scale, self._route_free
+            )
         current = self._state(x_m, y_m, heading_deg, scale)
         if (
             map_updates < self.MIN_MAP_UPDATES
@@ -291,6 +376,8 @@ class FrontierExplorer:
             self._mode = "BUILDING_MAP"
             self._target_cell = None
             self._waypoint_cell = None
+            self._path_cells = []
+            self._route_free = None
             return self._state(x_m, y_m, heading_deg, scale)
         if (
             now < self._next_replan_at
@@ -301,6 +388,8 @@ class FrontierExplorer:
 
         self._next_replan_at = now + self.REPLAN_PERIOD_S
         self._replans += 1
+        planning_started = time.perf_counter()
+        deadline = planning_started + self.PLAN_TIME_BUDGET_S
         known = observed > 0
         self._coverage_ratio = self._known_coverage(known)
         occupied = grid >= self.OCCUPIED_THRESHOLD
@@ -313,20 +402,30 @@ class FrontierExplorer:
             ),
         ) > 0
         free = (known & ~inflated).astype(np.uint8)
-        robot = (
-            int(np.clip(round(y_m * scale), 0, grid.shape[0] - 1)),
-            int(np.clip(round(x_m * scale), 0, grid.shape[1] - 1)),
-        )
-        cv2.circle(free, (robot[1], robot[0]), 2, 1, -1)
         free_mask = free > 0
+        planning_start = self._nearest_free_cell(
+            free_mask,
+            robot,
+            max(1, int(math.ceil(self.ROBOT_RECONNECT_M * scale))),
+        )
+        if planning_start is None:
+            self._planning_ms = (time.perf_counter() - planning_started) * 1000.0
+            self._mode = "NO_REACHABLE_SPACE"
+            self._target_cell = None
+            self._waypoint_cell = None
+            self._path_cells = []
+            self._route_free = None
+            return self._state(x_m, y_m, heading_deg, scale)
         component_count, labels = cv2.connectedComponents(
             free, connectivity=8
         )
-        robot_label = int(labels[robot])
+        robot_label = int(labels[planning_start])
         if component_count <= 1 or robot_label == 0:
             self._mode = "NO_REACHABLE_SPACE"
             self._target_cell = None
             self._waypoint_cell = None
+            self._path_cells = []
+            self._route_free = None
             return self._state(x_m, y_m, heading_deg, scale)
         reachable = (labels == robot_label) & free_mask
 
@@ -343,23 +442,29 @@ class FrontierExplorer:
         chosen_target: tuple[int, int] | None = None
         chosen_path: list[tuple[int, int]] | None = None
         for _score, target in candidates[:8]:
-            path = self._astar(reachable, robot, target)
+            path = self._astar(reachable, planning_start, target, deadline)
             if path:
                 chosen_target = target
                 chosen_path = path
                 break
+            if time.perf_counter() >= deadline:
+                break
+        self._planning_ms = (time.perf_counter() - planning_started) * 1000.0
         if chosen_target is None or chosen_path is None:
+            if time.perf_counter() >= deadline and current.active:
+                self._next_replan_at = now + 0.15
+                return current
             self._mode = "NO_REACHABLE_TARGET"
             self._target_cell = None
             self._waypoint_cell = None
+            self._path_cells = []
+            self._route_free = None
             return self._state(x_m, y_m, heading_deg, scale)
 
-        lookahead_cells = self.WAYPOINT_LOOKAHEAD_M * scale
-        waypoint = chosen_path[-1]
-        for cell in chosen_path[1:]:
-            if math.hypot(cell[0] - robot[0], cell[1] - robot[1]) >= lookahead_cells:
-                waypoint = cell
-                break
         self._target_cell = chosen_target
-        self._waypoint_cell = waypoint
+        self._path_cells = chosen_path
+        self._route_free = reachable
+        self._waypoint_cell = self._select_waypoint(
+            chosen_path, robot, scale, reachable
+        )
         return self._state(x_m, y_m, heading_deg, scale)

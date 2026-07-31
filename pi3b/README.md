@@ -185,10 +185,11 @@ move during that interval. Afterwards its authority order is fixed:
    remains a safety gate, but camera frames are not rendered in the robot
    display to reduce Pi 3B display work.
 3. During standby, the mapper distinguishes observed free space from unknown
-   space and persistent obstacle returns. Every 0.75 seconds a frontier planner
-   selects a reachable unexplored boundary, plans around inflated obstacles,
-   and supplies a persistent waypoint heading. When all current frontiers are
-   exhausted, it patrols the least-visited reachable mapped space.
+   space and persistent obstacle returns. A frontier planner selects a reachable
+   unexplored boundary, plans around inflated obstacles, and supplies a
+   persistent look-ahead route. The cached route advances its waypoint every
+   control cycle instead of waiting for the next full replan. When all current
+   frontiers are exhausted, it patrols the least-visited reachable mapped space.
 4. The LD19 begins a direction-locked forward arc when the straight inflated
    corridor drops below 1.1 m. Steering can use up to a 28-PWM wheel split,
    both motors stay above the loaded-wheel stall region, and steering changes
@@ -204,7 +205,9 @@ move during that interval. Afterwards its authority order is fixed:
    88 degrees; a 2.4-second bound applies if IMU yaw is unavailable. It may try
    the opposite side once. It stops as `STOP:BOXED_IN` when neither bounded
    attempt has a safe side/rear path, and automatically rechecks materially
-   changed geometry.
+   changed geometry. If reversing is blocked but one complete turn sweep has at
+   least 55 cm clearance, it begins the same bounded slow turn directly instead
+   of giving up despite that opening.
 6. Uno ultrasonic hard-stop (under 18 cm) always wins and blocks forward
    motor commands even if the Pi fails.
 7. A live, calibrated MPU-6050 supplies measured yaw rate to the local mapper
@@ -229,8 +232,9 @@ holds STOP unless the dashboard reports `UNO DIFFERENTIAL`. The Pi retries the
 capability request every 0.5 seconds until it receives that exact response.
 The LiDAR-only dashboard shows commanded PWM, Uno-reported actual PWM, the Uno
 ultrasonic `blocked` flag, `MPU-6050 CALIBRATING/LIVE/STALE`, frontier/patrol
-mode, target bearing/range, frontier count, and observed-map coverage so a
-software STOP is distinguishable from a motor-power or sensor problem.
+mode, target bearing/range, frontier count, observed-map coverage, and latest
+planner time so a software STOP is distinguishable from a motor-power or sensor
+problem.
 
 Camera startup defaults to `auto`. The runtime tries stable V4L by-id paths and
 camera indexes 0 through 7. If no webcam currently delivers frames, the LiDAR
@@ -289,9 +293,14 @@ Metre range rings make nearby geometry easier to read.
 The frontier explorer inflates obstacles by the robot body and safety margin,
 finds the free-space component connected to the robot, clusters reachable
 free/unknown boundaries, and runs bounded A* to the selected target. It guides
-the local planner toward a look-ahead waypoint. If no reachable frontier
-remains, it patrols low-visit mapped cells to expose missed openings. Planning
-runs at 0.75-second intervals to stay within Pi 3B CPU limits.
+the local planner along a cached look-ahead route whose waypoint advances every
+control cycle. If map inflation temporarily places the estimated pose just
+outside free space, planning reconnects to nearby known free space while live
+LiDAR remains authoritative. If no reachable frontier remains, it patrols
+low-visit mapped cells to expose missed openings. Full replans run every 0.6
+seconds with a 45 ms A* budget. The current motor decision is sent before that
+advisory search, and a timed-out replan retains the last safe route rather than
+pausing the robot or dropping the Uno's 350 ms watchdog.
 
 A heading correction is applied only when successive 360-bin LD19 scans have
 enough non-ambiguous support. Between accepted matches, a live MPU-6050 supplies
