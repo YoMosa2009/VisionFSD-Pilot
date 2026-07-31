@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Conservative Pi 3B robot runtime for an LD19, USB camera and Arduino Uno.
+"""Conservative Pi 3B robot runtime for LD19, camera, Uno and MPU-6050.
 
 The Pi is the high-level planner.  The Uno is the real-time motor and
 front-ultrasonic safety controller.  A missing serial link, stale LiDAR data,
 or a close obstacle therefore always results in STOP rather than a guessed
 movement command.
 
-This is deliberately a low-speed indoor demonstrator.  The supplied OSOYOO
-chassis has neither wheel encoders nor an IMU, so its on-screen LiDAR map uses
-commanded-motion dead reckoning and is labelled approximate; it is not a
-claim of metric SLAM.
+This is deliberately a low-speed indoor demonstrator.  The MPU-6050 improves
+short-term yaw prediction, but the chassis still has no wheel encoders or
+absolute heading sensor.  Its local map remains approximate and is not a claim
+of metric SLAM.
 """
 
 from __future__ import annotations
@@ -30,6 +30,7 @@ import serial
 from serial.tools import list_ports
 
 from lidar_visualizer import LD19Parser, LivePolarMap
+from robot_imu import IMUState, MPU6050Link
 from robot_slam_lite import LidarSlamLite, SlamLiteState
 from visionfsd_pi import (
     AsyncDetector,
@@ -82,6 +83,8 @@ CAMERA_AUTO_INDEX_LIMIT = 8
 CAMERA_CAPTURE_WIDTH = 320
 CAMERA_CAPTURE_HEIGHT = 240
 CAMERA_CAPTURE_FPS = 15
+IMU_SOFT_YAW_RATE_DPS = 38.0
+IMU_HARD_YAW_RATE_DPS = 55.0
 
 # Measured chassis, in metres.  The planner needs its own width because a
 # rectangle fits through a gap that a point always would: this is what lets it
@@ -640,6 +643,30 @@ class AutonomousPolicy:
         self._last_output = (0, 0)
         self.last_sent_at = 0.0
         self.reason = "BOOT_STANDBY"
+        self.imu_yaw_rate_dps: float | None = None
+        self.imu_limited = False
+
+    def observe_imu(self, state: IMUState) -> None:
+        self.imu_yaw_rate_dps = (
+            state.gyro_z_dps if state.connected and state.calibrated and state.fresh else None
+        )
+
+    def _limit_turn_split(self, requested_split: int) -> int:
+        """Reduce differential steering when measured yaw is already too fast."""
+        self.imu_limited = False
+        if requested_split <= 0 or self.imu_yaw_rate_dps is None:
+            return requested_split
+        yaw_rate = abs(self.imu_yaw_rate_dps)
+        if yaw_rate <= IMU_SOFT_YAW_RATE_DPS:
+            return requested_split
+        scale = float(np.clip(
+            (IMU_HARD_YAW_RATE_DPS - yaw_rate)
+            / (IMU_HARD_YAW_RATE_DPS - IMU_SOFT_YAW_RATE_DPS),
+            0.0,
+            1.0,
+        ))
+        self.imu_limited = True
+        return int(round(requested_split * scale))
 
     @staticmethod
     def _side_score(primary: float | None, outer: float | None) -> float | None:
@@ -700,7 +727,8 @@ class AutonomousPolicy:
         both wheels in their loaded movement band gives the LiDAR time to gain
         a little front clearance without a spin or a brake/reverse pulse.
         """
-        outer = min(MAX_PWM, self.min_move_pwm + ESCAPE_TURN_MARGIN_PWM)
+        turn_margin = self._limit_turn_split(ESCAPE_TURN_MARGIN_PWM)
+        outer = min(MAX_PWM, self.min_move_pwm + turn_margin)
         inner = self.min_move_pwm
         if direction == "L":
             return self._set_output("L", -outer, -inner)
@@ -734,7 +762,9 @@ class AutonomousPolicy:
         self._steering_deg += steering_delta
         heading = self._steering_deg
         turn_fraction = abs(heading) / MAX_GENTLE_HEADING_DEG
-        requested_split = int(round(MAX_TURN_SPLIT_PWM * turn_fraction))
+        requested_split = self._limit_turn_split(
+            int(round(MAX_TURN_SPLIT_PWM * turn_fraction))
+        )
         # The old eight-PWM split produced a turn radius too large to avoid an
         # obstacle detected one metre ahead.  Add only the headroom needed for
         # steering, keeping the inside wheel above its measured loaded floor.
@@ -788,6 +818,7 @@ class AutonomousPolicy:
     def _hold_stop(self, reason: str) -> str:
         """Stop without clearing the close-obstacle recovery latch."""
         self.reason = reason
+        self.imu_limited = False
         self.drive_confidence = 0.0
         self.cruise_pwm = 0
         self._steering_deg = 0.0
@@ -795,6 +826,7 @@ class AutonomousPolicy:
 
     def _set_stop(self, reason: str) -> str:
         self.reason = reason
+        self.imu_limited = False
         self._arc_active = False
         self.drive_confidence = 0.0
         self.cruise_pwm = 0
@@ -943,9 +975,9 @@ class AutonomousPolicy:
 def draw_dashboard(local_map: np.ndarray, policy: AutonomousPolicy,
                    clearance: SectorClearance, status: ArduinoStatus, person: bool,
                    camera_ready: bool, differential_ready: bool,
-                   slam_lite: SlamLiteState) -> np.ndarray:
+                   imu: IMUState, slam_lite: SlamLiteState) -> np.ndarray:
     panel = local_map.copy()
-    cv2.rectangle(panel, (0, 0), (panel.shape[1], 134), (14, 22, 31), -1)
+    cv2.rectangle(panel, (0, 0), (panel.shape[1], 158), (14, 22, 31), -1)
     front = "--" if clearance.front_m is None else f"{clearance.front_m:.2f}m"
     front_left = "--" if clearance.front_left_m is None else f"{clearance.front_left_m:.2f}m"
     front_right = "--" if clearance.front_right_m is None else f"{clearance.front_right_m:.2f}m"
@@ -966,11 +998,26 @@ def draw_dashboard(local_map: np.ndarray, policy: AutonomousPolicy,
                 f"UNO {drive_mode}  CMD {policy.left_pwm:+d}/{policy.right_pwm:+d}  "
                 f"ACTUAL {status.left_pwm:+d}/{status.right_pwm:+d}  BLOCKED {'YES' if status.blocked else 'NO'}",
                 (12, 97), cv2.FONT_HERSHEY_SIMPLEX, 0.35, drive_color, 1, cv2.LINE_AA)
+    if not imu.connected:
+        imu_state = "MISSING - COMMAND YAW FALLBACK"
+        imu_color = (80, 190, 245)
+    elif not imu.calibrated:
+        imu_state = f"CALIBRATING {imu.calibration_progress * 100:.0f}%"
+        imu_color = (80, 190, 245)
+    elif not imu.fresh:
+        imu_state = "STALE - COMMAND YAW FALLBACK"
+        imu_color = (70, 95, 255)
+    else:
+        limiter = " RATE LIMIT" if policy.imu_limited else ""
+        imu_state = f"LIVE  YAW {imu.yaw_deg:+.1f}deg  RATE {imu.gyro_z_dps:+.1f}dps{limiter}"
+        imu_color = (90, 235, 130)
+    cv2.putText(panel, f"MPU-6050 {imu_state}", (12, 121),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.37, imu_color, 1, cv2.LINE_AA)
     match = "MATCH" if slam_lite.matched else "PREDICT"
     cv2.putText(panel,
                 f"NAV CONFIDENCE {policy.drive_confidence:.2f}   SLAM-LITE {match} "
                 f"yaw {slam_lite.yaw_confidence:.2f} correction {slam_lite.yaw_correction_deg:+.1f}deg",
-                (12, 121), cv2.FONT_HERSHEY_SIMPLEX, 0.37, (185, 205, 225), 1, cv2.LINE_AA)
+                (12, 145), cv2.FONT_HERSHEY_SIMPLEX, 0.37, (185, 205, 225), 1, cv2.LINE_AA)
     return panel
 
 
@@ -993,6 +1040,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fov", type=float, default=70.0)
     parser.add_argument("--lidar-front-offset-deg", type=float, default=0.0,
                         help="Physical LD19 zero-angle correction; positive rotates readings right")
+    parser.add_argument("--imu-bus", type=int, default=1)
+    parser.add_argument("--imu-address", type=lambda value: int(value, 0), default=0x68)
+    parser.add_argument("--imu-mount-yaw-deg", type=float, default=180.0,
+                        help="MPU board yaw relative to robot frame; this chassis uses 180")
+    parser.add_argument("--no-imu", action="store_true",
+                        help="Disable MPU-6050 and use command-only map yaw prediction")
     parser.add_argument("--no-display", action="store_true")
     return parser.parse_args()
 
@@ -1014,14 +1067,23 @@ def main() -> int:
     arduino = ArduinoLink(arduino_port)
     lidar = LD19Link(lidar_port, args.lidar_front_offset_deg)
     camera = CameraSafety(args.model, args.fallback_model, args.camera, args.threads, args.fov)
-    print(f"VisionFSD Robot: Uno={arduino_port}, LD19={lidar_port}, camera request={args.camera}")
+    imu = None if args.no_imu else MPU6050Link(
+        args.imu_bus, args.imu_address, args.imu_mount_yaw_deg
+    )
+    print(
+        f"VisionFSD Robot: Uno={arduino_port}, LD19={lidar_port}, "
+        f"camera request={args.camera}, IMU={'disabled' if imu is None else hex(args.imu_address)}"
+    )
     policy = AutonomousPolicy(args.standby_seconds, args.speed, args.min_move_pwm)
     # The mapper is advisory: obstacle avoidance always uses the current LD19
     # sectors above, never a past map cell or a guessed pose.
     local_map = LidarSlamLite()
     slam_lite = local_map.state()
+    imu_state = IMUState(error="disabled") if imu is None else imu.state()
     next_display_at = 0.0
     next_telemetry_at = 0.0
+    last_imu_error: str | None = None
+    imu_calibration_reported = False
     keep_running = True
 
     def stop(_signum: int, _frame: object) -> None:
@@ -1036,6 +1098,20 @@ def main() -> int:
         while keep_running:
             now = time.monotonic()
             arduino.poll_capabilities(now)
+            if imu is not None:
+                imu_state = imu.tick(
+                    now, stationary=policy.left_pwm == 0 and policy.right_pwm == 0
+                )
+                if imu_state.error != last_imu_error:
+                    if imu_state.error:
+                        print(f"MPU-6050 unavailable; command-yaw fallback: {imu_state.error}")
+                    elif last_imu_error:
+                        print("MPU-6050 reconnected; calibrating while stationary")
+                    last_imu_error = imu_state.error
+                if imu_state.calibrated and not imu_calibration_reported:
+                    print("MPU-6050 calibrated; measured yaw enabled")
+                    imu_calibration_reported = True
+            policy.observe_imu(imu_state)
             camera.tick()
             clearance = lidar.clearance()
             status = arduino.status()
@@ -1043,7 +1119,14 @@ def main() -> int:
             command = policy.decide(clearance, status, camera.person_in_path(), now, camera_ready)
             policy.send(arduino, command, now)
             points, _fresh = lidar.snapshot()
-            slam_lite = local_map.update(points, policy.left_pwm, policy.right_pwm, now)
+            imu_yaw_rate = (
+                imu_state.gyro_z_dps
+                if imu_state.connected and imu_state.calibrated and imu_state.fresh
+                else None
+            )
+            slam_lite = local_map.update(
+                points, policy.left_pwm, policy.right_pwm, now, imu_yaw_rate
+            )
             if now >= next_telemetry_at:
                 next_telemetry_at = now + TELEMETRY_PERIOD_S
                 front = "--" if clearance.front_m is None else f"{clearance.front_m:.2f}"
@@ -1053,13 +1136,15 @@ def main() -> int:
                     f"cmd={policy.left_pwm}/{policy.right_pwm} "
                     f"actual={status.left_pwm}/{status.right_pwm} blocked={int(status.blocked)} "
                     f"lidar={int(clearance.fresh)} camera={int(camera_ready)} "
-                    f"drive_caps={int(arduino.differential_ready)}"
+                    f"drive_caps={int(arduino.differential_ready)} "
+                    f"imu={int(imu_state.fresh)} imu_cal={int(imu_state.calibrated)} "
+                    f"gyro_z={imu_state.gyro_z_dps:+.1f}"
                 )
             if not args.no_display and now >= next_display_at:
                 next_display_at = now + DISPLAY_PERIOD_S
                 panel = draw_dashboard(local_map.render(size=640), policy, clearance, status,
                                        camera.person_in_path(), camera_ready,
-                                       arduino.differential_ready, slam_lite)
+                                       arduino.differential_ready, imu_state, slam_lite)
                 cv2.imshow(WINDOW_TITLE, panel)
                 if cv2.waitKey(1) & 0xFF in (27, ord("q"), ord("Q")):
                     break
@@ -1068,6 +1153,8 @@ def main() -> int:
         arduino.close()
         lidar.close()
         camera.close()
+        if imu is not None:
+            imu.close()
         cv2.destroyAllWindows()
     return 0
 

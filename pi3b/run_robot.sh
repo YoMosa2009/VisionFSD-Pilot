@@ -65,6 +65,7 @@ ARGS=(
   --standby-seconds "${VISIONFSD_STANDBY_SECONDS:-25}"
   --speed "${VISIONFSD_ROBOT_SPEED:-118}"
   --lidar-front-offset-deg "${VISIONFSD_LIDAR_FRONT_OFFSET_DEG:-0}"
+  --imu-mount-yaw-deg "${VISIONFSD_IMU_MOUNT_YAW_DEG:-180}"
   "$@"
 )
 

@@ -24,6 +24,7 @@ from robot_autonomy import (
     _sector_clearance,
     corridor_profile,
 )
+from robot_imu import IMUState
 
 
 class _Return:
@@ -286,6 +287,22 @@ class AutonomousPolicyTests(unittest.TestCase):
         link = Link()
         policy.send(link, "F", time.monotonic())
         self.assertEqual(link.commands, ["STOP"])
+
+    def test_fast_measured_yaw_removes_additional_turn_split(self) -> None:
+        baseline = AutonomousPolicy(0.0, 118)
+        limited = AutonomousPolicy(0.0, 118)
+        limited.observe_imu(IMUState(
+            connected=True,
+            calibrated=True,
+            fresh=True,
+            gyro_z_dps=60.0,
+        ))
+        for _index in range(20):
+            baseline._differential(118, 40.0)
+            limited._differential(118, 40.0)
+        self.assertGreater(abs(baseline.left_pwm - baseline.right_pwm), 0)
+        self.assertEqual(limited.left_pwm, limited.right_pwm)
+        self.assertTrue(limited.imu_limited)
 
 
 class ArduinoLinkTests(unittest.TestCase):

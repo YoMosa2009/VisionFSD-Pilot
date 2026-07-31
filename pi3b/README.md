@@ -198,6 +198,10 @@ move during that interval. Afterwards its authority order is fixed:
    side so new scan noise cannot immediately send it back toward the obstacle.
 5. Uno ultrasonic hard-stop (under 18 cm) always wins and blocks forward
    motor commands even if the Pi fails.
+6. A live, calibrated MPU-6050 supplies measured yaw rate to the local mapper
+   and progressively removes steering split above 38 deg/s, reaching zero
+   additional split at 55 deg/s. If the IMU is absent or stale, navigation
+   continues with bounded command-yaw fallback instead of refusing to move.
 
 This keeps roles separate: LD19 geometry chooses an open direction, the camera
 prevents movement toward confirmed people, and the Uno enforces the final
@@ -212,9 +216,9 @@ The runtime no longer translates steering into legacy `L`/`R` commands while
 waiting for `CAPS DRIVE`; those commands are fast counter-rotating pivots. It
 holds STOP unless the dashboard reports `UNO DIFFERENTIAL`. The Pi retries the
 capability request every 0.5 seconds until it receives that exact response.
-The LiDAR-only dashboard shows commanded PWM, Uno-reported actual PWM, and the
-Uno ultrasonic `blocked` flag so a software STOP is distinguishable from a
-motor-power problem.
+The LiDAR-only dashboard shows commanded PWM, Uno-reported actual PWM, the Uno
+ultrasonic `blocked` flag, and `MPU-6050 CALIBRATING/LIVE/STALE` so a software
+STOP is distinguishable from a motor-power or sensor problem.
 
 Camera startup defaults to `auto`. The runtime tries stable V4L by-id paths and
 camera indexes 0 through 7. If no webcam currently delivers frames, the LiDAR
@@ -228,7 +232,40 @@ directly through the V4L2 backend rather than GStreamer. Robot-mode capture is
 320x240 at 15 FPS because the camera is a safety veto, not a displayed steering
 sensor; this reduces Pi 3B USB buffer and CPU pressure.
 
-### LiDAR SLAM-lite local map
+### MPU-6050 yaw sensing
+
+The MPU-6050 is connected directly to Pi I2C bus 1 at address `0x68`:
+
+| MPU-6050 | Pi physical pin |
+| --- | --- |
+| VCC | 1 (3.3 V) |
+| SDA | 3 (GPIO2/SDA1) |
+| SCL | 5 (GPIO3/SCL1) |
+| GND | 6 |
+| AD0 | 9 (GND, selects `0x68`) |
+
+The installed board is flat with components up and rotated 180 degrees from
+the robot frame: its pin-header edge faces forward and its `MPU-6050` text
+edge faces rearward. The runtime therefore defaults to
+`--imu-mount-yaw-deg 180`, which reverses sensor X/Y while retaining Z. Override
+only if the physical mount changes:
+
+```bash
+export VISIONFSD_IMU_MOUNT_YAW_DEG=180
+```
+
+The first stationary seconds of the existing 25-second standby calibrate gyro
+bias. Keep the chassis still until the dashboard changes from
+`MPU-6050 CALIBRATING` to `MPU-6050 LIVE`. Calibration rejects samples with
+excessive motion. The IMU is advisory: disconnecting it changes the dashboard
+to command-yaw fallback rather than creating a no-motion boot failure.
+
+The gyro improves short-term turn measurement and smooths excessive yaw. Its
+accelerometer is not integrated into position because chassis vibration,
+gravity error, and the front/side mounting offset would create rapid drift.
+The MPU-6050 has no magnetometer, so it cannot provide absolute heading.
+
+### LiDAR + IMU SLAM-lite local map
 
 The LD19-only panel uses a rolling **SLAM-lite** local map. It keeps a 6 m local
 occupancy sketch at 2.5 cm per cell, integrates every valid current scan return
@@ -237,15 +274,17 @@ one-degree angular bins. Bright current-scan points remain distinct from the
 fading dead-reckoned history. Metre range rings make nearby geometry easier to
 read.
 A heading correction is applied only when that comparison has enough
-non-ambiguous support; otherwise it stays with conservative commanded-motion
-prediction. This increases useful local detail without turning a map estimate
-into a motor-control input.
+non-ambiguous support. Between accepted LD19 matches, a live MPU-6050 supplies
+measured yaw rate; if it is unavailable, the mapper uses conservative
+commanded-motion prediction. This increases useful local detail without
+turning a map estimate into a motor-control input.
 
 This is intentionally advisory. The current LiDAR sectors remain the only
 range input to steering and safety—the map cannot command the motors. Without
-wheel encoders or an IMU, it is not global localization, true metric SLAM,
-loop closure, or a guarantee of room coverage. It is useful for a steadier
-local map and for showing when LiDAR heading agreement is weak.
+wheel encoders or an absolute heading/position reference, it is not global
+localization, true metric SLAM, loop closure, or a guarantee of room coverage.
+It is useful for a steadier local map and for showing when LiDAR heading
+agreement is weak.
 
 The LD19's 0-degree direction must physically point forward. If your mount is
 rotated, set its correction before launching, for example:

@@ -56,7 +56,7 @@ fi
 
 new_requirements="$(sha256sum "$PI_ROOT/requirements.txt" | awk '{print $1}')"
 dependencies_ok=true
-if ! "$PI_ROOT/.venv/bin/python" -c 'import cv2, numpy, serial; from ai_edge_litert.interpreter import Interpreter' >/dev/null 2>&1; then
+if ! "$PI_ROOT/.venv/bin/python" -c 'import cv2, numpy, serial, smbus2; from ai_edge_litert.interpreter import Interpreter' >/dev/null 2>&1; then
   dependencies_ok=false
 fi
 if [[ "$old_requirements" != "$new_requirements" || "$dependencies_ok" != true ]]; then

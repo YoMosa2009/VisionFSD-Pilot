@@ -71,6 +71,13 @@ class SlamLiteTests(unittest.TestCase):
         self.assertGreaterEqual(int(np.count_nonzero(mapper.grid)), len(points))
         self.assertEqual(mapper._latest_hits.shape[0], len(points))
 
+    def test_live_imu_rate_replaces_commanded_yaw_prediction(self) -> None:
+        mapper = LidarSlamLite()
+        mapper.integrate_motion(0, 0, 1.0)
+        mapper.integrate_motion(0, 0, 1.1, imu_yaw_rate_dps=30.0)
+        self.assertAlmostEqual(mapper.heading, 357.0, places=3)
+        self.assertTrue(mapper._using_imu)
+
 
 if __name__ == "__main__":
     unittest.main()

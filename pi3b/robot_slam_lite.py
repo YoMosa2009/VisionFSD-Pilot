@@ -1,11 +1,9 @@
 """Low-cost LiDAR mapping with cautious yaw correction for VisionFSD Pi.
 
-The OSOYOO chassis has no encoders or IMU, so full metric SLAM is not an
-honest claim.  This module intentionally does less: it keeps a small rolling
-occupancy map from the LD19 and applies a heading correction only when two
-successive scans have a clear, low-residual angular match.  Translation remains
-commanded-motion dead reckoning and the map is advisory only; it is never an
-input to the motor-safety decision path.
+The MPU-6050 supplies short-term yaw rate when live, and the LD19 corrects that
+prediction only when successive scans have clear, low-residual agreement.
+Translation remains commanded-motion dead reckoning because the chassis has no
+wheel encoders.  The map is advisory only and never controls motor safety.
 """
 
 from __future__ import annotations
@@ -57,6 +55,7 @@ class LidarSlamLite:
         self._matched = False
         self._map_updates = 0
         self._latest_hits = np.empty((0, 2), dtype=np.int32)
+        self._using_imu = False
 
     @staticmethod
     def _signed_angle(angle: float) -> float:
@@ -141,7 +140,13 @@ class LidarSlamLite:
             return 0.0, confidence, False
         return float(np.clip(mismatch * 0.35, -5.0, 5.0)), confidence, True
 
-    def integrate_motion(self, left_pwm: int, right_pwm: int, now: float) -> None:
+    def integrate_motion(
+        self,
+        left_pwm: int,
+        right_pwm: int,
+        now: float,
+        imu_yaw_rate_dps: float | None = None,
+    ) -> None:
         if self._last_motion_at is None:
             self._last_motion_at = now
             return
@@ -150,7 +155,14 @@ class LidarSlamLite:
         # These deliberately conservative values are only a prediction used by
         # the visual local map.  They are not odometry and never control drive.
         linear_mps = ((left_pwm + right_pwm) * 0.5 / 255.0) * 0.26
-        turn_rate_dps = ((left_pwm - right_pwm) / 255.0) * 130.0
+        self._using_imu = imu_yaw_rate_dps is not None
+        # The mapper's heading increases clockwise; robot-frame +Z gyro is
+        # counter-clockwise.  Negate the IMU rate to preserve map convention.
+        turn_rate_dps = (
+            -imu_yaw_rate_dps
+            if imu_yaw_rate_dps is not None
+            else ((left_pwm - right_pwm) / 255.0) * 130.0
+        )
         yaw_delta = turn_rate_dps * elapsed
         self.heading = (self.heading + yaw_delta) % 360.0
         self._yaw_since_scan += yaw_delta
@@ -188,9 +200,15 @@ class LidarSlamLite:
         self.grid = np.minimum(accumulator, 255).astype(np.uint8)
         self._map_updates += 1
 
-    def update(self, points: list[tuple[int, object]], left_pwm: int, right_pwm: int,
-               now: float) -> SlamLiteState:
-        self.integrate_motion(left_pwm, right_pwm, now)
+    def update(
+        self,
+        points: list[tuple[int, object]],
+        left_pwm: int,
+        right_pwm: int,
+        now: float,
+        imu_yaw_rate_dps: float | None = None,
+    ) -> SlamLiteState:
+        self.integrate_motion(left_pwm, right_pwm, now, imu_yaw_rate_dps)
         bins, scan_stamp = self.bins_from_points(points)
         self._matched = False
         new_scan = scan_stamp > self._last_scan_stamp + 0.035 and now - scan_stamp <= self.MAX_SCAN_AGE_S
@@ -244,8 +262,10 @@ class LidarSlamLite:
         cv2.circle(panel, (px, py), 8, (80, 240, 100), -1, cv2.LINE_AA)
         cv2.arrowedLine(panel, (px, py), tip, (255, 255, 255), 2, cv2.LINE_AA, tipLength=0.35)
         label = "SLAM-LITE LOCAL MAP - ADVISORY"
+        yaw_source = "IMU" if self._using_imu else "COMMAND"
         detail = (f"{self.metres / self.cells * 100:.1f} cm/cell  scans {self._map_updates}  "
-                  f"yaw match {self._yaw_confidence:.2f} correction {self._last_correction:+.1f} deg")
+                  f"yaw {yaw_source} match {self._yaw_confidence:.2f} "
+                  f"correction {self._last_correction:+.1f} deg")
         cv2.rectangle(panel, (0, size - 56), (size, size), (14, 22, 31), -1)
         cv2.putText(panel, label, (12, size - 32), cv2.FONT_HERSHEY_SIMPLEX,
                     0.48, (235, 245, 250), 1, cv2.LINE_AA)

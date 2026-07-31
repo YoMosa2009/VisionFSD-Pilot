@@ -135,14 +135,16 @@ as an independent near-field stop, and the webcam as both a live-frame safety
 gate and a confirmed-person veto. The Pi sends bounded differential motor
 commands/status over the Uno's normal USB cable. It starts with a 25-second
 no-motion standby, uses hysteresis and direction locking for stable LiDAR-guided
-arcs, and uses a short LiDAR-cleared pivot only for close escape manoeuvres.
-Its rolling local map has a lightweight scan-to-scan heading correction, but
-remains advisory rather than true SLAM because the kit has no encoders or IMU.
+arcs, and uses a short LiDAR-cleared reverse curve only for close escape
+manoeuvres. A Pi-connected MPU-6050 supplies measured short-term yaw for turn
+rate limiting and the rolling local map; LD19 scan matching provides cautious
+heading correction. The map remains advisory rather than true SLAM because the
+kit has no wheel encoders or absolute position reference.
 
-It is not vehicle autonomy and is not robust room-scale SLAM: the kit has no
-wheel encoders or IMU. Do not run it unsupervised, near stairs, pets, people,
-or property that can be damaged. Details, firmware location, boot behaviour,
-and the one-command Pi update are in [`pi3b/README.md`](pi3b/README.md#osoyoo-robot-mode-pi--ld19--camera--uno).
+It is not vehicle autonomy and is not robust room-scale SLAM. Do not run it
+unsupervised, near stairs, pets, people, or property that can be damaged.
+Details, firmware location, boot behaviour, and the one-command Pi update are
+in [`pi3b/README.md`](pi3b/README.md#osoyoo-robot-mode-pi--ld19--camera--uno).
 
 ### LD19 LiDAR visualizer
 
