@@ -34,15 +34,10 @@ from robot_explorer import ExplorationState, FrontierExplorer
 from robot_imu import IMUState, MPU6050Link
 from robot_slam_lite import LidarSlamLite, SlamLiteState
 from visionfsd_pi import (
-    AsyncDetector,
     LatestCamera,
-    SceneObject,
-    SceneObjectTracker,
-    TFLiteVehicleDetector,
 )
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent
 WINDOW_TITLE = "VisionFSD Pi Robot - standby"
 UNO_BAUD = 115200
 UNO_HEARTBEAT_S = 0.09
@@ -79,11 +74,13 @@ ESCAPE_MIN_TURN_DEG = 28.0
 ESCAPE_TARGET_TURN_DEG = 58.0
 ESCAPE_MAX_TURN_DEG = 88.0
 ESCAPE_TURN_TIMEOUT_S = 2.40
-ESCAPE_TURN_SIDE_CLEARANCE_M = 0.28
-ESCAPE_DIRECT_TURN_CLEARANCE_M = 0.55
+ESCAPE_TURN_SIDE_CLEARANCE_M = 0.18
+ESCAPE_DIRECT_TURN_CLEARANCE_M = 0.34
+ESCAPE_SIDE_HARD_CLEARANCE_M = 0.16
 FORWARD_PREFERENCE_CLEARANCE_M = 1.10
-CLOSE_LIDAR_M = 0.52
-CLOSE_ULTRASONIC_CM = 30.0
+CLOSE_LIDAR_M = 0.28
+CLOSE_ULTRASONIC_CM = 22.0
+MIN_NAV_CORRIDOR_M = 0.30
 DISPLAY_PERIOD_S = 0.10
 TELEMETRY_PERIOD_S = 1.0
 CAPS_RETRY_S = 0.50
@@ -194,7 +191,7 @@ def _sector_clearance(points: list[tuple[int, object]], centre_deg: float, half_
         # A thin chair leg can occupy one angular bin.  Preserve a strong close
         # return even without a neighbour; farther isolated returns remain
         # rejected so a distant speckle cannot steer the chassis.
-        if len(neighbours) >= 2 or (distance <= 1.20 and confidence >= 80):
+        if len(neighbours) >= 2 or (distance <= 0.75 and confidence >= 180):
             clustered.append(float(np.median(neighbours)))
     return min(clustered) if clustered else None
 
@@ -247,7 +244,7 @@ def corridor_profile(
         supported |= finite & np.isfinite(neighbour) & (np.abs(neighbour - binned) <= tolerance)
     # Do not erase a high-confidence close return merely because the object is
     # narrower than the LD19's adjacent angular samples.
-    close_confirmed = valid & (raw_ranges <= 1.20) & (raw_confidences >= 80)
+    close_confirmed = valid & (raw_ranges <= 0.75) & (raw_confidences >= 180)
     if np.any(close_confirmed):
         close_bins = np.rint(raw_angles[close_confirmed]).astype(np.int16) % 360
         supported[close_bins] = True
@@ -474,7 +471,10 @@ class LD19Link:
     def snapshot(self) -> tuple[list[tuple[int, object]], bool]:
         now = time.monotonic()
         with self._lock:
-            points = self._map.fresh(now, 0.35)
+            # Keep roughly two LD19 revolutions.  Longer point persistence made
+            # obstacles remain in a corridor after the chassis had already
+            # changed angle, causing repeated stop/reverse decisions.
+            points = self._map.fresh(now, 0.22)
             fresh = now - self._last_packet_at <= 0.45
         return points, fresh
 
@@ -564,21 +564,13 @@ class LocalLidarMap:
 
 
 class CameraSafety:
-    """Camera health/person semantics are a veto; range sensing steers."""
+    """Camera health and optical flow support non-IMU pose prediction."""
 
-    def __init__(self, model: Path, fallback: Path, camera: str, threads: int, fov: float) -> None:
-        try:
-            detector = TFLiteVehicleDetector(model, 0.50, threads)
-        except Exception:
-            detector = TFLiteVehicleDetector(fallback, 0.50, threads)
-        self.worker = AsyncDetector(detector)
-        self.tracker = SceneObjectTracker(fov)
+    def __init__(self, camera: str, fov: float) -> None:
         self._fov = fov
         self._last_camera_sequence = 0
-        self._last_result_sequence = 0
         self._last_frame_at = 0.0
         self.frame: np.ndarray | None = None
-        self.people: list[SceneObject] = []
         self.camera: LatestCamera | None = None
         self.camera_source = "none"
         self._camera_sources = self._candidate_sources(camera)
@@ -637,7 +629,6 @@ class CameraSafety:
         self.camera = None
         self.camera_source = "none"
         self.frame = None
-        self.people = []
         self._last_frame_at = 0.0
         self._last_camera_sequence = 0
         self._flow_gray = None
@@ -732,20 +723,8 @@ class CameraSafety:
             self.frame = frame
             if sequence > self._last_camera_sequence:
                 self._update_motion(frame, captured, left_pwm, right_pwm)
-                self.worker.submit(sequence, frame, captured)
                 self._last_camera_sequence = sequence
                 self._last_frame_at = captured
-        result = self.worker.latest_after(self._last_result_sequence)
-        if result is not None and self.frame is not None:
-            self.people = [item for item in self.tracker.update(
-                result.detections, self.frame.shape[1], result.completed_time, self.frame.shape[0]
-            ) if item.detection.label == "person" and abs(item.bearing_deg) <= 28.0]
-            self._last_result_sequence = result.sequence
-
-    def person_in_path(self) -> bool:
-        # A confirmed person approximately inside the forward path is a stop
-        # condition.  A one-frame model guess is intentionally ignored.
-        return any(item.observed and item.distance_m < 1.7 for item in self.people)
 
     def ready(self, now: float) -> bool:
         """Do not drive blind if the webcam has stopped delivering frames."""
@@ -757,18 +736,9 @@ class CameraSafety:
         )
 
     def annotated_frame(self) -> np.ndarray | None:
-        if self.frame is None:
-            return None
-        panel = self.frame.copy()
-        for item in self.people:
-            x1, y1, x2, y2 = (int(value) for value in item.detection.box)
-            cv2.rectangle(panel, (x1, y1), (x2, y2), (50, 70, 255), 2, cv2.LINE_AA)
-            cv2.putText(panel, f"PERSON {item.distance_m:.1f}m", (x1, max(18, y1 - 7)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, (50, 70, 255), 1, cv2.LINE_AA)
-        return panel
+        return None if self.frame is None else self.frame.copy()
 
     def close(self) -> None:
-        self.worker.close()
         if self.camera is not None:
             self.camera.close()
 
@@ -776,8 +746,8 @@ class CameraSafety:
 class AutonomousPolicy:
     """Sensor-fused, low-speed differential-drive planner.
 
-    The LD19 supplies geometry, the webcam supplies a live/person safety
-    veto, and the Uno's ultrasonic sensor remains the final near-field guard.
+    The LD19 supplies geometry, the webcam supplies optical-flow pose cues,
+    and the Uno's ultrasonic sensor remains the final near-field guard.
     This is reactive local navigation, not a claim of room-scale SLAM.
     """
 
@@ -794,8 +764,6 @@ class AutonomousPolicy:
         self._escape_phase_until = 0.0
         self._escape_turn_start_yaw_deg: float | None = None
         self._escape_attempt = 0
-        self._escape_blocked_direction: str | None = None
-        self._escape_blocked_side_score = 0.0
         self._arc_active = False
         self._guidance_bias = 0.0
         self._steering_deg = 0.0
@@ -987,16 +955,11 @@ class AutonomousPolicy:
         self._escape_turn_start_yaw_deg = None
         self._escape_turn_yaw_source = "TIME"
         self._escape_attempt = 0
-        self._escape_blocked_direction = None
-        self._escape_blocked_side_score = 0.0
 
-    def _mark_escape_blocked(self, lidar: SectorClearance, now: float) -> str:
+    def _mark_escape_blocked(self, _lidar: SectorClearance, now: float) -> str:
         self._escape_phase = "BLOCKED"
         self._escape_phase_until = now + 0.50
         self._escape_turn_start_yaw_deg = None
-        self._escape_blocked_direction = self.turn_command
-        raw_score = self._raw_turn_side_score(lidar, self.turn_command)
-        self._escape_blocked_side_score = 0.0 if raw_score is None else raw_score
         return self._hold_stop("STOP:BOXED_IN")
 
     def _can_turn_without_reverse(
@@ -1011,13 +974,12 @@ class AutonomousPolicy:
         return (
             score is not None
             and score >= ESCAPE_DIRECT_TURN_CLEARANCE_M
-            and raw_score is not None
-            and raw_score >= ESCAPE_DIRECT_TURN_CLEARANCE_M
+            and (raw_score is None or raw_score >= ESCAPE_SIDE_HARD_CLEARANCE_M)
         )
 
     def _start_escape(self, lidar: SectorClearance, now: float, source: str) -> str:
         choice = self._choose_turn(lidar, now)
-        if choice is None or choice[1] < 0.34:
+        if choice is None or choice[1] < MIN_NAV_CORRIDOR_M:
             if lidar.rear_m is not None and lidar.rear_m >= ESCAPE_REAR_CLEARANCE_M:
                 self._escape_phase = "REVERSE_SEARCH"
                 self._escape_phase_until = now + ESCAPE_REVERSE_SEARCH_SECONDS
@@ -1026,14 +988,14 @@ class AutonomousPolicy:
                 self.drive_confidence = 0.20
                 return self._reverse_straight()
             return self._mark_escape_blocked(lidar, now)
+        if self._can_turn_without_reverse(lidar, choice[0], choice[1]):
+            self.turn_command = choice[0]
+            self._escape_attempt = 1
+            self._start_escape_turn(now)
+            self.reason = f"ESCAPE_DIRECT_TURN_{source}:{self.turn_command}"
+            self.drive_confidence = 0.30
+            return self._pivot_crawl(self.turn_command)
         if lidar.rear_m is None or lidar.rear_m < ESCAPE_REAR_CLEARANCE_M:
-            if self._can_turn_without_reverse(lidar, choice[0], choice[1]):
-                self.turn_command = choice[0]
-                self._escape_attempt = 1
-                self._start_escape_turn(now)
-                self.reason = f"ESCAPE_DIRECT_TURN_{source}:{self.turn_command}"
-                self.drive_confidence = 0.30
-                return self._pivot_crawl(self.turn_command)
             return self._hold_stop("STOP:ESCAPE_REAR_BLOCKED")
         self.turn_command = choice[0]
         self._escape_phase = "REVERSE"
@@ -1073,7 +1035,7 @@ class AutonomousPolicy:
             return False
         opposite = "R" if self.turn_command == "L" else "L"
         score = self._turn_side_score(lidar, opposite)
-        if score is None or score < 0.42:
+        if score is None or score < MIN_NAV_CORRIDOR_M:
             return False
         if lidar.rear_m is None or lidar.rear_m < ESCAPE_REAR_CLEARANCE_M:
             return False
@@ -1106,15 +1068,10 @@ class AutonomousPolicy:
                 if choice is None
                 else self._raw_turn_side_score(lidar, choice[0])
             )
-            geometry_improved = (
+            geometry_open = (
                 choice is not None
-                and choice[1] >= 0.42
-                and raw_score is not None
-                and raw_score >= 0.30
-                and (
-                    choice[0] != self._escape_blocked_direction
-                    or raw_score >= self._escape_blocked_side_score + 0.12
-                )
+                and choice[1] >= MIN_NAV_CORRIDOR_M
+                and (raw_score is None or raw_score >= ESCAPE_SIDE_HARD_CLEARANCE_M)
             )
             rear_clear = (
                 lidar.rear_m is not None
@@ -1123,23 +1080,23 @@ class AutonomousPolicy:
             if (
                 choice is not None
                 and now >= self._escape_phase_until
-                and geometry_improved
+                and geometry_open
             ):
                 self.turn_command = choice[0]
                 self._escape_attempt = 1
+                if self._can_turn_without_reverse(lidar, choice[0], choice[1]):
+                    self._start_escape_turn(now)
+                    self.reason = f"ESCAPE_OPENING_TURN:{self.turn_command}"
+                    self.drive_confidence = 0.25
+                    return self._pivot_crawl(self.turn_command)
                 if rear_clear:
                     self._escape_phase = "REVERSE"
                     self._escape_phase_until = now + ESCAPE_REVERSE_SECONDS
                     self.reason = f"ESCAPE_GEOMETRY_CHANGED:{self.turn_command}"
                     self.drive_confidence = 0.25
                     return self._reverse_arc(self.turn_command)
-                if self._can_turn_without_reverse(lidar, choice[0], choice[1]):
-                    self._start_escape_turn(now)
-                    self.reason = f"ESCAPE_OPENING_TURN:{self.turn_command}"
-                    self.drive_confidence = 0.25
-                    return self._pivot_crawl(self.turn_command)
             if (
-                (choice is None or choice[1] < 0.34)
+                (choice is None or choice[1] < MIN_NAV_CORRIDOR_M)
                 and rear_clear
                 and now >= self._escape_phase_until
             ):
@@ -1158,7 +1115,7 @@ class AutonomousPolicy:
                 self.drive_confidence = 0.20
                 return self._reverse_straight()
             choice = self._choose_turn(lidar, now)
-            if choice is None or choice[1] < 0.34:
+            if choice is None or choice[1] < MIN_NAV_CORRIDOR_M:
                 return self._mark_escape_blocked(lidar, now)
             self.turn_command = choice[0]
             self._start_escape_turn(now)
@@ -1287,7 +1244,7 @@ class AutonomousPolicy:
             ))
             goal_error = np.abs(STEER_HEADINGS - exploration_heading)
             score += np.clip(1.0 - goal_error / 90.0, 0.0, 1.0) * 0.82
-        usable = profile >= 0.38
+        usable = profile >= MIN_NAV_CORRIDOR_M
         if not np.any(usable):
             return None
         straight = int(np.argmin(np.abs(STEER_HEADINGS)))
@@ -1342,7 +1299,7 @@ class AutonomousPolicy:
         self._reset_escape()
         return self._set_output("STOP", 0, 0)
 
-    def decide(self, lidar: SectorClearance, arduino: ArduinoStatus, person: bool, now: float,
+    def decide(self, lidar: SectorClearance, arduino: ArduinoStatus, _person: bool, now: float,
                camera_ready: bool = True) -> str:
         if now - self.started_at < self.standby_s:
             return self._set_stop(f"STANDBY {max(0, int(self.standby_s - (now - self.started_at)))}s")
@@ -1352,22 +1309,25 @@ class AutonomousPolicy:
             return self._set_stop("STOP:LD19_STALE")
         if not camera_ready:
             return self._set_stop("STOP:CAMERA_STALE")
-        if person:
-            return self._set_stop("STOP:CONFIRMED_PERSON")
-        if lidar.front_m is None:
+        if lidar.front_m is None and lidar.profile is None:
             return self._set_stop("STOP:LD19_FRONT_UNSEEN")
 
         # Close obstacles enter a bounded recovery state machine.  Reverse
         # clearance comes from the LD19, turn completion comes from the IMU when
         # available, and every phase has a finite endpoint.
-        straight_clearance = lidar.front_m
+        straight_clearance = lidar.front_m or 0.0
+        best_clearance = straight_clearance
         if lidar.profile is not None:
             straight_index = int(np.argmin(np.abs(STEER_HEADINGS)))
             straight_clearance = float(lidar.profile[straight_index])
+            best_clearance = float(np.max(lidar.profile))
         close_ultrasonic = (
             arduino.front_cm is not None and arduino.front_cm < CLOSE_ULTRASONIC_CM
         )
-        close_lidar = straight_clearance < CLOSE_LIDAR_M
+        # A close return straight ahead is not a reason to reverse when a
+        # body-width forward arc is open.  Recovery is reserved for the case
+        # where every candidate corridor is genuinely too short.
+        close_lidar = best_clearance < CLOSE_LIDAR_M
         if self._escape_phase != "IDLE":
             recovery_command = self._continue_escape(
                 lidar, arduino, straight_clearance, now
@@ -1464,7 +1424,7 @@ class AutonomousPolicy:
 
 
 def draw_dashboard(local_map: np.ndarray, policy: AutonomousPolicy,
-                   clearance: SectorClearance, status: ArduinoStatus, person: bool,
+                   clearance: SectorClearance, status: ArduinoStatus, _person: bool,
                    camera_ready: bool, differential_ready: bool,
                    imu: IMUState, slam_lite: SlamLiteState,
                    camera_motion: CameraMotionState | None = None) -> np.ndarray:
@@ -1484,7 +1444,7 @@ def draw_dashboard(local_map: np.ndarray, policy: AutonomousPolicy,
                 (90, 235, 130) if policy.last_command == "F" else (80, 190, 245), 1, cv2.LINE_AA)
     cv2.putText(panel,
                 f"LD19 {lidar_state}  F {front}  FL {front_left}  FR {front_right}  "
-                f"ULTRA {ultra}  CAM {camera_state}  PERSON {'YES' if person else 'NO'}",
+                f"ULTRA {ultra}  CAM NAV {camera_state}",
                 (12, 73), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (195, 215, 230), 1, cv2.LINE_AA)
     drive_mode = "DIFFERENTIAL" if differential_ready else "WAITING FOR CAPS DRIVE - MOTORS HELD STOPPED"
     drive_color = (90, 235, 130) if differential_ready else (70, 95, 255)
@@ -1546,8 +1506,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--arduino-port", default="auto", help="Normally /dev/ttyACM0")
     parser.add_argument("--lidar-port", default="auto", help="Normally /dev/ttyUSB0")
     parser.add_argument("--camera", default="auto")
-    parser.add_argument("--model", type=Path, default=PROJECT_ROOT / "models/vehicle_efficientdet_lite0_int8.tflite")
-    parser.add_argument("--fallback-model", type=Path, default=PROJECT_ROOT / "models/vehicle_ssd_mobilenet_v1.tflite")
     parser.add_argument("--standby-seconds", type=float, default=25.0)
     parser.add_argument("--speed", type=int, default=DEFAULT_CRUISE_PWM, choices=range(MIN_MOVE_PWM, MAX_PWM + 1),
                         metavar=f"{MIN_MOVE_PWM}..{MAX_PWM}",
@@ -1556,7 +1514,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-move-pwm", type=int, default=MIN_MOVE_PWM,
                         help="Lowest PWM that turns a loaded wheel. Raise if the robot "
                              "buzzes without moving; lower if it is still too quick.")
-    parser.add_argument("--threads", type=int, default=2, choices=(1, 2, 3))
     parser.add_argument("--fov", type=float, default=70.0)
     parser.add_argument("--lidar-front-offset-deg", type=float, default=0.0,
                         help="Physical LD19 zero-angle correction; positive rotates readings right")
@@ -1586,7 +1543,7 @@ def main() -> int:
     cv2.setUseOptimized(True)
     arduino = ArduinoLink(arduino_port)
     lidar = LD19Link(lidar_port, args.lidar_front_offset_deg)
-    camera = CameraSafety(args.model, args.fallback_model, args.camera, args.threads, args.fov)
+    camera = CameraSafety(args.camera, args.fov)
     imu = None if args.no_imu else MPU6050Link(
         args.imu_bus, args.imu_address, args.imu_mount_yaw_deg
     )
@@ -1604,6 +1561,7 @@ def main() -> int:
     imu_state = IMUState(error="disabled") if imu is None else imu.state()
     next_display_at = 0.0
     next_telemetry_at = 0.0
+    last_policy_state: tuple[str, str, str] | None = None
     last_imu_error: str | None = None
     imu_calibration_reported = False
     keep_running = True
@@ -1670,11 +1628,26 @@ def main() -> int:
             command = policy.decide(
                 clearance,
                 status,
-                camera.person_in_path(),
+                False,
                 control_now,
                 camera_ready,
             )
             policy.send(arduino, command, control_now)
+            policy_state = (
+                command,
+                policy._escape_phase,
+                policy.reason.split(":", 1)[0],
+            )
+            if policy_state != last_policy_state:
+                event_front = clearance.limit_at(0.0)
+                if event_front is None:
+                    event_front = clearance.front_m or 0.0
+                print(
+                    f"NAV_EVENT reason={policy.reason} "
+                    f"cmd={policy.left_pwm}/{policy.right_pwm} "
+                    f"front_path={event_front:.2f}"
+                )
+                last_policy_state = policy_state
             exploration = explorer.update(
                 local_map.grid,
                 local_map.observed,
@@ -1727,7 +1700,7 @@ def main() -> int:
                     policy,
                     clearance,
                     status,
-                    camera.person_in_path(),
+                    False,
                     camera_ready,
                     arduino.differential_ready,
                     imu_state,

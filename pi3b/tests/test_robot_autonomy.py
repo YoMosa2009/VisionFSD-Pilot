@@ -85,18 +85,18 @@ class AutonomousPolicyTests(unittest.TestCase):
         clear_sides = SectorClearance(2.0, 2.0, 1.0, True, 1.8, 0.8, None, 1.0)
         self.assertEqual(policy.decide(clear_sides, blocked, False, time.monotonic()), "L")
         self.assertLess(policy.left_pwm, 0)
-        self.assertLess(policy.right_pwm, 0)
+        self.assertEqual(policy.right_pwm, 0)
 
-    def test_close_obstacle_never_commands_a_one_wheel_pivot(self) -> None:
+    def test_ultrasonic_obstacle_prefers_bounded_turn_over_backing_out(self) -> None:
         policy = AutonomousPolicy(0.0, 118)
         blocked = ArduinoStatus(front_cm=15.0, motion="S", received_at=time.monotonic())
         clear_sides = SectorClearance(0.30, 1.8, 0.8, True, 1.7, 0.8, None, 1.0)
         settle(policy, clear_sides, blocked, cycles=10)
         self.assertLess(policy.left_pwm, 0)
-        self.assertLess(policy.right_pwm, 0)
-        self.assertNotEqual(policy.left_pwm, policy.right_pwm)
+        self.assertEqual(policy.right_pwm, 0)
+        self.assertEqual(policy._escape_phase, "TURN")
 
-    def test_close_obstacle_transitions_from_reverse_to_bounded_turn(self) -> None:
+    def test_close_obstacle_enters_bounded_turn_without_reverse_cycle(self) -> None:
         policy = AutonomousPolicy(0.0, 118)
         now = time.monotonic()
         blocked = ArduinoStatus(front_cm=15.0, motion="S", received_at=now)
@@ -105,8 +105,8 @@ class AutonomousPolicyTests(unittest.TestCase):
         for index in range(48):
             policy.decide(clearance, blocked, False, now + index * 0.03)
             outputs.append((policy.left_pwm, policy.right_pwm))
-        self.assertTrue(any(left < 0 and right < 0 for left, right in outputs[:24]))
-        self.assertTrue(any((left < 0) != (right < 0) for left, right in outputs[24:]))
+        self.assertFalse(any(left < 0 and right < 0 for left, right in outputs))
+        self.assertTrue(any((left < 0) != (right < 0) for left, right in outputs))
         self.assertNotEqual(outputs[-1], (0, 0))
         self.assertTrue(policy.reason.startswith("ESCAPE_TURN:L"))
 
@@ -192,7 +192,7 @@ class AutonomousPolicyTests(unittest.TestCase):
         self.assertEqual(
             policy.decide(changed_geometry, blocked, False, now + 1.30), "R"
         )
-        self.assertEqual(policy.reason, "ESCAPE_GEOMETRY_CHANGED:R")
+        self.assertEqual(policy.reason, "ESCAPE_OPENING_TURN:R")
 
     def test_ambiguous_sides_search_rear_then_use_new_opening(self) -> None:
         policy = AutonomousPolicy(0.0, 118)
@@ -206,7 +206,7 @@ class AutonomousPolicyTests(unittest.TestCase):
         self.assertLess(policy.left_pwm, 0)
         self.assertEqual(policy.right_pwm, 0)
 
-    def test_corridor_profile_cannot_override_a_blocked_turn_side(self) -> None:
+    def test_body_corridor_overrides_noncritical_broad_side_minimum(self) -> None:
         policy = AutonomousPolicy(0.0, 118)
         now = time.monotonic()
         blocked = ArduinoStatus(front_cm=15.0, motion="S", received_at=now)
@@ -216,8 +216,8 @@ class AutonomousPolicyTests(unittest.TestCase):
         clearance = SectorClearance(
             0.30, 0.20, 1.4, True, 0.20, 1.3, misleading_profile, 1.0
         )
-        self.assertEqual(policy.decide(clearance, blocked, False, now), "R")
-        self.assertEqual(policy.turn_command, "R")
+        self.assertEqual(policy.decide(clearance, blocked, False, now), "L")
+        self.assertEqual(policy.turn_command, "L")
 
     def test_no_forward_corridor_searches_clear_rear_before_boxed_stop(self) -> None:
         policy = AutonomousPolicy(0.0, 118)
@@ -225,7 +225,7 @@ class AutonomousPolicyTests(unittest.TestCase):
         status = ArduinoStatus(front_cm=80.0, motion="S", received_at=now)
         no_corridor = SectorClearance(
             0.60, 1.5, 0.70, True, 1.4, 0.70,
-            np.full(STEER_HEADINGS.shape, 0.30, dtype=np.float32), 1.0,
+            np.full(STEER_HEADINGS.shape, 0.25, dtype=np.float32), 1.0,
         )
         self.assertEqual(policy.decide(no_corridor, status, False, now), "B")
         self.assertEqual(policy.reason, "ESCAPE_REVERSE_SEARCH_LD19")
@@ -294,10 +294,49 @@ class AutonomousPolicyTests(unittest.TestCase):
         self.assertGreaterEqual(policy.left_pwm, first)
         self.assertLessEqual(policy.left_pwm - first, 4)
 
-    def test_confirmed_person_stops(self) -> None:
-        policy = AutonomousPolicy(0.0, 70)
+    def test_camera_person_flag_is_ignored_in_navigation_only_mode(self) -> None:
+        policy = AutonomousPolicy(0.0, 118)
         clear = SectorClearance(2.0, 2.0, 2.0, True)
-        self.assertEqual(policy.decide(clear, self.status, True, time.monotonic()), "STOP")
+        self.assertEqual(policy.decide(clear, self.status, True, time.monotonic()), "F")
+
+    def test_close_straight_return_uses_open_body_corridor_without_reversing(self) -> None:
+        policy = AutonomousPolicy(0.0, 118)
+        profile = np.full(STEER_HEADINGS.size, 0.20, dtype=np.float32)
+        profile[(STEER_HEADINGS >= 22.0) & (STEER_HEADINGS <= 38.0)] = 1.20
+        clearance = SectorClearance(
+            0.24, 0.35, 1.4, True, 0.30, 1.3, profile, 1.0
+        )
+
+        command = policy.decide(clearance, self.status, False, time.monotonic())
+
+        self.assertEqual(command, "F")
+        self.assertGreaterEqual(policy.left_pwm, MIN_MOVE_PWM)
+        self.assertGreaterEqual(policy.right_pwm, MIN_MOVE_PWM)
+        self.assertEqual(policy._escape_phase, "IDLE")
+
+    def test_multi_obstacle_corridors_remain_continuous_forward_motion(self) -> None:
+        policy = AutonomousPolicy(0.0, 118)
+        now = time.monotonic()
+        outputs = []
+        for index in range(80):
+            profile = np.full(STEER_HEADINGS.size, 0.18, dtype=np.float32)
+            centre = 32.0 if (index // 20) % 2 == 0 else -32.0
+            profile[np.abs(STEER_HEADINGS - centre) <= 10.0] = 1.10
+            clearance = SectorClearance(
+                0.22, 0.9, 0.9, True, 0.8, 0.8, profile, 1.0
+            )
+            decision_at = now + index * 0.04
+            status = ArduinoStatus(
+                front_cm=80.0, motion="S", received_at=decision_at
+            )
+            command = policy.decide(
+                clearance, status, False, decision_at
+            )
+            outputs.append((command, policy.left_pwm, policy.right_pwm))
+
+        self.assertTrue(all(command == "F" for command, _left, _right in outputs))
+        self.assertTrue(all(left > 0 and right > 0 for _command, left, right in outputs))
+        self.assertEqual(policy._escape_phase, "IDLE")
 
     def test_front_obstacle_turns_toward_clearer_side(self) -> None:
         policy = AutonomousPolicy(0.0, 118)
@@ -367,6 +406,15 @@ class AutonomousPolicyTests(unittest.TestCase):
         policy = AutonomousPolicy(0.0, 70)
         unseen = SectorClearance(None, 2.0, 2.0, True, 2.0, 2.0)
         self.assertEqual(policy.decide(unseen, self.status, False, time.monotonic()), "STOP")
+
+    def test_unseen_fixed_front_sector_uses_live_open_corridor_profile(self) -> None:
+        policy = AutonomousPolicy(0.0, 118)
+        profile = np.full(STEER_HEADINGS.size, 1.5, dtype=np.float32)
+        clearance = SectorClearance(None, None, None, True, profile=profile, rear_m=1.0)
+
+        self.assertEqual(
+            policy.decide(clearance, self.status, False, time.monotonic()), "F"
+        )
 
     def test_clear_path_moves_forward(self) -> None:
         policy = AutonomousPolicy(0.0, 70)
@@ -546,15 +594,13 @@ class CameraSafetyTests(unittest.TestCase):
 
     def test_missing_camera_keeps_runtime_in_safe_stale_state(self) -> None:
         with (
-            mock.patch("robot_autonomy.TFLiteVehicleDetector", return_value=object()),
-            mock.patch("robot_autonomy.AsyncDetector"),
-            mock.patch("robot_autonomy.SceneObjectTracker"),
             mock.patch.object(CameraSafety, "_candidate_sources", return_value=["0", "1"]),
             mock.patch("robot_autonomy.LatestCamera", side_effect=RuntimeError("not available")),
         ):
-            safety = CameraSafety(pathlib.Path("model"), pathlib.Path("fallback"), "auto", 1, 62.0)
+            safety = CameraSafety("auto", 62.0)
             self.assertIsNone(safety.camera)
             self.assertFalse(safety.ready(time.monotonic()))
+            self.assertFalse(hasattr(safety, "worker"))
             safety.tick()
             safety.close()
 
@@ -562,16 +608,13 @@ class CameraSafetyTests(unittest.TestCase):
         working_camera = mock.Mock()
         working_camera.error = ""
         with (
-            mock.patch("robot_autonomy.TFLiteVehicleDetector", return_value=object()),
-            mock.patch("robot_autonomy.AsyncDetector"),
-            mock.patch("robot_autonomy.SceneObjectTracker"),
             mock.patch.object(CameraSafety, "_candidate_sources", return_value=["0", "1"]),
             mock.patch(
                 "robot_autonomy.LatestCamera",
                 side_effect=[RuntimeError("index zero failed"), working_camera],
             ),
         ):
-            safety = CameraSafety(pathlib.Path("model"), pathlib.Path("fallback"), "auto", 1, 62.0)
+            safety = CameraSafety("auto", 62.0)
             self.assertIs(safety.camera, working_camera)
             self.assertEqual(safety.camera_source, "1")
             safety.close()
@@ -620,8 +663,14 @@ class CorridorProfileTests(unittest.TestCase):
         straight = profile[int(np.argmin(np.abs(STEER_HEADINGS)))]
         self.assertGreater(float(straight), 2.0)
 
-    def test_strong_close_single_return_blocks_a_thin_obstacle(self) -> None:
+    def test_unconfirmed_single_return_does_not_create_stop_step(self) -> None:
         thin_leg = [(0, _Return(0, 500, confidence=120))]
+        profile = corridor_profile(thin_leg)
+        straight = profile[int(np.argmin(np.abs(STEER_HEADINGS)))]
+        self.assertGreater(float(straight), 2.0)
+
+    def test_very_strong_close_single_return_is_retained(self) -> None:
+        thin_leg = [(0, _Return(0, 500, confidence=220))]
         profile = corridor_profile(thin_leg)
         straight = profile[int(np.argmin(np.abs(STEER_HEADINGS)))]
         self.assertLess(float(straight), 0.50)

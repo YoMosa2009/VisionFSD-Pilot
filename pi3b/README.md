@@ -84,7 +84,7 @@ updates can then use `bash ~/visionfsd-pi/pi3b/update.sh`.
 The optional indoor robot runtime connects all four sensor/control parts:
 
 ```text
-Pi USB webcam ──────────────> Pi (semantic person veto + display)
+Pi USB webcam ──────────────> Pi (optical-flow pose cue + live health gate)
 LD19 USB-UART ──────────────> Pi (360-degree range obstacles/local map)
 Arduino Uno USB ────────────> Pi (serial commands/status)
 front static ultrasonic ────> Uno (independent final forward-stop guard)
@@ -181,11 +181,11 @@ At boot the robot runtime starts in a **25-second STOP standby**. It will not
 move during that interval. Afterwards its authority order is fixed:
 
 1. A stale Uno, LD19, or webcam stops the robot; it will not drive blind.
-2. A confirmed person in the camera's forward path stops it. Camera inference
-   remains a safety gate. Low-resolution optical flow also provides a bounded
-   non-IMU yaw cue during turns and reduces false commanded map translation
-   when a high-confidence textured view shows no movement. It is not odometry.
-   Camera frames are not rendered, keeping camera/display work small on Pi 3B.
+2. Robot mode does not run object or person detection. Low-resolution webcam
+   optical flow provides a bounded non-IMU yaw cue during turns and reduces
+   false commanded map translation when a high-confidence textured view shows
+   no movement. It is not odometry. Camera frames are not rendered, keeping
+   camera/display work small on Pi 3B.
 3. During standby, the mapper distinguishes observed free space from unknown
    space and persistent obstacle returns. A frontier planner selects a reachable
    unexplored boundary, plans around inflated obstacles, and supplies a
@@ -195,11 +195,14 @@ move during that interval. Afterwards its authority order is fixed:
 4. The LD19 begins a direction-locked forward arc when the straight inflated
    corridor drops below 1.1 m. Steering can use up to a 28-PWM wheel split,
    both motors stay above the loaded-wheel stall region, and steering changes
-   are slew-limited. A high-confidence close return is retained even when a
-   thin obstacle occupies only one angular bin; distant weak speckle is ignored.
+   are slew-limited. A very-high-confidence close return is retained even when
+   a thin obstacle occupies only one angular bin; weaker isolated speckle is ignored.
    The frontier heading only biases among currently safe full-body corridors.
-5. At 52 cm of body-path clearance (or an ultrasonic return below 30 cm), it
-   runs a finite recovery sequence: a short LiDAR-cleared reverse curve with
+5. A close straight return does not trigger recovery while another body-width
+   forward corridor is open; the controller follows that corridor as a
+   continuous differential arc. Only when every candidate corridor is below
+   28 cm (or ultrasonic is below 22 cm) does it run a finite recovery sequence:
+   a short LiDAR-cleared reverse curve with
    both wheels driven, a slow one-wheel reverse turn toward the best full
    body-width LiDAR corridor, then a short forward commit and immediate return
    to live corridor planning. A calibrated MPU-6050 releases the turn after
@@ -211,7 +214,7 @@ move during that interval. Afterwards its authority order is fixed:
    the closest point in a broad rear sector. When that corridor is clear but
    both sides are ambiguous, one short straight reverse search obtains a new
    view before declaring itself boxed in. If reversing is blocked but one
-   complete turn sweep has at least 55 cm clearance, it begins the same bounded
+   complete turn sweep has at least 34 cm clearance, it begins the same bounded
    slow turn directly instead of giving up despite that opening.
 6. Uno ultrasonic hard-stop (under 18 cm) always wins and blocks forward
    motor commands even if the Pi fails.
@@ -223,9 +226,9 @@ move during that interval. Afterwards its authority order is fixed:
    available, retaining the same 2.4-second hard timeout as the final bound.
 
 This keeps roles separate: LD19 geometry chooses an open direction, the camera
-prevents movement toward confirmed people and supplies only bounded pose cues,
-and the Uno enforces the final close-range stop. Camera output never overrides
-measured LiDAR or ultrasonic safety.
+supplies only bounded optical-flow pose cues, and the Uno enforces the final
+close-range stop. Camera output never overrides measured LiDAR or ultrasonic
+safety.
 
 The motor battery in the described 9 V-style holder is not adequate for
 autonomous testing: voltage sag can still cause buzzing, stuttering, or a

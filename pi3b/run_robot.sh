@@ -11,15 +11,6 @@ if [[ ! -x "$PYTHON" ]]; then
   exit 1
 fi
 
-PRIMARY_MODEL="$ROOT/models/vehicle_efficientdet_lite0_int8.tflite"
-FALLBACK_MODEL="$ROOT/models/vehicle_ssd_mobilenet_v1.tflite"
-MODEL="$PRIMARY_MODEL"
-if [[ ! -f "$MODEL" ]]; then MODEL="$FALLBACK_MODEL"; fi
-if [[ ! -f "$MODEL" ]]; then
-  echo "No verified Pi detector model is installed. Re-run ./install.sh." >&2
-  exit 1
-fi
-
 # The desktop autostart entry runs with no terminal, so anything printed here
 # is lost and a failed start is indistinguishable from "nothing happened".
 # Keep the last two runs on disk so a boot failure can be read afterwards.
@@ -60,7 +51,6 @@ done
 # loaded-wheel movement floor, never into the buzzing/no-motion PWM band.
 ARGS=(
   "$ROOT/robot_autonomy.py"
-  --model "$MODEL" --fallback-model "$FALLBACK_MODEL"
   --camera "${VISIONFSD_CAMERA:-auto}"
   --standby-seconds "${VISIONFSD_STANDBY_SECONDS:-25}"
   --speed "${VISIONFSD_ROBOT_SPEED:-118}"

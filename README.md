@@ -131,8 +131,9 @@ See [`pi3b/README.md`](pi3b/README.md) for camera, model, and benchmark details.
 
 The Pi robot runtime is separate from the read-only desktop visualizer. It
 uses the LD19 as 360-degree measured range, the front static ultrasonic sensor
-as an independent near-field stop, and the webcam as both a live-frame safety
-gate and a confirmed-person veto. The Pi sends bounded differential motor
+as an independent near-field stop, and the webcam as a live-frame gate plus
+low-cost optical-flow pose aid. Robot mode does not run camera object/person
+detection. The Pi sends bounded differential motor
 commands/status over the Uno's normal USB cable. It starts with a 25-second
 no-motion standby, uses hysteresis and direction locking for stable LiDAR-guided
 arcs, and uses a bounded reverse-turn-commit recovery sequence when a close
@@ -149,13 +150,15 @@ encoders, loop closure, or absolute position reference.
 If the MPU-6050 is missing or stale, the same occupancy, frontier, A*, waypoint,
 patrol, and live-corridor stack remains active. Turn prediction uses differential
 motor commands and is corrected by successive LD19 scans; recovery turns use
-that corrected map heading instead of relying only on elapsed time. In v1.8.3,
+that corrected map heading instead of relying only on elapsed time. In v1.8.4,
 a fail-safe leased heartbeat refreshes the selected motor output independently
 of camera/display/planner scheduling, rear clearance uses a body-width LiDAR
-corridor, and an ambiguous side view can trigger a short straight reverse search
-instead of an immediate boxed-in stop. The full-screen dashboard remains
-LiDAR-only, while low-cost webcam optical flow cautiously refines non-IMU yaw and
-suppresses false commanded translation when a well-textured view shows no motion.
+corridor, and the controller checks all forward body corridors before entering
+recovery. A close straight obstacle with an open curved path therefore remains
+continuous forward differential motion. Recovery uses less-sensitive thresholds,
+prefers a bounded turn over reversing when safe, and ignores unconfirmed isolated
+LD19 returns. Camera neural inference was removed from robot mode; optical flow
+continues to refine non-IMU pose without spending CPU on person detection.
 
 It is not vehicle autonomy and is not robust room-scale SLAM. Do not run it
 unsupervised, near stairs, pets, people, or property that can be damaged.
