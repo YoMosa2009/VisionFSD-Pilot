@@ -45,6 +45,8 @@ from visionfsd_pi import (
 PROJECT_ROOT = Path(__file__).resolve().parent
 WINDOW_TITLE = "VisionFSD Pi Robot - standby"
 UNO_BAUD = 115200
+UNO_HEARTBEAT_S = 0.09
+UNO_CONTROL_LEASE_S = 0.25
 # The L298N bridge on this shield drops roughly 2 V, so a 7.9 V pack puts at
 # most about 5.6 V across a motor at full duty.  Capping PWM at 105 meant 41%
 # of that, near 2.3 V: enough to spin a free wheel on blocks, not enough to
@@ -69,7 +71,8 @@ MAX_STEERING_STEP_DEG = 2.5
 CORRIDOR_STEERING_GAIN = 1.6
 ESCAPE_TURN_MARGIN_PWM = 24
 ESCAPE_REVERSE_SECONDS = 0.70
-ESCAPE_REAR_CLEARANCE_M = 0.38
+ESCAPE_REAR_CLEARANCE_M = 0.24
+ESCAPE_REVERSE_SEARCH_SECONDS = 0.45
 ESCAPE_FRONT_RELEASE_M = 0.68
 ESCAPE_COMMIT_SECONDS = 1.00
 ESCAPE_MIN_TURN_DEG = 28.0
@@ -104,8 +107,8 @@ FRONT_OVERHANG_M = ROBOT_LENGTH_M / 2.0
 PLANNING_HORIZON_M = 3.0
 # Candidate headings for the corridor sweep, symmetric so straight ahead is
 # itself an option rather than falling between two near-tied neighbours.
-STEER_HEADINGS = np.arange(-72.0, 72.1, 2.0, dtype=np.float32)
-_STEER_RADIANS = np.radians(STEER_HEADINGS)
+STEER_HEADINGS = np.arange(-72.0, 72.1, 1.0, dtype=np.float32)
+_CLEARANCE_HEADINGS = np.concatenate((STEER_HEADINGS, np.array([180.0], dtype=np.float32)))
 LD19_BAUD = 230400
 
 
@@ -143,6 +146,17 @@ class SectorClearance:
             return None
         index = int(np.argmin(np.abs(STEER_HEADINGS - heading_deg)))
         return float(self.profile[index])
+
+
+@dataclass(frozen=True)
+class CameraMotionState:
+    fresh: bool = False
+    confidence: float = 0.0
+    tracked_features: int = 0
+    yaw_rate_dps: float | None = None
+    translation_scale: float = 1.0
+    motion_observed: bool = False
+    captured_at: float = 0.0
 
 
 def _signed_angle(angle: float) -> float:
@@ -185,7 +199,10 @@ def _sector_clearance(points: list[tuple[int, object]], centre_deg: float, half_
     return min(clustered) if clustered else None
 
 
-def corridor_profile(points: list[tuple[int, object]]) -> np.ndarray:
+def corridor_profile(
+    points: list[tuple[int, object]],
+    candidate_headings: np.ndarray = STEER_HEADINGS,
+) -> np.ndarray:
     """Clear travel ahead of the bumper for every candidate heading.
 
     For each heading the robot is swept forward as a rectangle of its own
@@ -195,7 +212,7 @@ def corridor_profile(points: list[tuple[int, object]]) -> np.ndarray:
     object instead of stopping in front of it or swerving past the whole side.
     """
     if not points:
-        return np.zeros(STEER_HEADINGS.size, dtype=np.float32)
+        return np.zeros(candidate_headings.size, dtype=np.float32)
     # Build robust one-degree bins first.  The old corridor sweep accepted every
     # isolated return, so one LD19 speckle could make a clear path disappear for
     # one control cycle and jerk the wheel command.  A physical obstacle normally
@@ -236,11 +253,13 @@ def corridor_profile(points: list[tuple[int, object]]) -> np.ndarray:
         supported[close_bins] = True
     usable_indices = np.flatnonzero(supported)
     if usable_indices.size == 0:
-        return np.full(STEER_HEADINGS.size, PLANNING_HORIZON_M, dtype=np.float32)
+        return np.full(candidate_headings.size, PLANNING_HORIZON_M, dtype=np.float32)
     angles = usable_indices.astype(np.float32)
     ranges = binned[usable_indices]
 
-    delta = np.radians(((angles[None, :] - STEER_HEADINGS[:, None]) + 180.0) % 360.0 - 180.0)
+    delta = np.radians(
+        ((angles[None, :] - candidate_headings[:, None]) + 180.0) % 360.0 - 180.0
+    )
     cos, sin = np.cos(delta), np.sin(delta)
     lateral = sin * ranges[None, :]
     along = cos * ranges[None, :]
@@ -281,6 +300,12 @@ class ArduinoLink:
         time.sleep(2.1)
         self._lines: queue.Queue[str] = queue.Queue()
         self._running = True
+        self._write_lock = threading.Lock()
+        self._drive_lock = threading.Lock()
+        self._drive_command = "STOP"
+        self._drive_lease_until = 0.0
+        self._drive_last_write = 0.0
+        self._drive_expired = True
         self._status = ArduinoStatus(None, "S", 0.0)
         self._supports_differential = False
         self._last_caps_sent_at = float("-inf")
@@ -288,6 +313,10 @@ class ArduinoLink:
         self._reader.start()
         self.send("STOP")
         self.poll_capabilities(time.monotonic())
+        self._heartbeat = threading.Thread(
+            target=self._heartbeat_loop, name="uno-drive-heartbeat", daemon=True
+        )
+        self._heartbeat.start()
 
     @staticmethod
     def _parse_status(line: str, received_at: float) -> ArduinoStatus:
@@ -327,9 +356,53 @@ class ArduinoLink:
                 self._supports_differential = True
             self._lines.put(line)
 
+    def _write(self, command: str) -> None:
+        with self._write_lock:
+            if self._running and self._serial.is_open:
+                self._serial.write((command + "\n").encode("ascii"))
+
     def send(self, command: str) -> None:
-        if self._running and self._serial.is_open:
-            self._serial.write((command + "\n").encode("ascii"))
+        self._write(command)
+
+    def publish_drive(self, left_pwm: int, right_pwm: int) -> None:
+        """Publish a leased command and refresh it independently of planning.
+
+        The short lease preserves fail-safe STOP behavior if the main loop
+        hangs.  While the loop remains healthy, this thread prevents display,
+        camera, or route-planning jitter from tripping the Uno dead-man timer.
+        """
+        now = time.monotonic()
+        command = f"DRIVE {left_pwm} {right_pwm}"
+        with self._drive_lock:
+            changed = command != self._drive_command
+            self._drive_command = command
+            self._drive_lease_until = now + UNO_CONTROL_LEASE_S
+            self._drive_expired = False
+            due = changed or now - self._drive_last_write >= UNO_HEARTBEAT_S
+            if due:
+                self._drive_last_write = now
+        if due:
+            self._write(command)
+
+    def _heartbeat_loop(self) -> None:
+        while self._running:
+            command = self._heartbeat_command(time.monotonic())
+            if command is not None:
+                self._write(command)
+            time.sleep(UNO_HEARTBEAT_S / 3.0)
+
+    def _heartbeat_command(self, now: float) -> str | None:
+        command: str | None = None
+        with self._drive_lock:
+            if now <= self._drive_lease_until:
+                if now - self._drive_last_write >= UNO_HEARTBEAT_S:
+                    command = self._drive_command
+                    self._drive_last_write = now
+            elif not self._drive_expired:
+                command = "STOP"
+                self._drive_expired = True
+                self._drive_last_write = now
+        return command
 
     def status(self) -> ArduinoStatus:
         return self._status
@@ -347,11 +420,13 @@ class ArduinoLink:
     def close(self) -> None:
         self._running = False
         try:
-            if self._serial.is_open:
-                self._serial.write(b"STOP\n")
+            with self._write_lock:
+                if self._serial.is_open:
+                    self._serial.write(b"STOP\n")
         except (serial.SerialException, OSError, TypeError):
             pass
         self._reader.join(timeout=0.5)
+        self._heartbeat.join(timeout=0.5)
         try:
             self._serial.close()
         except (serial.SerialException, OSError, TypeError):
@@ -410,6 +485,8 @@ class LD19Link:
         scan_at = max((float(point.captured_at) for _index, point in points), default=0.0)
         if self._clearance_cache is not None and scan_at <= self._clearance_stamp:
             return self._clearance_cache
+        profiles = corridor_profile(points, _CLEARANCE_HEADINGS)
+        rear_evidence = _sector_clearance(points, 180.0, 60.0)
         clearance = SectorClearance(
             _sector_clearance(points, 0.0, 20.0),
             _sector_clearance(points, -75.0, 35.0),
@@ -417,8 +494,8 @@ class LD19Link:
             True,
             _sector_clearance(points, -35.0, 20.0),
             _sector_clearance(points, 35.0, 20.0),
-            corridor_profile(points),
-            _sector_clearance(points, 180.0, 25.0),
+            profiles[:-1],
+            None if rear_evidence is None else float(profiles[-1]),
             scan_at,
         )
         self._clearance_stamp = scan_at
@@ -496,6 +573,7 @@ class CameraSafety:
             detector = TFLiteVehicleDetector(fallback, 0.50, threads)
         self.worker = AsyncDetector(detector)
         self.tracker = SceneObjectTracker(fov)
+        self._fov = fov
         self._last_camera_sequence = 0
         self._last_result_sequence = 0
         self._last_frame_at = 0.0
@@ -508,6 +586,9 @@ class CameraSafety:
         self._next_camera_retry_at = 0.0
         self._camera_opened_at = 0.0
         self._last_camera_error = ""
+        self._flow_gray: np.ndarray | None = None
+        self._flow_at = 0.0
+        self.motion = CameraMotionState()
         self._open_next_camera(time.monotonic())
 
     @staticmethod
@@ -559,10 +640,81 @@ class CameraSafety:
         self.people = []
         self._last_frame_at = 0.0
         self._last_camera_sequence = 0
+        self._flow_gray = None
+        self._flow_at = 0.0
+        self.motion = CameraMotionState()
         self._next_camera_retry_at = now + CAMERA_RETRY_S
         print(f"Camera lost; safe STOP while retrying: {reason}", file=sys.stderr)
 
-    def tick(self) -> None:
+    def _update_motion(
+        self, frame: np.ndarray, captured: float, left_pwm: int, right_pwm: int
+    ) -> None:
+        gray = cv2.cvtColor(
+            cv2.resize(frame, (160, 120), interpolation=cv2.INTER_AREA),
+            cv2.COLOR_BGR2GRAY,
+        )
+        previous = self._flow_gray
+        elapsed = captured - self._flow_at
+        self._flow_gray = gray
+        self._flow_at = captured
+        if previous is None or not 0.035 <= elapsed <= 0.35:
+            self.motion = CameraMotionState(captured_at=captured)
+            return
+        features = cv2.goodFeaturesToTrack(
+            previous, maxCorners=80, qualityLevel=0.025, minDistance=7, blockSize=7
+        )
+        if features is None or len(features) < 10:
+            self.motion = CameraMotionState(captured_at=captured)
+            return
+        next_points, status, errors = cv2.calcOpticalFlowPyrLK(
+            previous,
+            gray,
+            features,
+            None,
+            winSize=(15, 15),
+            maxLevel=2,
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 12, 0.03),
+        )
+        if next_points is None or status is None:
+            self.motion = CameraMotionState(captured_at=captured)
+            return
+        valid = status.reshape(-1) == 1
+        if errors is not None:
+            valid &= errors.reshape(-1) < 24.0
+        old = features.reshape(-1, 2)[valid]
+        new = next_points.reshape(-1, 2)[valid]
+        if old.shape[0] < 8:
+            self.motion = CameraMotionState(captured_at=captured)
+            return
+        flow = new - old
+        median = np.median(flow, axis=0)
+        deviation = np.median(np.linalg.norm(flow - median, axis=1))
+        confidence = float(np.clip((old.shape[0] / 55.0) * (1.0 - deviation / 5.0), 0.0, 1.0))
+        flow_magnitude = float(np.median(np.linalg.norm(flow, axis=1)))
+        commanded_turn = abs(left_pwm - right_pwm) >= 18
+        yaw_rate = (
+            float(-median[0] / 160.0 * self._fov / elapsed)
+            if commanded_turn and confidence >= 0.25
+            else None
+        )
+        commanded_forward = left_pwm > 0 and right_pwm > 0
+        motion_observed = flow_magnitude >= 0.35
+        translation_scale = (
+            (1.0 if motion_observed else 0.20)
+            if commanded_forward and confidence >= 0.35
+            else 1.0
+        )
+        self.motion = CameraMotionState(
+            fresh=True,
+            confidence=confidence,
+            tracked_features=int(old.shape[0]),
+            yaw_rate_dps=yaw_rate,
+            translation_scale=translation_scale,
+            motion_observed=motion_observed,
+            captured_at=captured,
+        )
+
+    def tick(self, left_pwm: int = 0, right_pwm: int = 0) -> None:
         now = time.monotonic()
         if self.camera is None:
             if now >= self._next_camera_retry_at:
@@ -579,6 +731,7 @@ class CameraSafety:
         if frame is not None:
             self.frame = frame
             if sequence > self._last_camera_sequence:
+                self._update_motion(frame, captured, left_pwm, right_pwm)
                 self.worker.submit(sequence, frame, captured)
                 self._last_camera_sequence = sequence
                 self._last_frame_at = captured
@@ -815,6 +968,9 @@ class AutonomousPolicy:
             return self._set_output("L", -outer, -inner)
         return self._set_output("R", -inner, -outer)
 
+    def _reverse_straight(self) -> str:
+        return self._set_output("B", -self.min_move_pwm, -self.min_move_pwm)
+
     def _pivot_crawl(self, direction: str) -> str:
         """Rotate slowly around one stopped wheel, never as an endless pivot."""
         if direction == "L":
@@ -862,6 +1018,13 @@ class AutonomousPolicy:
     def _start_escape(self, lidar: SectorClearance, now: float, source: str) -> str:
         choice = self._choose_turn(lidar, now)
         if choice is None or choice[1] < 0.34:
+            if lidar.rear_m is not None and lidar.rear_m >= ESCAPE_REAR_CLEARANCE_M:
+                self._escape_phase = "REVERSE_SEARCH"
+                self._escape_phase_until = now + ESCAPE_REVERSE_SEARCH_SECONDS
+                self._escape_attempt = 1
+                self.reason = f"ESCAPE_REVERSE_SEARCH_{source}"
+                self.drive_confidence = 0.20
+                return self._reverse_straight()
             return self._mark_escape_blocked(lidar, now)
         if lidar.rear_m is None or lidar.rear_m < ESCAPE_REAR_CLEARANCE_M:
             if self._can_turn_without_reverse(lidar, choice[0], choice[1]):
@@ -975,7 +1138,30 @@ class AutonomousPolicy:
                     self.reason = f"ESCAPE_OPENING_TURN:{self.turn_command}"
                     self.drive_confidence = 0.25
                     return self._pivot_crawl(self.turn_command)
+            if (
+                (choice is None or choice[1] < 0.34)
+                and rear_clear
+                and now >= self._escape_phase_until
+            ):
+                self._escape_phase = "REVERSE_SEARCH"
+                self._escape_phase_until = now + ESCAPE_REVERSE_SEARCH_SECONDS
+                self.reason = "ESCAPE_REVERSE_SEARCH"
+                self.drive_confidence = 0.20
+                return self._reverse_straight()
             return self._hold_stop("STOP:BOXED_IN")
+
+        if self._escape_phase == "REVERSE_SEARCH":
+            if lidar.rear_m is None or lidar.rear_m < ESCAPE_REAR_CLEARANCE_M:
+                return self._hold_stop("STOP:ESCAPE_REAR_BLOCKED")
+            if now < self._escape_phase_until:
+                self.reason = "ESCAPE_REVERSE_SEARCH"
+                self.drive_confidence = 0.20
+                return self._reverse_straight()
+            choice = self._choose_turn(lidar, now)
+            if choice is None or choice[1] < 0.34:
+                return self._mark_escape_blocked(lidar, now)
+            self.turn_command = choice[0]
+            self._start_escape_turn(now)
 
         if self._escape_phase == "REVERSE":
             if lidar.rear_m is None or lidar.rear_m < ESCAPE_REAR_CLEARANCE_M:
@@ -1262,24 +1448,26 @@ class AutonomousPolicy:
         return self._set_output("F", left_pwm, right_pwm)
 
     def send(self, link: ArduinoLink, command: str, now: float) -> None:
-        # Refresh inside the Uno's 350 ms dead-man timeout, but do not spam the
-        # USB serial link or waste Pi/Uno CPU on redundant writes.
+        # Renew a short control lease every decision.  ArduinoLink refreshes
+        # the selected output independently, so bounded planner/display stalls
+        # cannot become audible motor dropouts while a healthy main loop runs.
         output = (self.left_pwm, self.right_pwm)
+        if link.differential_ready:
+            link.publish_drive(output[0], output[1])
+        else:
+            # The legacy L/R fallback is a counter-rotating pivot and was
+            # responsible for fast spins whenever CAPS DRIVE was missing or
+            # delayed.  Smooth autonomous motion requires current firmware.
+            link.send("STOP")
         if output != self._last_output or now - self.last_sent_at >= 0.12:
-            if link.differential_ready:
-                link.send(f"DRIVE {output[0]} {output[1]}")
-            else:
-                # The legacy L/R fallback is a counter-rotating pivot and was
-                # responsible for fast spins whenever CAPS DRIVE was missing or
-                # delayed.  Smooth autonomous motion requires current firmware.
-                link.send("STOP")
             self.last_command, self._last_output, self.last_sent_at = command, output, now
 
 
 def draw_dashboard(local_map: np.ndarray, policy: AutonomousPolicy,
                    clearance: SectorClearance, status: ArduinoStatus, person: bool,
                    camera_ready: bool, differential_ready: bool,
-                   imu: IMUState, slam_lite: SlamLiteState) -> np.ndarray:
+                   imu: IMUState, slam_lite: SlamLiteState,
+                   camera_motion: CameraMotionState | None = None) -> np.ndarray:
     panel = local_map.copy()
     cv2.rectangle(panel, (0, 0), (panel.shape[1], 182), (14, 22, 31), -1)
     front = "--" if clearance.front_m is None else f"{clearance.front_m:.2f}m"
@@ -1288,6 +1476,8 @@ def draw_dashboard(local_map: np.ndarray, policy: AutonomousPolicy,
     ultra = "--" if status.front_cm is None else f"{status.front_cm:.0f}cm"
     lidar_state = "LIVE" if clearance.fresh else "STALE"
     camera_state = "LIVE" if camera_ready else "STALE"
+    if camera_motion is not None and camera_motion.fresh:
+        camera_state += f" FLOW {camera_motion.confidence:.2f}/{camera_motion.tracked_features}"
     cv2.putText(panel, "VisionFSD Robot - LiDAR navigation", (12, 24),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, (238, 244, 250), 1, cv2.LINE_AA)
     cv2.putText(panel, f"POLICY {policy.reason}", (12, 49), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
@@ -1342,6 +1532,13 @@ def draw_dashboard(local_map: np.ndarray, policy: AutonomousPolicy,
                 f"xy {slam_lite.translation_confidence:.2f}",
                 (12, 169), cv2.FONT_HERSHEY_SIMPLEX, 0.37, (185, 205, 225), 1, cv2.LINE_AA)
     return panel
+
+
+def open_dashboard_window() -> None:
+    cv2.namedWindow(WINDOW_TITLE, cv2.WINDOW_NORMAL)
+    cv2.setWindowProperty(
+        WINDOW_TITLE, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -1418,7 +1615,7 @@ def main() -> int:
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
     if not args.no_display:
-        cv2.namedWindow(WINDOW_TITLE, cv2.WINDOW_AUTOSIZE)
+        open_dashboard_window()
     try:
         while keep_running:
             now = time.monotonic()
@@ -1440,7 +1637,7 @@ def main() -> int:
                     print("MPU-6050 calibrated; measured yaw enabled")
                     imu_calibration_reported = True
             policy.observe_imu(imu_state)
-            camera.tick()
+            camera.tick(policy.left_pwm, policy.right_pwm)
             clearance = lidar.clearance()
             status = arduino.status()
             camera_ready = camera.ready(now)
@@ -1450,8 +1647,20 @@ def main() -> int:
                 if imu_state.connected and imu_state.calibrated and imu_state.fresh
                 else None
             )
+            camera_motion = camera.motion
+            camera_flow_fresh = (
+                camera_motion.fresh
+                and now - camera_motion.captured_at <= 0.45
+                and camera_motion.confidence >= 0.25
+            )
             slam_lite = local_map.update(
-                points, policy.left_pwm, policy.right_pwm, now, imu_yaw_rate
+                points,
+                policy.left_pwm,
+                policy.right_pwm,
+                now,
+                imu_yaw_rate,
+                camera_motion.yaw_rate_dps if camera_flow_fresh else None,
+                camera_motion.translation_scale if camera_flow_fresh else 1.0,
             )
             policy.observe_pose(slam_lite)
             # Make the safety decision and refresh the Uno watchdog before the
@@ -1491,6 +1700,7 @@ def main() -> int:
                     f"imu={int(imu_state.fresh)} imu_cal={int(imu_state.calibrated)} "
                     f"gyro_z={imu_state.gyro_z_dps:+.1f} "
                     f"pose_yaw={slam_lite.yaw_source} "
+                    f"cam_flow={camera_motion.confidence:.2f} "
                     f"explore={exploration.mode} "
                     f"target_m={exploration.target_distance_m:.2f} "
                     f"bearing={exploration.heading_error_deg:+.0f} "
@@ -1522,6 +1732,7 @@ def main() -> int:
                     arduino.differential_ready,
                     imu_state,
                     slam_lite,
+                    camera_motion,
                 )
                 cv2.imshow(WINDOW_TITLE, panel)
                 if cv2.waitKey(1) & 0xFF in (27, ord("q"), ord("Q")):

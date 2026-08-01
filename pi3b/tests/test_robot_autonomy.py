@@ -23,6 +23,7 @@ from robot_autonomy import (
     SectorClearance,
     _sector_clearance,
     corridor_profile,
+    open_dashboard_window,
 )
 from robot_imu import IMUState
 from robot_slam_lite import SlamLiteState
@@ -193,16 +194,17 @@ class AutonomousPolicyTests(unittest.TestCase):
         )
         self.assertEqual(policy.reason, "ESCAPE_GEOMETRY_CHANGED:R")
 
-    def test_boxed_stop_rechecks_geometry_and_recovers_when_side_opens(self) -> None:
+    def test_ambiguous_sides_search_rear_then_use_new_opening(self) -> None:
         policy = AutonomousPolicy(0.0, 118)
         now = time.monotonic()
         blocked = ArduinoStatus(front_cm=15.0, motion="S", received_at=now)
         boxed = SectorClearance(0.30, 0.20, 0.20, True, 0.20, 0.20, None, 1.0)
-        self.assertEqual(policy.decide(boxed, blocked, False, now), "STOP")
+        self.assertEqual(policy.decide(boxed, blocked, False, now), "B")
+        self.assertEqual(policy.reason, "ESCAPE_REVERSE_SEARCH_ULTRASONIC")
         opened = SectorClearance(0.30, 1.5, 0.20, True, 1.4, 0.20, None, 1.0)
         self.assertEqual(policy.decide(opened, blocked, False, now + 0.53), "L")
         self.assertLess(policy.left_pwm, 0)
-        self.assertLess(policy.right_pwm, 0)
+        self.assertEqual(policy.right_pwm, 0)
 
     def test_corridor_profile_cannot_override_a_blocked_turn_side(self) -> None:
         policy = AutonomousPolicy(0.0, 118)
@@ -217,7 +219,7 @@ class AutonomousPolicyTests(unittest.TestCase):
         self.assertEqual(policy.decide(clearance, blocked, False, now), "R")
         self.assertEqual(policy.turn_command, "R")
 
-    def test_no_body_width_corridor_stops_as_boxed_in(self) -> None:
+    def test_no_forward_corridor_searches_clear_rear_before_boxed_stop(self) -> None:
         policy = AutonomousPolicy(0.0, 118)
         now = time.monotonic()
         status = ArduinoStatus(front_cm=80.0, motion="S", received_at=now)
@@ -225,8 +227,8 @@ class AutonomousPolicyTests(unittest.TestCase):
             0.60, 1.5, 0.70, True, 1.4, 0.70,
             np.full(STEER_HEADINGS.shape, 0.30, dtype=np.float32), 1.0,
         )
-        self.assertEqual(policy.decide(no_corridor, status, False, now), "STOP")
-        self.assertEqual(policy.reason, "STOP:BOXED_IN")
+        self.assertEqual(policy.decide(no_corridor, status, False, now), "B")
+        self.assertEqual(policy.reason, "ESCAPE_REVERSE_SEARCH_LD19")
 
     def test_recovery_commits_to_selected_side_after_front_clears(self) -> None:
         policy = AutonomousPolicy(0.0, 118)
@@ -455,6 +457,18 @@ class AutonomousPolicyTests(unittest.TestCase):
 
 
 class ArduinoLinkTests(unittest.TestCase):
+    def test_drive_heartbeat_refreshes_lease_then_expires_to_stop(self) -> None:
+        link = object.__new__(ArduinoLink)
+        link._drive_lock = __import__("threading").Lock()
+        link._drive_command = "DRIVE 110 112"
+        link._drive_lease_until = 10.4
+        link._drive_last_write = 10.0
+        link._drive_expired = False
+
+        self.assertEqual(link._heartbeat_command(10.1), "DRIVE 110 112")
+        self.assertEqual(link._heartbeat_command(10.5), "STOP")
+        self.assertIsNone(link._heartbeat_command(10.6))
+
     def test_capability_handshake_retries_until_drive_is_confirmed(self) -> None:
         link = object.__new__(ArduinoLink)
         link._supports_differential = False
@@ -503,6 +517,33 @@ class ArduinoLinkTests(unittest.TestCase):
 
 
 class CameraSafetyTests(unittest.TestCase):
+    def test_optical_flow_supplies_non_imu_turn_measurement(self) -> None:
+        safety = object.__new__(CameraSafety)
+        safety._fov = 70.0
+        safety._flow_gray = None
+        safety._flow_at = 0.0
+        safety.motion = None
+        rng = np.random.default_rng(7)
+        frame = rng.integers(0, 256, (240, 320, 3), dtype=np.uint8)
+        shifted = np.roll(frame, -4, axis=1)
+
+        safety._update_motion(frame, 1.0, 118, 90)
+        safety._update_motion(shifted, 1.1, 118, 90)
+
+        self.assertTrue(safety.motion.fresh)
+        self.assertGreater(safety.motion.confidence, 0.25)
+        self.assertIsNotNone(safety.motion.yaw_rate_dps)
+        self.assertGreater(safety.motion.yaw_rate_dps, 0.0)
+
+    def test_dashboard_window_opens_full_screen(self) -> None:
+        with (
+            mock.patch("robot_autonomy.cv2.namedWindow") as named,
+            mock.patch("robot_autonomy.cv2.setWindowProperty") as fullscreen,
+        ):
+            open_dashboard_window()
+        named.assert_called_once()
+        fullscreen.assert_called_once()
+
     def test_missing_camera_keeps_runtime_in_safe_stale_state(self) -> None:
         with (
             mock.patch("robot_autonomy.TFLiteVehicleDetector", return_value=object()),
@@ -562,6 +603,16 @@ class CorridorProfileTests(unittest.TestCase):
         profile = corridor_profile(behind)
         straight = profile[int(np.argmin(np.abs(STEER_HEADINGS)))]
         self.assertGreater(float(straight), 2.0)
+
+    def test_rear_corridor_ignores_obstacle_outside_robot_width(self) -> None:
+        points = [
+            (0, _Return(180, 1200)),
+            (1, _Return(177, 1200)),
+            (2, _Return(135, 220)),
+            (3, _Return(138, 225)),
+        ]
+        rear = corridor_profile(points, np.array([180.0], dtype=np.float32))[0]
+        self.assertGreater(float(rear), 1.0)
 
     def test_isolated_lidar_speckle_does_not_block_a_clear_corridor(self) -> None:
         speckle = [(0, _Return(0, 180, confidence=20))]

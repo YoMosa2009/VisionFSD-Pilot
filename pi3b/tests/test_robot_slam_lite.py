@@ -14,9 +14,9 @@ from robot_slam_lite import LidarSlamLite
 
 
 class SlamLiteTests(unittest.TestCase):
-    def test_default_map_uses_two_and_a_half_centimetre_cells(self) -> None:
+    def test_default_map_uses_about_two_centimetre_cells(self) -> None:
         mapper = LidarSlamLite()
-        self.assertAlmostEqual(mapper.metres / mapper.cells, 0.025, places=3)
+        self.assertAlmostEqual(mapper.metres / mapper.cells, 0.0208, places=3)
         self.assertEqual(mapper.BIN_COUNT, 360)
 
     def test_one_degree_bins_keep_the_nearest_duplicate_return(self) -> None:
@@ -128,6 +128,31 @@ class SlamLiteTests(unittest.TestCase):
         mapper.integrate_motion(105, 0, 1.1, imu_yaw_rate_dps=None)
 
         self.assertEqual(mapper.state().yaw_source, "COMMAND+LD19")
+
+    def test_camera_flow_refines_command_yaw_when_direction_agrees(self) -> None:
+        mapper = LidarSlamLite()
+        mapper.integrate_motion(118, 90, 1.0)
+        mapper.integrate_motion(
+            118, 90, 1.1, camera_yaw_rate_dps=40.0
+        )
+
+        self.assertEqual(mapper.state().yaw_source, "COMMAND+CAMERA+LD19")
+        command_only_delta = ((118 - 90) / 255.0) * 130.0 * 0.1
+        self.assertGreater(mapper.heading, command_only_delta)
+
+    def test_camera_no_motion_reduces_uncertain_forward_prediction(self) -> None:
+        normal = LidarSlamLite()
+        reduced = LidarSlamLite()
+        normal.integrate_motion(118, 118, 1.0)
+        reduced.integrate_motion(118, 118, 1.0)
+        normal.integrate_motion(118, 118, 1.1)
+        reduced.integrate_motion(
+            118, 118, 1.1, camera_translation_scale=0.20
+        )
+
+        normal_distance = 4.0 - normal.y
+        reduced_distance = 4.0 - reduced.y
+        self.assertAlmostEqual(reduced_distance / normal_distance, 0.20, places=2)
 
 
 if __name__ == "__main__":

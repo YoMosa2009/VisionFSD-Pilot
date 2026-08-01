@@ -47,7 +47,7 @@ class LidarSlamLite:
     MIN_MATCH_BINS = 75
     MAX_SCAN_AGE_S = 0.35
 
-    def __init__(self, cells: int = 320, metres: float = 8.0) -> None:
+    def __init__(self, cells: int = 384, metres: float = 8.0) -> None:
         self.cells = cells
         self.metres = metres
         self.grid = np.zeros((cells, cells), dtype=np.uint8)
@@ -66,6 +66,7 @@ class LidarSlamLite:
         self._map_updates = 0
         self._latest_hits = np.empty((0, 2), dtype=np.int32)
         self._using_imu = False
+        self._using_camera = False
         self._translation_confidence = 0.0
         self._translation_correction_m = 0.0
         self._translation_matched = False
@@ -135,11 +136,23 @@ class LidarSlamLite:
             np.nan,
         )
         residuals = np.nanmedian(residual_matrix, axis=1)
+        residual_by_row = np.full(shifts.size, np.nan, dtype=np.float32)
+        residual_by_row[eligible] = residuals
         order = np.argsort(residuals)
         best_row = int(eligible[order[0]])
         best_residual = float(residuals[order[0]])
         runner_residual = float(residuals[order[1]])
-        best_shift = int(shifts[best_row])
+        best_shift = float(shifts[best_row])
+        if 0 < best_row < shifts.size - 1:
+            left_residual = float(residual_by_row[best_row - 1])
+            right_residual = float(residual_by_row[best_row + 1])
+            denominator = left_residual - 2.0 * best_residual + right_residual
+            if np.isfinite(left_residual + right_residual) and denominator > 1e-6:
+                best_shift += float(np.clip(
+                    0.5 * (left_residual - right_residual) / denominator,
+                    -0.5,
+                    0.5,
+                ))
         count = int(counts[best_row])
         separation = runner_residual - best_residual
         confidence = float(np.clip((separation / 0.035) * (count / self.BIN_COUNT), 0.0, 1.0))
@@ -159,6 +172,8 @@ class LidarSlamLite:
         right_pwm: int,
         now: float,
         imu_yaw_rate_dps: float | None = None,
+        camera_yaw_rate_dps: float | None = None,
+        camera_translation_scale: float = 1.0,
     ) -> None:
         if self._last_motion_at is None:
             self._last_motion_at = now
@@ -167,15 +182,28 @@ class LidarSlamLite:
         self._last_motion_at = now
         # These deliberately conservative values are only a prediction used by
         # the visual local map.  They are not odometry and never control drive.
-        linear_mps = ((left_pwm + right_pwm) * 0.5 / 255.0) * 0.26
+        linear_mps = (
+            ((left_pwm + right_pwm) * 0.5 / 255.0)
+            * 0.26
+            * float(np.clip(camera_translation_scale, 0.15, 1.0))
+        )
         self._using_imu = imu_yaw_rate_dps is not None
+        self._using_camera = False
         # The mapper's heading increases clockwise; robot-frame +Z gyro is
         # counter-clockwise.  Negate the IMU rate to preserve map convention.
-        turn_rate_dps = (
-            -imu_yaw_rate_dps
-            if imu_yaw_rate_dps is not None
-            else ((left_pwm - right_pwm) / 255.0) * 130.0
-        )
+        command_turn_rate = ((left_pwm - right_pwm) / 255.0) * 130.0
+        if imu_yaw_rate_dps is not None:
+            turn_rate_dps = -imu_yaw_rate_dps
+        elif (
+            camera_yaw_rate_dps is not None
+            and abs(command_turn_rate) >= 4.0
+            and command_turn_rate * camera_yaw_rate_dps > 0.0
+        ):
+            camera_rate = float(np.clip(camera_yaw_rate_dps, -180.0, 180.0))
+            turn_rate_dps = command_turn_rate * 0.65 + camera_rate * 0.35
+            self._using_camera = True
+        else:
+            turn_rate_dps = command_turn_rate
         yaw_delta = turn_rate_dps * elapsed
         self.heading = (self.heading + yaw_delta) % 360.0
         self._yaw_since_scan += yaw_delta
@@ -209,14 +237,14 @@ class LidarSlamLite:
         )
         valid = (
             (distances >= 0.15)
-            & (distances <= min(4.5, self.metres * 0.55))
+            & (distances <= min(5.6, self.metres * 0.72))
             & (confidence >= 35.0)
         )
         distances = distances[valid]
         angles = angles[valid]
         if distances.size < 35:
             return 0.0, 0.0, 0.0, False
-        stride = max(1, distances.size // 140)
+        stride = max(1, distances.size // 180)
         distances = distances[::stride]
         angles = angles[::stride]
         scale = self.cells / self.metres
@@ -236,8 +264,8 @@ class LidarSlamLite:
             return 0.0, 0.0, 0.0, False
 
         candidates: list[tuple[float, int, int]] = []
-        for row_offset in range(-4, 5):
-            for col_offset in range(-4, 5):
+        for row_offset in range(-5, 6):
+            for col_offset in range(-5, 6):
                 score = float(np.mean(
                     self.grid[
                         base_rows + row_offset,
@@ -300,7 +328,7 @@ class LidarSlamLite:
             )
             valid = (
                 (distances >= 0.10)
-                & (distances <= self.metres * 0.62)
+                & (distances <= self.metres * 0.72)
                 & (confidence >= 20.0)
             )
             distances = distances[valid]
@@ -316,7 +344,7 @@ class LidarSlamLite:
             robot_col = int(np.clip(round(self.x * scale), 0, self.cells - 1))
             robot_row = int(np.clip(round(self.y * scale), 0, self.cells - 1))
             ray_count = hit_rows.size
-            ray_stride = max(1, ray_count // 180)
+            ray_stride = max(1, ray_count // 240)
             for hit_row, hit_col in zip(
                 hit_rows[::ray_stride], hit_cols[::ray_stride]
             ):
@@ -363,8 +391,17 @@ class LidarSlamLite:
         right_pwm: int,
         now: float,
         imu_yaw_rate_dps: float | None = None,
+        camera_yaw_rate_dps: float | None = None,
+        camera_translation_scale: float = 1.0,
     ) -> SlamLiteState:
-        self.integrate_motion(left_pwm, right_pwm, now, imu_yaw_rate_dps)
+        self.integrate_motion(
+            left_pwm,
+            right_pwm,
+            now,
+            imu_yaw_rate_dps,
+            camera_yaw_rate_dps,
+            camera_translation_scale,
+        )
         bins, scan_stamp = self.bins_from_points(points)
         self._matched = False
         self._translation_matched = False
@@ -419,7 +456,13 @@ class LidarSlamLite:
             self._translation_correction_m,
             self._translation_matched,
             int(np.count_nonzero(self.observed)),
-            "IMU+LD19" if self._using_imu else "COMMAND+LD19",
+            (
+                "IMU+LD19"
+                if self._using_imu
+                else "COMMAND+CAMERA+LD19"
+                if self._using_camera
+                else "COMMAND+LD19"
+            ),
         )
 
     def render(

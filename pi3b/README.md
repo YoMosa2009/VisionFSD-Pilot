@@ -182,8 +182,10 @@ move during that interval. Afterwards its authority order is fixed:
 
 1. A stale Uno, LD19, or webcam stops the robot; it will not drive blind.
 2. A confirmed person in the camera's forward path stops it. Camera inference
-   remains a safety gate, but camera frames are not rendered in the robot
-   display to reduce Pi 3B display work.
+   remains a safety gate. Low-resolution optical flow also provides a bounded
+   non-IMU yaw cue during turns and reduces false commanded map translation
+   when a high-confidence textured view shows no movement. It is not odometry.
+   Camera frames are not rendered, keeping camera/display work small on Pi 3B.
 3. During standby, the mapper distinguishes observed free space from unknown
    space and persistent obstacle returns. A frontier planner selects a reachable
    unexplored boundary, plans around inflated obstacles, and supplies a
@@ -205,9 +207,12 @@ move during that interval. Afterwards its authority order is fixed:
    88 degrees; a 2.4-second bound applies if IMU yaw is unavailable. It may try
    the opposite side once. It stops as `STOP:BOXED_IN` when neither bounded
    attempt has a safe side/rear path, and automatically rechecks materially
-   changed geometry. If reversing is blocked but one complete turn sweep has at
-   least 55 cm clearance, it begins the same bounded slow turn directly instead
-   of giving up despite that opening.
+   changed geometry. Rear safety is a robot-width swept corridor rather than
+   the closest point in a broad rear sector. When that corridor is clear but
+   both sides are ambiguous, one short straight reverse search obtains a new
+   view before declaring itself boxed in. If reversing is blocked but one
+   complete turn sweep has at least 55 cm clearance, it begins the same bounded
+   slow turn directly instead of giving up despite that opening.
 6. Uno ultrasonic hard-stop (under 18 cm) always wins and blocks forward
    motor commands even if the Pi fails.
 7. A live, calibrated MPU-6050 supplies measured yaw rate to the local mapper
@@ -218,8 +223,9 @@ move during that interval. Afterwards its authority order is fixed:
    available, retaining the same 2.4-second hard timeout as the final bound.
 
 This keeps roles separate: LD19 geometry chooses an open direction, the camera
-prevents movement toward confirmed people, and the Uno enforces the final
-close-range stop. A camera classification never overrides measured range data.
+prevents movement toward confirmed people and supplies only bounded pose cues,
+and the Uno enforces the final close-range stop. Camera output never overrides
+measured LiDAR or ultrasonic safety.
 
 The motor battery in the described 9 V-style holder is not adequate for
 autonomous testing: voltage sag can still cause buzzing, stuttering, or a
@@ -230,23 +236,26 @@ The runtime no longer translates steering into legacy `L`/`R` commands while
 waiting for `CAPS DRIVE`; those commands are fast counter-rotating pivots. It
 holds STOP unless the dashboard reports `UNO DIFFERENTIAL`. The Pi retries the
 capability request every 0.5 seconds until it receives that exact response.
-The LiDAR-only dashboard shows commanded PWM, Uno-reported actual PWM, the Uno
+The full-screen LiDAR-only dashboard shows commanded PWM, Uno-reported actual PWM, the Uno
 ultrasonic `blocked` flag, `MPU-6050 CALIBRATING/LIVE/STALE`, frontier/patrol
 mode, target bearing/range, frontier count, observed-map coverage, and latest
-planner time so a software STOP is distinguishable from a motor-power or sensor
-problem.
+planner time. It also reports camera-flow confidence. The occupancy grid uses
+about 2.1 cm cells, up to 240 current-scan free-space rays, and useful LD19
+returns up to 5.8 m where map bounds permit. These software changes do not
+increase the LD19's physical range or create true odometry.
 
 Camera startup defaults to `auto`. The runtime tries stable V4L by-id paths and
 camera indexes 0 through 7. If no webcam currently delivers frames, the LiDAR
 dashboard remains open in `CAMERA STALE` safe-STOP mode and retries instead of
-terminating the complete robot runtime.
+terminating the complete robot runtime. Optical-flow pose assistance assumes the
+webcam is rigidly mounted and faces forward; low-confidence flow is ignored.
 
 `run_robot.sh` holds a process lock before opening USB devices. This prevents
 XDG and compositor autostart entries from launching two robot processes that
 compete for the same webcam and serial ports. Linux V4L device paths are opened
 directly through the V4L2 backend rather than GStreamer. Robot-mode capture is
-320x240 at 15 FPS because the camera is a safety veto, not a displayed steering
-sensor; this reduces Pi 3B USB buffer and CPU pressure.
+320x240 at 15 FPS. Optical flow uses a 160x120 grayscale copy and the camera
+image is not displayed; this limits Pi 3B USB, display, and CPU pressure.
 
 ### MPU-6050 yaw sensing
 

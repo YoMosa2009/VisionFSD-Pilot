@@ -149,10 +149,13 @@ encoders, loop closure, or absolute position reference.
 If the MPU-6050 is missing or stale, the same occupancy, frontier, A*, waypoint,
 patrol, and live-corridor stack remains active. Turn prediction uses differential
 motor commands and is corrected by successive LD19 scans; recovery turns use
-that corrected map heading instead of relying only on elapsed time. In v1.8.2,
-motor safety decisions and watchdog refreshes run before bounded global planning,
-the cached route advances continuously between replans, and a clearly open side
-can start a bounded turn when reversing is unavailable.
+that corrected map heading instead of relying only on elapsed time. In v1.8.3,
+a fail-safe leased heartbeat refreshes the selected motor output independently
+of camera/display/planner scheduling, rear clearance uses a body-width LiDAR
+corridor, and an ambiguous side view can trigger a short straight reverse search
+instead of an immediate boxed-in stop. The full-screen dashboard remains
+LiDAR-only, while low-cost webcam optical flow cautiously refines non-IMU yaw and
+suppresses false commanded translation when a well-textured view shows no motion.
 
 It is not vehicle autonomy and is not robust room-scale SLAM. Do not run it
 unsupervised, near stairs, pets, people, or property that can be damaged.
