@@ -81,6 +81,9 @@ fi
 configure_sparse_checkout
 
 PI_ROOT="$INSTALL_ROOT/pi3b"
+# Install persistent MCP2221 permissions and native build prerequisites before
+# pip may need to build hidapi. A marker makes this a one-time system step.
+bash "$PI_ROOT/setup_mcp2221.sh"
 python3 -m venv --system-site-packages "$PI_ROOT/.venv"
 "$PI_ROOT/.venv/bin/python" -m pip install --upgrade pip
 "$PI_ROOT/.venv/bin/python" -m pip install -r "$PI_ROOT/requirements.txt"
@@ -106,7 +109,8 @@ chmod +x \
   "$PI_ROOT/recover-update.sh" \
   "$PI_ROOT/sync_primary_model.sh" \
   "$PI_ROOT/run_lidar.sh" \
-  "$PI_ROOT/run_robot.sh"
+  "$PI_ROOT/run_robot.sh" \
+  "$PI_ROOT/setup_mcp2221.sh"
 bash "$PI_ROOT/sync_primary_model.sh" "$PI_ROOT"
 
 if [[ "$ROBOT_AUTOSTART" == true ]]; then

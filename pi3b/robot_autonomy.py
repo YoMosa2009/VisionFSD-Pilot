@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Conservative Pi 3B robot runtime for LD19, camera, Uno and MPU-6050.
+"""Conservative Pi 3B robot runtime for LD19, camera, Uno and optional IMU.
 
 The Pi is the high-level planner.  The Uno is the real-time motor and
 front-ultrasonic safety controller.  A missing serial link, stale LiDAR data,
 or a close obstacle therefore always results in STOP rather than a guessed
 movement command.
 
-This is deliberately a low-speed indoor demonstrator.  The MPU-6050 improves
+This is deliberately a low-speed indoor demonstrator.  A supported IMU improves
 short-term yaw prediction, but the chassis still has no wheel encoders or
 absolute heading sensor.  Its local map remains approximate and is not a claim
 of metric SLAM.
@@ -31,7 +31,7 @@ from serial.tools import list_ports
 
 from lidar_visualizer import LD19Parser, LivePolarMap
 from robot_explorer import ExplorationState, FrontierExplorer
-from robot_imu import IMUState, MPU6050Link
+from robot_imu import AutoIMULink, IMUState
 from robot_slam_lite import LidarSlamLite, SlamLiteState
 from visionfsd_pi import (
     LatestCamera,
@@ -1465,7 +1465,7 @@ def draw_dashboard(local_map: np.ndarray, policy: AutonomousPolicy,
         limiter = " RATE LIMIT" if policy.imu_limited else ""
         imu_state = f"LIVE  YAW {imu.yaw_deg:+.1f}deg  RATE {imu.gyro_z_dps:+.1f}dps{limiter}"
         imu_color = (90, 235, 130)
-    cv2.putText(panel, f"MPU-6050 {imu_state}", (12, 121),
+    cv2.putText(panel, f"IMU {imu.source} {imu_state}", (12, 121),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.37, imu_color, 1, cv2.LINE_AA)
     exploration = policy.exploration
     exploration_state = (
@@ -1520,9 +1520,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--imu-bus", type=int, default=1)
     parser.add_argument("--imu-address", type=lambda value: int(value, 0), default=0x68)
     parser.add_argument("--imu-mount-yaw-deg", type=float, default=180.0,
-                        help="MPU board yaw relative to robot frame; this chassis uses 180")
+                        help="IMU board yaw relative to robot frame; this chassis uses 180")
     parser.add_argument("--no-imu", action="store_true",
-                        help="Disable MPU-6050 and use command-only map yaw prediction")
+                        help="Disable USB/GPIO IMUs and use camera+LD19 pose prediction")
     parser.add_argument("--no-display", action="store_true")
     return parser.parse_args()
 
@@ -1544,12 +1544,12 @@ def main() -> int:
     arduino = ArduinoLink(arduino_port)
     lidar = LD19Link(lidar_port, args.lidar_front_offset_deg)
     camera = CameraSafety(args.camera, args.fov)
-    imu = None if args.no_imu else MPU6050Link(
+    imu = None if args.no_imu else AutoIMULink(
         args.imu_bus, args.imu_address, args.imu_mount_yaw_deg
     )
     print(
         f"VisionFSD Robot: Uno={arduino_port}, LD19={lidar_port}, "
-        f"camera request={args.camera}, IMU={'disabled' if imu is None else hex(args.imu_address)}"
+        f"camera request={args.camera}, IMU={'disabled' if imu is None else 'auto USB/GPIO'}"
     )
     policy = AutonomousPolicy(args.standby_seconds, args.speed, args.min_move_pwm)
     # The map supplies a long-horizon exploration heading.  Current LD19
@@ -1563,7 +1563,7 @@ def main() -> int:
     next_telemetry_at = 0.0
     last_policy_state: tuple[str, str, str] | None = None
     last_imu_error: str | None = None
-    imu_calibration_reported = False
+    calibrated_source: str | None = None
     keep_running = True
 
     def stop(_signum: int, _frame: object) -> None:
@@ -1584,16 +1584,13 @@ def main() -> int:
                 )
                 if imu_state.error != last_imu_error:
                     if imu_state.error:
-                        print(
-                            "MPU-6050 unavailable; LD19+command pose active: "
-                            f"{imu_state.error}"
-                        )
+                        print(f"IMU unavailable; camera+LD19 pose active: {imu_state.error}")
                     elif last_imu_error:
-                        print("MPU-6050 reconnected; calibrating while stationary")
+                        print(f"{imu_state.source} connected; calibrating while stationary")
                     last_imu_error = imu_state.error
-                if imu_state.calibrated and not imu_calibration_reported:
-                    print("MPU-6050 calibrated; measured yaw enabled")
-                    imu_calibration_reported = True
+                if imu_state.calibrated and imu_state.source != calibrated_source:
+                    print(f"{imu_state.source} calibrated; measured yaw enabled")
+                    calibrated_source = imu_state.source
             policy.observe_imu(imu_state)
             camera.tick(policy.left_pwm, policy.right_pwm)
             clearance = lidar.clearance()

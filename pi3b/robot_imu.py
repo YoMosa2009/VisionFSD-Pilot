@@ -1,14 +1,15 @@
-"""Low-cost MPU-6050 sampling for the Raspberry Pi robot runtime.
+"""Optional USB LSM6DS3 and GPIO MPU-6050 sampling for the Pi runtime.
 
 The IMU improves short-term yaw prediction and turn-rate limiting.  It does
-not provide absolute heading or position because the MPU-6050 has no
+not provide absolute heading or position because neither configured IMU has a
 magnetometer and the chassis has no wheel encoders.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
+import os
 import statistics
 import time
 from typing import Callable, Protocol
@@ -48,6 +49,49 @@ class IMUState:
     temperature_c: float = 0.0
     updated_at: float = 0.0
     error: str | None = None
+    source: str = "NONE"
+
+
+class _MCP2221Bus:
+    """SMBus-shaped adapter over Blinka's MCP2221 USB-I2C transport."""
+
+    def __init__(self) -> None:
+        os.environ["BLINKA_MCP2221"] = "1"
+        import board
+
+        self._i2c = board.I2C()
+        deadline = time.monotonic() + 1.0
+        while not self._i2c.try_lock():
+            if time.monotonic() >= deadline:
+                if hasattr(self._i2c, "deinit"):
+                    self._i2c.deinit()
+                raise OSError("MCP2221 I2C lock timed out")
+            time.sleep(0.01)
+        self._closed = False
+
+    def read_byte_data(self, address: int, register: int) -> int:
+        return self.read_i2c_block_data(address, register, 1)[0]
+
+    def write_byte_data(self, address: int, register: int, value: int) -> None:
+        self._i2c.writeto(address, bytes((register & 0xFF, value & 0xFF)))
+
+    def read_i2c_block_data(
+        self, address: int, register: int, length: int
+    ) -> list[int]:
+        result = bytearray(length)
+        self._i2c.writeto_then_readfrom(
+            address, bytes((register & 0xFF,)), result
+        )
+        return list(result)
+
+    def close(self) -> None:
+        if not self._closed:
+            self._closed = True
+            self._i2c.unlock()
+
+
+def _mcp2221_bus_factory(_bus_number: int) -> _SMBusLike:
+    return _MCP2221Bus()
 
 
 class MPU6050Link:
@@ -63,6 +107,7 @@ class MPU6050Link:
     EXPECTED_IDS = (0x68, 0x69)
     RETRY_SECONDS = 1.0
     MAX_SAMPLE_AGE_S = 0.25
+    SENSOR_NAME = "MPU-6050"
 
     def __init__(
         self,
@@ -242,6 +287,7 @@ class MPU6050Link:
             temperature_c=self._temperature_c,
             updated_at=self._last_sample_at,
             error=self._error,
+            source=self.SENSOR_NAME,
         )
 
     def close(self) -> None:
@@ -251,3 +297,142 @@ class MPU6050Link:
                 bus.close()
             except Exception:
                 pass
+
+
+class LSM6DS3MCP2221Link(MPU6050Link):
+    """LSM6DS3 sampled through the MCP2221A USB-I2C adapter."""
+
+    WHO_AM_I = 0x0F
+    CTRL1_XL = 0x10
+    CTRL2_G = 0x11
+    CTRL3_C = 0x12
+    DATA_START = 0x20
+    EXPECTED_IDS = (0x69,)
+    SENSOR_NAME = "LSM6DS3 USB"
+
+    def __init__(
+        self,
+        address: int | None = None,
+        mount_yaw_deg: float = 180.0,
+        calibration_samples: int = 80,
+        bus_factory: Callable[[int], _SMBusLike] | None = None,
+    ) -> None:
+        super().__init__(
+            bus_number=0,
+            address=0x6A if address is None else address,
+            mount_yaw_deg=mount_yaw_deg,
+            calibration_samples=calibration_samples,
+            bus_factory=bus_factory or _mcp2221_bus_factory,
+        )
+        self._candidate_addresses = (
+            (0x6A, 0x6B) if address is None else (address,)
+        )
+
+    @classmethod
+    def _decode_block(
+        cls, data: list[int]
+    ) -> tuple[float, float, float, float, float, float, float]:
+        if len(data) != 14:
+            raise OSError(f"LSM6DS3 returned {len(data)} bytes, expected 14")
+
+        def signed16_le(offset: int) -> int:
+            value = data[offset] | (data[offset + 1] << 8)
+            return value - 65536 if value >= 32768 else value
+
+        temperature = signed16_le(0)
+        gx, gy, gz = (signed16_le(offset) for offset in (2, 4, 6))
+        ax, ay, az = (signed16_le(offset) for offset in (8, 10, 12))
+        return (
+            ax * 0.000061,
+            ay * 0.000061,
+            az * 0.000061,
+            25.0 + temperature / 16.0,
+            gx * 0.00875,
+            gy * 0.00875,
+            gz * 0.00875,
+        )
+
+    def _connect(self, now: float) -> bool:
+        bus: _SMBusLike | None = None
+        try:
+            bus = self._bus_factory(self.bus_number)
+            errors: list[str] = []
+            for address in self._candidate_addresses:
+                try:
+                    identity = bus.read_byte_data(address, self.WHO_AM_I)
+                except Exception as exc:
+                    errors.append(f"0x{address:02X}: {exc}")
+                    continue
+                if identity in self.EXPECTED_IDS:
+                    self.address = address
+                    break
+                errors.append(f"0x{address:02X}: WHO_AM_I 0x{identity:02X}")
+            else:
+                raise OSError("LSM6DS3 not found (" + "; ".join(errors) + ")")
+            # 104 Hz, +/-2 g accelerometer; 104 Hz, +/-245 dps gyro;
+            # block-data update and automatic register increment enabled.
+            bus.write_byte_data(self.address, self.CTRL1_XL, 0x40)
+            bus.write_byte_data(self.address, self.CTRL2_G, 0x40)
+            bus.write_byte_data(self.address, self.CTRL3_C, 0x44)
+            self._bus = bus
+            self._error = None
+            return True
+        except Exception as exc:
+            if bus is not None:
+                try:
+                    bus.close()
+                except Exception:
+                    pass
+            self._bus = None
+            self._error = str(exc)
+            self._next_connect_at = now + self.RETRY_SECONDS
+            return False
+
+
+class AutoIMULink:
+    """Prefer USB LSM6DS3, falling back to the existing GPIO MPU-6050."""
+
+    def __init__(
+        self,
+        mpu_bus: int = 1,
+        mpu_address: int = 0x68,
+        mount_yaw_deg: float = 180.0,
+        lsm_address: int | None = None,
+        lsm_link: LSM6DS3MCP2221Link | None = None,
+        mpu_link: MPU6050Link | None = None,
+    ) -> None:
+        self._lsm = lsm_link or LSM6DS3MCP2221Link(
+            address=lsm_address, mount_yaw_deg=mount_yaw_deg
+        )
+        self._mpu = mpu_link or MPU6050Link(
+            bus_number=mpu_bus,
+            address=mpu_address,
+            mount_yaw_deg=mount_yaw_deg,
+        )
+        self._using_lsm = False
+
+    def tick(self, now: float | None = None, stationary: bool = True) -> IMUState:
+        now = time.monotonic() if now is None else now
+        lsm_state = self._lsm.tick(now, stationary)
+        if lsm_state.connected:
+            self._using_lsm = True
+            return lsm_state
+        self._using_lsm = False
+        mpu_state = self._mpu.tick(now, stationary)
+        if mpu_state.connected:
+            return mpu_state
+        return replace(
+            mpu_state,
+            error=(
+                f"LSM6DS3 USB: {lsm_state.error or 'not found'}; "
+                f"MPU-6050 GPIO: {mpu_state.error or 'not found'}"
+            ),
+            source="AUTO",
+        )
+
+    def state(self, now: float | None = None) -> IMUState:
+        return (self._lsm if self._using_lsm else self._mpu).state(now)
+
+    def close(self) -> None:
+        self._lsm.close()
+        self._mpu.close()

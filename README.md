@@ -138,8 +138,9 @@ commands/status over the Uno's normal USB cable. It starts with a 25-second
 no-motion standby, uses hysteresis and direction locking for stable LiDAR-guided
 arcs, and uses a bounded reverse-turn-commit recovery sequence when a close
 obstacle blocks forward progress. It then resumes live corridor planning instead
-of latching a terminal stop. A Pi-connected MPU-6050 bounds recovery turns by
-measured short-term yaw and supplies yaw to an 8 m occupancy map. The runtime
+of latching a terminal stop. A USB LSM6DS3 through an MCP2221A, or the existing
+GPIO MPU-6050 fallback, bounds recovery turns by measured short-term yaw and
+supplies yaw to an 8 m occupancy map. The runtime
 marks observed free space, selects reachable unexplored frontiers, plans a
 collision-inflated grid route, and uses its next waypoint as long-horizon
 guidance. Current LD19 geometry still authorizes every motor direction. LD19
@@ -147,7 +148,7 @@ scan matching supplies cautious yaw and translation correction, but this remains
 estimated navigation rather than true metric SLAM because the kit has no wheel
 encoders, loop closure, or absolute position reference.
 
-If the MPU-6050 is missing or stale, the same occupancy, frontier, A*, waypoint,
+If both IMUs are missing or stale, the same occupancy, frontier, A*, waypoint,
 patrol, and live-corridor stack remains active. Turn prediction uses differential
 motor commands and is corrected by successive LD19 scans; recovery turns use
 that corrected map heading instead of relying only on elapsed time. In v1.8.4,
@@ -158,7 +159,10 @@ recovery. A close straight obstacle with an open curved path therefore remains
 continuous forward differential motion. Recovery uses less-sensitive thresholds,
 prefers a bounded turn over reversing when safe, and ignores unconfirmed isolated
 LD19 returns. Camera neural inference was removed from robot mode; optical flow
-continues to refine non-IMU pose without spending CPU on person detection.
+continues to refine non-IMU pose without spending CPU on person detection. In
+v1.9.0 the normal updater performs the one-time MCP2221 Linux setup and installs
+its Python transport. Robot startup probes LSM6DS3 addresses `0x6A` and `0x6B`,
+prefers the USB sensor when live, and retains GPIO/non-IMU fallbacks.
 
 It is not vehicle autonomy and is not robust room-scale SLAM. Do not run it
 unsupervised, near stairs, pets, people, or property that can be damaged.

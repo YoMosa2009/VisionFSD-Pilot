@@ -205,7 +205,7 @@ move during that interval. Afterwards its authority order is fixed:
    a short LiDAR-cleared reverse curve with
    both wheels driven, a slow one-wheel reverse turn toward the best full
    body-width LiDAR corridor, then a short forward commit and immediate return
-   to live corridor planning. A calibrated MPU-6050 releases the turn after
+   to live corridor planning. A calibrated USB LSM6DS3 or GPIO MPU-6050 releases the turn after
    measured yaw reaches the clear corridor and hard-limits each turn to
    88 degrees; a 2.4-second bound applies if IMU yaw is unavailable. It may try
    the opposite side once. It stops as `STOP:BOXED_IN` when neither bounded
@@ -218,7 +218,7 @@ move during that interval. Afterwards its authority order is fixed:
    slow turn directly instead of giving up despite that opening.
 6. Uno ultrasonic hard-stop (under 18 cm) always wins and blocks forward
    motor commands even if the Pi fails.
-7. A live, calibrated MPU-6050 supplies measured yaw rate to the local mapper
+7. A live, calibrated USB LSM6DS3 or GPIO MPU-6050 supplies measured yaw rate to the local mapper
    and recovery controller, and progressively removes steering split above
    38 deg/s, reaching zero additional split at 55 deg/s. If the IMU is absent
    or stale, navigation continues with command-predicted yaw corrected by
@@ -240,7 +240,7 @@ waiting for `CAPS DRIVE`; those commands are fast counter-rotating pivots. It
 holds STOP unless the dashboard reports `UNO DIFFERENTIAL`. The Pi retries the
 capability request every 0.5 seconds until it receives that exact response.
 The full-screen LiDAR-only dashboard shows commanded PWM, Uno-reported actual PWM, the Uno
-ultrasonic `blocked` flag, `MPU-6050 CALIBRATING/LIVE/STALE`, frontier/patrol
+ultrasonic `blocked` flag, `IMU LSM6DS3 USB CALIBRATING/LIVE/STALE`, frontier/patrol
 mode, target bearing/range, frontier count, observed-map coverage, and latest
 planner time. It also reports camera-flow confidence. The occupancy grid uses
 about 2.1 cm cells, up to 240 current-scan free-space rays, and useful LD19
@@ -260,9 +260,31 @@ directly through the V4L2 backend rather than GStreamer. Robot-mode capture is
 320x240 at 15 FPS. Optical flow uses a 160x120 grayscale copy and the camera
 image is not displayed; this limits Pi 3B USB, display, and CPU pressure.
 
-### MPU-6050 yaw sensing
+### Automatic USB LSM6DS3 yaw sensing
 
-The MPU-6050 is connected directly to Pi I2C bus 1 at address `0x68`:
+The preferred IMU path is:
+
+```text
+LSM6DS3 STEMMA QT -> MCP2221A I2C -> MCP2221A USB-C -> Pi USB-A
+```
+
+Keep the board rigid, flat, and component-side up. The normal updater installs
+the Linux prerequisites and Python USB transport, writes persistent MCP2221A
+USB permissions, and prevents the optional kernel MCP2221 driver from competing
+with the userspace transport. That system setup is recorded once and skipped on
+later updates. Every robot boot still opens and validates the sensor because an
+IMU cannot remain open across a power cycle.
+
+At startup the runtime automatically checks both normal LSM6DS3 I2C addresses,
+`0x6A` and `0x6B`, and accepts the sensor only when its identity register returns
+`0x69`. No manual `modprobe`, I2C scan, or launch command is required. During the
+25-second stationary standby, the dashboard should change from
+`IMU LSM6DS3 USB CALIBRATING` to `IMU LSM6DS3 USB LIVE`.
+
+### GPIO MPU-6050 fallback
+
+The previous MPU-6050 remains supported as an automatic fallback on Pi I2C bus
+1 at address `0x68`:
 
 | MPU-6050 | Pi physical pin |
 | --- | --- |
@@ -283,15 +305,15 @@ export VISIONFSD_IMU_MOUNT_YAW_DEG=180
 ```
 
 The first stationary seconds of the existing 25-second standby calibrate gyro
-bias. Keep the chassis still until the dashboard changes from
-`MPU-6050 CALIBRATING` to `MPU-6050 LIVE`. Calibration rejects samples with
-excessive motion. The IMU is optional: disconnecting it changes the dashboard
-to `LD19+COMMAND POSE ACTIVE` rather than creating a no-motion boot failure.
+bias. Calibration rejects samples with excessive motion. USB LSM6DS3 is
+preferred, GPIO MPU-6050 is second, and `LD19+COMMAND POSE ACTIVE` remains the
+automatic fallback if neither IMU is usable. Missing IMU hardware never creates
+a no-motion boot failure.
 
 The gyro improves short-term turn measurement and smooths excessive yaw. Its
 accelerometer is not integrated into position because chassis vibration,
 gravity error, and the front/side mounting offset would create rapid drift.
-The MPU-6050 has no magnetometer, so it cannot provide absolute heading.
+Neither supported IMU has a magnetometer, so neither provides absolute heading.
 
 ### LiDAR + IMU exploration map
 
@@ -315,7 +337,7 @@ advisory search, and a timed-out replan retains the last safe route rather than
 pausing the robot or dropping the Uno's 350 ms watchdog.
 
 A heading correction is applied only when successive 360-bin LD19 scans have
-enough non-ambiguous support. Between accepted matches, a live MPU-6050 supplies
+enough non-ambiguous support. Between accepted matches, a live USB LSM6DS3 or GPIO MPU-6050 supplies
 measured yaw rate; if it is unavailable, the mapper uses conservative
 commanded-motion prediction. Bounded scan-to-map correlation also corrects
 small translation errors when a moving scan uniquely agrees with established
@@ -327,7 +349,7 @@ ultrasonic remains the final forward hard stop. Without wheel encoders, loop
 closure, or an absolute position reference, this is not true metric SLAM and
 cannot guarantee complete coverage or recovery from accumulated pose drift.
 
-All mapping and exploration features remain enabled without the MPU-6050:
+All mapping and exploration features remain enabled without either IMU:
 free/occupied/unknown mapping, translation correlation, frontier detection,
 inflated-grid A*, persistent waypoints, patrol, live-corridor overrides, and
 reverse/turn/replan recovery. The degraded yaw source is shown as

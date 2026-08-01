@@ -6,7 +6,7 @@ import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from robot_imu import MPU6050Link
+from robot_imu import AutoIMULink, IMUState, LSM6DS3MCP2221Link, MPU6050Link
 
 
 def _word(value: int) -> list[int]:
@@ -30,6 +30,27 @@ def _sample(
     return data
 
 
+def _little_word(value: int) -> list[int]:
+    if value < 0:
+        value += 65536
+    return [value & 0xFF, (value >> 8) & 0xFF]
+
+
+def _lsm_sample(
+    temperature: int = 0,
+    gx: int = 0,
+    gy: int = 0,
+    gz: int = 0,
+    ax: int = 0,
+    ay: int = 0,
+    az: int = 16393,
+) -> list[int]:
+    data: list[int] = []
+    for value in (temperature, gx, gy, gz, ax, ay, az):
+        data.extend(_little_word(value))
+    return data
+
+
 class _FakeBus:
     def __init__(self) -> None:
         self.identity = 0x68
@@ -47,6 +68,34 @@ class _FakeBus:
         self, _address: int, _register: int, _length: int
     ) -> list[int]:
         return list(self.sample)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeLSMBus(_FakeBus):
+    def __init__(self) -> None:
+        super().__init__()
+        self.sample = _lsm_sample()
+        self.probed: list[int] = []
+
+    def read_byte_data(self, address: int, _register: int) -> int:
+        self.probed.append(address)
+        if address == 0x6A:
+            raise OSError("no response")
+        return 0x69
+
+
+class _FakeLink:
+    def __init__(self, state: IMUState) -> None:
+        self.current = state
+        self.closed = False
+
+    def tick(self, _now: float, _stationary: bool) -> IMUState:
+        return self.current
+
+    def state(self, _now: float | None = None) -> IMUState:
+        return self.current
 
     def close(self) -> None:
         self.closed = True
@@ -108,6 +157,46 @@ class MPU6050Tests(unittest.TestCase):
         self.assertFalse(state.connected)
         self.assertFalse(state.fresh)
         self.assertIn("missing", state.error)
+
+
+class LSM6DS3Tests(unittest.TestCase):
+    def test_auto_probes_second_address_and_decodes_little_endian(self) -> None:
+        bus = _FakeLSMBus()
+        imu = LSM6DS3MCP2221Link(
+            mount_yaw_deg=0.0,
+            calibration_samples=20,
+            bus_factory=lambda _number: bus,
+        )
+        state = None
+        for index in range(20):
+            state = imu.tick(1.0 + index * 0.03, stationary=True)
+        self.assertIsNotNone(state)
+        self.assertTrue(state.connected)
+        self.assertTrue(state.calibrated)
+        self.assertEqual(state.source, "LSM6DS3 USB")
+        self.assertEqual(bus.probed[:2], [0x6A, 0x6B])
+        self.assertEqual(imu.address, 0x6B)
+        self.assertAlmostEqual(state.accel_z_g, 1.0, places=3)
+        self.assertEqual(
+            bus.writes,
+            [(0x6B, 0x10, 0x40), (0x6B, 0x11, 0x40), (0x6B, 0x12, 0x44)],
+        )
+
+    def test_auto_link_prefers_usb_then_falls_back_to_gpio(self) -> None:
+        lsm = _FakeLink(IMUState(connected=True, source="LSM6DS3 USB"))
+        mpu = _FakeLink(IMUState(connected=True, source="MPU-6050"))
+        auto = AutoIMULink(lsm_link=lsm, mpu_link=mpu)
+        self.assertEqual(auto.tick(1.0).source, "LSM6DS3 USB")
+
+        lsm.current = IMUState(error="unplugged", source="LSM6DS3 USB")
+        self.assertEqual(auto.tick(2.0).source, "MPU-6050")
+
+        mpu.current = IMUState(error="missing", source="MPU-6050")
+        missing = auto.tick(3.0)
+        self.assertFalse(missing.connected)
+        self.assertEqual(missing.source, "AUTO")
+        self.assertIn("unplugged", missing.error)
+        self.assertIn("missing", missing.error)
 
 
 if __name__ == "__main__":
