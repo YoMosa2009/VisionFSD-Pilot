@@ -151,23 +151,27 @@ encoders, loop closure, or absolute position reference.
 If both IMUs are missing or stale, the same occupancy, frontier, A*, waypoint,
 patrol, and live-corridor stack remains active. Turn prediction uses differential
 motor commands and is corrected by successive LD19 scans; recovery turns use
-that corrected map heading instead of relying only on elapsed time. In v1.8.4,
-a fail-safe leased heartbeat refreshes the selected motor output independently
-of camera/display/planner scheduling, rear clearance uses a body-width LiDAR
+that corrected map heading instead of relying only on elapsed time. A fail-safe
+leased heartbeat refreshes the selected motor output independently of
+camera/display/planner scheduling, rear clearance uses a body-width LiDAR
 corridor, and the controller checks all forward body corridors before entering
-recovery. A close straight obstacle with an open curved path therefore remains
-continuous forward differential motion. Recovery uses less-sensitive thresholds,
-prefers a bounded turn over reversing when safe, and ignores unconfirmed isolated
-LD19 returns. Camera neural inference was removed from robot mode; optical flow
-continues to refine non-IMU pose without spending CPU on person detection. In
-v1.9.4 the normal updater performs the one-time MCP2221 Linux setup and installs
+recovery. Camera neural inference was removed from robot mode; optical flow
+continues to refine non-IMU pose without spending CPU on person detection. The
+normal updater performs the one-time MCP2221 Linux setup and installs
 its Python transport. Robot startup probes LSM6DS3 addresses `0x6A` and `0x6B`,
 accepts the LSM6DS3TR-C identity `0x6A`, verifies the programmed registers,
 consumes only fresh complete samples, and retains GPIO/non-IMU fallbacks. If
 the Uno USB serial node changes, the runtime holds STOP, rediscovers the exact
 Uno USB identity, and repeats the capability handshake instead of terminating.
 Its calibrated gyro bias continues adapting only during confirmed stationary
-periods to reduce temperature-related yaw drift.
+periods to reduce temperature-related yaw drift. In v1.9.5, unfinished IMU
+calibration pauses instead of resetting when the chassis moves or another USB
+device is handled. Motor commands survive bounded half-second scheduling stalls,
+a camera reset receives at most one second of last-frame grace, and sustained
+camera loss still stops the robot. The local planner selects an 11-degree-wide
+opening instead of trusting one long LiDAR ray, pivots away before a straight
+obstacle reaches 40 cm, and uses clearance-weighted frontier routes to avoid
+unnecessary wall-hugging while retaining reachable narrow passages.
 The Pi launcher uses the available XWayland display and reapplies fullscreen
 after the first dashboard frames so the LiDAR UI fills the connected screen.
 

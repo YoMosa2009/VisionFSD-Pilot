@@ -41,7 +41,10 @@ from visionfsd_pi import (
 WINDOW_TITLE = "VisionFSD Pi Robot - standby"
 UNO_BAUD = 115200
 UNO_HEARTBEAT_S = 0.09
-UNO_CONTROL_LEASE_S = 0.25
+# Keep the last safe command across bounded USB-I2C/camera/planner stalls. The
+# heartbeat thread still expires it quickly if the main control loop actually
+# dies, and the Uno retains its independent 350 ms serial and ultrasonic stops.
+UNO_CONTROL_LEASE_S = 0.50
 # The L298N bridge on this shield drops roughly 2 V, so a 7.9 V pack puts at
 # most about 5.6 V across a motor at full duty.  Capping PWM at 105 meant 41%
 # of that, near 2.3 V: enough to spin a free wheel on blocks, not enough to
@@ -77,10 +80,16 @@ ESCAPE_TURN_TIMEOUT_S = 2.40
 ESCAPE_TURN_SIDE_CLEARANCE_M = 0.18
 ESCAPE_DIRECT_TURN_CLEARANCE_M = 0.34
 ESCAPE_SIDE_HARD_CLEARANCE_M = 0.16
-FORWARD_PREFERENCE_CLEARANCE_M = 1.10
-CLOSE_LIDAR_M = 0.28
-CLOSE_ULTRASONIC_CM = 22.0
+# Start choosing a broad alternate corridor before the robot reaches the
+# close-range recovery zone. This creates clearance through motion rather than
+# waiting until the only safe action is an abrupt stop.
+FORWARD_PREFERENCE_CLEARANCE_M = 1.25
+CLOSE_LIDAR_M = 0.38
+CLOSE_FRONT_TURN_M = 0.40
+CLOSE_ULTRASONIC_CM = 26.0
 MIN_NAV_CORRIDOR_M = 0.30
+MIN_DRIVE_CORRIDOR_M = 0.40
+OPENING_HALF_WIDTH_DEG = 5
 DISPLAY_PERIOD_S = 0.10
 TELEMETRY_PERIOD_S = 1.0
 CAPS_RETRY_S = 0.50
@@ -98,7 +107,7 @@ IMU_HARD_YAW_RATE_DPS = 55.0
 # steer around an object rather than treat one sector as blocked.
 ROBOT_WIDTH_M = 0.14
 ROBOT_LENGTH_M = 0.15
-SAFETY_MARGIN_M = 0.06
+SAFETY_MARGIN_M = 0.075
 CORRIDOR_HALF_WIDTH_M = ROBOT_WIDTH_M / 2.0 + SAFETY_MARGIN_M
 FRONT_OVERHANG_M = ROBOT_LENGTH_M / 2.0
 PLANNING_HORIZON_M = 3.0
@@ -667,6 +676,7 @@ class CameraSafety:
         self._fov = fov
         self._last_camera_sequence = 0
         self._last_frame_at = 0.0
+        self._has_live_frame = False
         self.frame: np.ndarray | None = None
         self.camera: LatestCamera | None = None
         self.camera_source = "none"
@@ -726,7 +736,6 @@ class CameraSafety:
         self.camera = None
         self.camera_source = "none"
         self.frame = None
-        self._last_frame_at = 0.0
         self._last_camera_sequence = 0
         self._flow_gray = None
         self._flow_at = 0.0
@@ -822,13 +831,12 @@ class CameraSafety:
                 self._update_motion(frame, captured, left_pwm, right_pwm)
                 self._last_camera_sequence = sequence
                 self._last_frame_at = captured
+                self._has_live_frame = True
 
     def ready(self, now: float) -> bool:
-        """Do not drive blind if the webcam has stopped delivering frames."""
+        """Require a recent frame without turning one camera reset into a pulse."""
         return (
-            self.camera is not None
-            and self.frame is not None
-            and not self.camera.error
+            self._has_live_frame
             and now - self._last_frame_at <= 1.0
         )
 
@@ -1324,14 +1332,29 @@ class AutonomousPolicy:
         return self._set_output("F", left, right)
 
     def _heading_from_profile(self, profile: np.ndarray, now: float) -> tuple[float, float] | None:
-        """Pick the best heading, preferring straight and resisting flicker."""
+        """Pick the centre of a broad opening, preferring straight and stability."""
+        # A single heading with a long range can be a sampling gap between two
+        # objects. Score the minimum clearance across an 11-degree window so a
+        # genuinely broad opening wins over one lucky LiDAR ray. The footprint
+        # is already inflated in corridor_profile(); this adds steering-error
+        # tolerance rather than pretending the robot is wider than measured.
+        half_width = OPENING_HALF_WIDTH_DEG
+        padded = np.pad(profile, (half_width, half_width), mode="edge")
+        opening = np.minimum.reduce([
+            padded[offset:offset + profile.size]
+            for offset in range(half_width * 2 + 1)
+        ])
         # Clear distance stops being worth anything once there is a decent run
         # ahead; without saturation the robot always turns toward whichever
         # direction is roomiest and curls instead of crossing the room.
         # The straight-line cost has to be large relative to the saturated
         # clearance, or a flat wall ahead always makes some oblique heading
         # look better and the robot veers off instead of closing on it.
-        score = np.minimum(profile, 1.5) - np.abs(STEER_HEADINGS) / 90.0 * 0.65
+        score = (
+            np.minimum(opening, 1.5) * 0.85
+            + np.minimum(profile, 1.5) * 0.15
+            - np.abs(STEER_HEADINGS) / 90.0 * 0.65
+        )
         exploration_heading: float | None = None
         if self.exploration.active:
             exploration_heading = float(np.clip(
@@ -1341,7 +1364,7 @@ class AutonomousPolicy:
             ))
             goal_error = np.abs(STEER_HEADINGS - exploration_heading)
             score += np.clip(1.0 - goal_error / 90.0, 0.0, 1.0) * 0.82
-        usable = profile >= MIN_NAV_CORRIDOR_M
+        usable = opening >= MIN_DRIVE_CORRIDOR_M
         if not np.any(usable):
             return None
         straight = int(np.argmin(np.abs(STEER_HEADINGS)))
@@ -1349,7 +1372,7 @@ class AutonomousPolicy:
         # progress.  Previously a slightly longer side corridor won every scan,
         # causing the robot to orbit local objects instead of crossing open floor.
         prefer_straight = (
-            profile[straight] >= FORWARD_PREFERENCE_CLEARANCE_M
+            opening[straight] >= FORWARD_PREFERENCE_CLEARANCE_M
             and (
                 exploration_heading is None
                 or abs(exploration_heading) < 10.0
@@ -1374,7 +1397,7 @@ class AutonomousPolicy:
         if previous is None or STEER_HEADINGS[previous] * STEER_HEADINGS[best] < 0.0:
             self._direction_lock_until = now + 1.20
         self._heading_index = best
-        return float(STEER_HEADINGS[best]), float(profile[best])
+        return float(STEER_HEADINGS[best]), float(opening[best])
 
     def _hold_stop(self, reason: str) -> str:
         """Stop without clearing the close-obstacle recovery latch."""
@@ -1421,10 +1444,14 @@ class AutonomousPolicy:
         close_ultrasonic = (
             arduino.front_cm is not None and arduino.front_cm < CLOSE_ULTRASONIC_CM
         )
-        # A close return straight ahead is not a reason to reverse when a
-        # body-width forward arc is open.  Recovery is reserved for the case
-        # where every candidate corridor is genuinely too short.
-        close_lidar = best_clearance < CLOSE_LIDAR_M
+        # Do not keep driving toward a close straight obstacle just because a
+        # curved corridor exists. Inside the front-turn threshold, pivot toward
+        # that broad opening; reserve reverse recovery for genuinely short
+        # corridors or the independent ultrasonic near-field trigger.
+        close_lidar = (
+            best_clearance < CLOSE_LIDAR_M
+            or straight_clearance < CLOSE_FRONT_TURN_M
+        )
         if self._escape_phase != "IDLE":
             recovery_command = self._continue_escape(
                 lidar, arduino, straight_clearance, now

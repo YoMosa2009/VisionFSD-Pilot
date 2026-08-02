@@ -46,6 +46,8 @@ class FrontierExplorer:
     MAX_ASTAR_VISITS = 12_000
     PLAN_TIME_BUDGET_S = 0.045
     ROBOT_RECONNECT_M = 0.30
+    ROUTE_CLEARANCE_WEIGHT = 1.25
+    FRONTIER_CLEARANCE_WEIGHT = 0.55
 
     def __init__(self) -> None:
         self._next_replan_at = 0.0
@@ -90,12 +92,13 @@ class FrontierExplorer:
         start: tuple[int, int],
         goal: tuple[int, int],
         deadline: float | None = None,
+        traversal_cost: np.ndarray | None = None,
     ) -> list[tuple[int, int]] | None:
         if deadline is not None and time.perf_counter() >= deadline:
             return None
         if start == goal:
             return [start]
-        if cls._line_is_clear(free, start, goal):
+        if traversal_cost is None and cls._line_is_clear(free, start, goal):
             return [start, goal]
 
         height, width = free.shape
@@ -140,7 +143,11 @@ class FrontierExplorer:
                 if delta_row != 0 and delta_col != 0:
                     if not free[row + delta_row, col] or not free[row, col + delta_col]:
                         continue
-                next_cost = cost + step_cost
+                next_cost = cost + step_cost * (
+                    1.0
+                    if traversal_cost is None
+                    else 1.0 + float(traversal_cost[next_row, next_col])
+                )
                 if next_cost >= float(g_score[next_row, next_col]):
                     continue
                 g_score[next_row, next_col] = next_cost
@@ -183,6 +190,7 @@ class FrontierExplorer:
         visits: np.ndarray,
         robot: tuple[int, int],
         scale: float,
+        obstacle_clearance: np.ndarray | None = None,
     ) -> list[tuple[float, tuple[int, int]]]:
         unknown_nearby = cv2.dilate(
             (~known).astype(np.uint8), np.ones((3, 3), dtype=np.uint8)
@@ -220,10 +228,17 @@ class FrontierExplorer:
                     self._target_cell[1] - target[1],
                 ) / scale
                 persistence = max(0.0, 0.70 - previous_distance * 1.75)
+            clearance_reward = (
+                0.0
+                if obstacle_clearance is None
+                else min(float(obstacle_clearance[target]) / scale, 0.75)
+                * self.FRONTIER_CLEARANCE_WEIGHT
+            )
             score = (
                 math.log1p(area) * 0.85
                 + min(distance, 3.0) * 0.18
                 + persistence
+                + clearance_reward
                 - visit_penalty
             )
             candidates.append((score, target))
@@ -403,6 +418,20 @@ class FrontierExplorer:
         ) > 0
         free = (known & ~inflated).astype(np.uint8)
         free_mask = free > 0
+        # A binary inflated map prevents collision but gives every remaining
+        # cell equal cost, so plain A* can scrape walls. Add a gentle graded
+        # traversal penalty inside known free space to prefer the middle of
+        # corridors while still allowing narrow passages when necessary.
+        route_clearance = cv2.distanceTransform(free, cv2.DIST_L2, 3)
+        comfort_cells = max(2.0, float(clearance_cells) * 2.5)
+        traversal_cost = (
+            np.clip((comfort_cells - route_clearance) / comfort_cells, 0.0, 1.0)
+            ** 2
+            * self.ROUTE_CLEARANCE_WEIGHT
+        ).astype(np.float32)
+        obstacle_clearance = cv2.distanceTransform(
+            (~inflated).astype(np.uint8), cv2.DIST_L2, 3
+        )
         planning_start = self._nearest_free_cell(
             free_mask,
             robot,
@@ -430,7 +459,7 @@ class FrontierExplorer:
         reachable = (labels == robot_label) & free_mask
 
         candidates = self._candidate_frontiers(
-            reachable, known, visits, robot, scale
+            reachable, known, visits, robot, scale, obstacle_clearance
         )
         self._mode = "FRONTIER"
         if not candidates:
@@ -441,12 +470,28 @@ class FrontierExplorer:
 
         chosen_target: tuple[int, int] | None = None
         chosen_path: list[tuple[int, int]] | None = None
-        for _score, target in candidates[:8]:
-            path = self._astar(reachable, planning_start, target, deadline)
+        chosen_utility = float("-inf")
+        for candidate_score, target in candidates[:6]:
+            path = self._astar(
+                reachable,
+                planning_start,
+                target,
+                deadline,
+                traversal_cost,
+            )
             if path:
-                chosen_target = target
-                chosen_path = path
-                break
+                route_length_m = sum(
+                    math.hypot(
+                        current[0] - previous[0],
+                        current[1] - previous[1],
+                    )
+                    for previous, current in zip(path, path[1:])
+                ) / scale
+                utility = candidate_score - route_length_m * 0.12
+                if utility > chosen_utility:
+                    chosen_utility = utility
+                    chosen_target = target
+                    chosen_path = path
             if time.perf_counter() >= deadline:
                 break
         self._planning_ms = (time.perf_counter() - planning_started) * 1000.0

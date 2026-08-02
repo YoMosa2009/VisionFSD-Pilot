@@ -111,6 +111,10 @@ class MPU6050Link:
     FILTER_CUTOFF_HZ = 5.0
     BIAS_TRACK_MIN_SAMPLES = 20
     BIAS_TRACK_ALPHA = 0.01
+    CALIBRATION_ACCEL_MIN_G = 0.88
+    CALIBRATION_ACCEL_MAX_G = 1.12
+    CALIBRATION_MAX_GYRO_DPS = 8.0
+    CALIBRATION_MAX_HORIZONTAL_G = 0.45
     SENSOR_NAME = "MPU-6050"
 
     def __init__(
@@ -247,6 +251,27 @@ class MPU6050Link:
         self._calibration.clear()
         return True
 
+    def _calibration_sample_is_still(
+        self,
+        gx: float,
+        gy: float,
+        gz: float,
+        accel_norm: float,
+        ax: float,
+        ay: float,
+        az: float,
+    ) -> bool:
+        """Reject handling/USB-plug jolts before they enter the bias window."""
+        return (
+            self.CALIBRATION_ACCEL_MIN_G
+            <= accel_norm
+            <= self.CALIBRATION_ACCEL_MAX_G
+            and max(abs(gx), abs(gy), abs(gz))
+            <= self.CALIBRATION_MAX_GYRO_DPS
+            and math.hypot(ax, ay) <= self.CALIBRATION_MAX_HORIZONTAL_G
+            and az >= 0.70
+        )
+
     def tick(self, now: float | None = None, stationary: bool = True) -> IMUState:
         now = time.monotonic() if now is None else now
         if self._bus is None and now >= self._next_connect_at and not self._connect(now):
@@ -274,10 +299,17 @@ class MPU6050Link:
 
         if not self._calibrated:
             self._gyro = (gx, gy, gz)
+            # A commanded movement pauses calibration, but does not throw away
+            # earlier valid still samples. Unplugging another USB device can
+            # momentarily delay the loop or jolt the chassis; neither should
+            # make a nearly complete calibration visibly restart at zero.
             if not stationary:
-                self._calibration.clear()
                 return self.state(now)
             accel_norm = math.sqrt(ax * ax + ay * ay + az * az)
+            if not self._calibration_sample_is_still(
+                gx, gy, gz, accel_norm, ax, ay, az
+            ):
+                return self.state(now)
             self._calibration.append((gx, gy, gz, accel_norm, ax, ay, az))
             if len(self._calibration) >= self.calibration_samples:
                 self._finish_calibration()

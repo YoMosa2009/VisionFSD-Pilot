@@ -147,7 +147,7 @@ class MPU6050Tests(unittest.TestCase):
         self.assertGreater(state.gyro_z_dps, 0.0)
         self.assertGreater(state.yaw_deg, 0.0)
 
-    def test_motion_restarts_unfinished_calibration(self) -> None:
+    def test_motion_pauses_unfinished_calibration_without_resetting_progress(self) -> None:
         bus = _FakeBus()
         imu = MPU6050Link(
             calibration_samples=20,
@@ -157,7 +157,30 @@ class MPU6050Tests(unittest.TestCase):
             imu.tick(1.0 + index * 0.03, stationary=True)
         moved = imu.tick(1.4, stationary=False)
         self.assertFalse(moved.calibrated)
-        self.assertEqual(moved.calibration_progress, 0.0)
+        self.assertEqual(moved.calibration_progress, 0.5)
+        for index in range(10):
+            moved = imu.tick(1.5 + index * 0.03, stationary=True)
+        self.assertTrue(moved.calibrated)
+
+    def test_handling_jolt_is_rejected_without_erasing_still_samples(self) -> None:
+        bus = _FakeBus()
+        imu = MPU6050Link(
+            calibration_samples=20,
+            bus_factory=lambda _number: bus,
+        )
+        for index in range(10):
+            state = imu.tick(1.0 + index * 0.03, stationary=True)
+        self.assertEqual(state.calibration_progress, 0.5)
+
+        bus.sample = _sample(ax=12000, ay=9000, az=9000, gz=5000)
+        for index in range(4):
+            state = imu.tick(1.4 + index * 0.03, stationary=True)
+        self.assertEqual(state.calibration_progress, 0.5)
+
+        bus.sample = _sample()
+        for index in range(10):
+            state = imu.tick(1.6 + index * 0.03, stationary=True)
+        self.assertTrue(state.calibrated)
 
     def test_missing_bus_degrades_without_raising(self) -> None:
         def missing(_number: int):

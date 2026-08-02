@@ -18,6 +18,7 @@ from robot_autonomy import (
     MAX_PWM,
     MIN_MOVE_PWM,
     STEER_HEADINGS,
+    UNO_CONTROL_LEASE_S,
     ArduinoLink,
     ArduinoStatus,
     AutonomousPolicy,
@@ -336,7 +337,7 @@ class AutonomousPolicyTests(unittest.TestCase):
         clear = SectorClearance(2.0, 2.0, 2.0, True)
         self.assertEqual(policy.decide(clear, self.status, True, time.monotonic()), "F")
 
-    def test_close_straight_return_uses_open_body_corridor_without_reversing(self) -> None:
+    def test_close_straight_return_pivots_into_open_body_corridor_before_contact(self) -> None:
         policy = AutonomousPolicy(0.0, 118)
         profile = np.full(STEER_HEADINGS.size, 0.20, dtype=np.float32)
         profile[(STEER_HEADINGS >= 22.0) & (STEER_HEADINGS <= 38.0)] = 1.20
@@ -346,21 +347,21 @@ class AutonomousPolicyTests(unittest.TestCase):
 
         command = policy.decide(clearance, self.status, False, time.monotonic())
 
-        self.assertEqual(command, "F")
-        self.assertGreaterEqual(policy.left_pwm, MIN_MOVE_PWM)
-        self.assertGreaterEqual(policy.right_pwm, MIN_MOVE_PWM)
-        self.assertEqual(policy._escape_phase, "IDLE")
+        self.assertEqual(command, "R")
+        self.assertEqual(policy.left_pwm, 0)
+        self.assertLessEqual(policy.right_pwm, -MIN_MOVE_PWM)
+        self.assertEqual(policy._escape_phase, "TURN")
 
     def test_multi_obstacle_corridors_remain_continuous_forward_motion(self) -> None:
         policy = AutonomousPolicy(0.0, 118)
         now = time.monotonic()
         outputs = []
         for index in range(80):
-            profile = np.full(STEER_HEADINGS.size, 0.18, dtype=np.float32)
+            profile = np.full(STEER_HEADINGS.size, 0.55, dtype=np.float32)
             centre = 32.0 if (index // 20) % 2 == 0 else -32.0
             profile[np.abs(STEER_HEADINGS - centre) <= 10.0] = 1.10
             clearance = SectorClearance(
-                0.22, 0.9, 0.9, True, 0.8, 0.8, profile, 1.0
+                0.55, 0.9, 0.9, True, 0.8, 0.8, profile, 1.0
             )
             decision_at = now + index * 0.04
             status = ArduinoStatus(
@@ -461,7 +462,7 @@ class AutonomousPolicyTests(unittest.TestCase):
     def test_wide_open_heading_still_uses_a_forward_arc_not_a_pivot(self) -> None:
         policy = AutonomousPolicy(0.0, 118)
         profile = np.full(STEER_HEADINGS.size, 0.70, dtype=np.float32)
-        profile[int(np.argmin(np.abs(STEER_HEADINGS - 72.0)))] = 3.0
+        profile[(STEER_HEADINGS >= 58.0) & (STEER_HEADINGS <= 72.0)] = 3.0
         clearance = SectorClearance(1.0, 2.0, 2.0, True, 2.0, 2.0, profile)
         self.assertEqual(settle(policy, clearance, self.status), "F")
         self.assertGreater(policy.left_pwm, 0)
@@ -473,15 +474,15 @@ class AutonomousPolicyTests(unittest.TestCase):
         policy = AutonomousPolicy(0.0, 118)
         now = time.monotonic()
         left_profile = np.full(STEER_HEADINGS.size, 0.60, dtype=np.float32)
-        left_profile[int(np.argmin(np.abs(STEER_HEADINGS + 28.0)))] = 2.0
+        left_profile[np.abs(STEER_HEADINGS + 28.0) <= 7.0] = 2.0
         left = SectorClearance(0.70, 1.8, 1.6, True, 1.7, 1.5, left_profile)
         for index in range(4):
             policy.decide(left, self.status, False, now + index * 0.03)
         self.assertLess(policy.left_pwm, policy.right_pwm)
 
         right_profile = np.full(STEER_HEADINGS.size, 0.60, dtype=np.float32)
-        right_profile[int(np.argmin(np.abs(STEER_HEADINGS + 28.0)))] = 0.50
-        right_profile[int(np.argmin(np.abs(STEER_HEADINGS - 28.0)))] = 2.5
+        right_profile[np.abs(STEER_HEADINGS + 28.0) <= 7.0] = 0.50
+        right_profile[np.abs(STEER_HEADINGS - 28.0) <= 7.0] = 2.5
         right = SectorClearance(0.70, 1.0, 2.0, True, 0.8, 1.9, right_profile)
         policy.decide(right, self.status, False, now + 0.15)
         self.assertLess(policy.left_pwm, policy.right_pwm)
@@ -497,7 +498,7 @@ class AutonomousPolicyTests(unittest.TestCase):
     def test_planner_returns_to_forward_progress_when_straight_opens(self) -> None:
         policy = AutonomousPolicy(0.0, 118)
         side_profile = np.full(STEER_HEADINGS.size, 0.60, dtype=np.float32)
-        side_profile[int(np.argmin(np.abs(STEER_HEADINGS + 28.0)))] = 2.0
+        side_profile[np.abs(STEER_HEADINGS + 28.0) <= 7.0] = 2.0
         side = SectorClearance(0.70, 2.0, 0.7, True, 2.0, 0.7, side_profile)
         settle(policy, side, self.status)
         self.assertLess(policy.left_pwm, policy.right_pwm)
@@ -542,6 +543,22 @@ class AutonomousPolicyTests(unittest.TestCase):
 
 
 class ArduinoLinkTests(unittest.TestCase):
+    def test_published_drive_survives_bounded_half_second_control_stall(self) -> None:
+        link = object.__new__(ArduinoLink)
+        link._drive_lock = threading.Lock()
+        link._drive_command = "STOP"
+        link._drive_lease_until = 0.0
+        link._drive_last_write = 0.0
+        link._drive_expired = True
+        link._write = mock.Mock(return_value=True)
+
+        with mock.patch("robot_autonomy.time.monotonic", return_value=10.0):
+            link.publish_drive(110, 112)
+
+        self.assertEqual(link._drive_lease_until, 10.0 + UNO_CONTROL_LEASE_S)
+        self.assertEqual(link._heartbeat_command(10.45), "DRIVE 110 112")
+        self.assertEqual(link._heartbeat_command(10.51), "STOP")
+
     def test_drive_heartbeat_refreshes_lease_then_expires_to_stop(self) -> None:
         link = object.__new__(ArduinoLink)
         link._drive_lock = __import__("threading").Lock()
@@ -656,6 +673,16 @@ class ArduinoLinkTests(unittest.TestCase):
 
 
 class CameraSafetyTests(unittest.TestCase):
+    def test_recent_live_frame_bridges_a_short_camera_usb_reset(self) -> None:
+        safety = object.__new__(CameraSafety)
+        safety._has_live_frame = True
+        safety._last_frame_at = 10.0
+        safety.camera = None
+        safety.frame = None
+
+        self.assertTrue(safety.ready(10.80))
+        self.assertFalse(safety.ready(11.01))
+
     def test_optical_flow_supplies_non_imu_turn_measurement(self) -> None:
         safety = object.__new__(CameraSafety)
         safety._fov = 70.0

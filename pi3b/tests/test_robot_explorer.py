@@ -120,6 +120,34 @@ class FrontierExplorerTests(unittest.TestCase):
         self.assertTrue(any(row >= 28 for row, _col in path))
         self.assertTrue(all(free[row, col] for row, col in path))
 
+    def test_astar_clearance_cost_prefers_room_over_wall_hugging(self) -> None:
+        free = np.ones((31, 31), dtype=bool)
+        traversal_cost = np.zeros((31, 31), dtype=np.float32)
+        traversal_cost[12:19, 7:24] = 4.0
+
+        path = FrontierExplorer._astar(
+            free,
+            (15, 3),
+            (15, 27),
+            traversal_cost=traversal_cost,
+        )
+
+        self.assertIsNotNone(path)
+        assert path is not None
+        self.assertTrue(any(abs(row - 15) >= 4 for row, _col in path))
+
+    def test_narrow_single_heading_peak_loses_to_broad_opening(self) -> None:
+        policy = AutonomousPolicy(0.0, 118)
+        profile = np.full(STEER_HEADINGS.shape, 0.65, dtype=np.float32)
+        profile[int(np.argmin(np.abs(STEER_HEADINGS + 35.0)))] = 3.0
+        profile[np.abs(STEER_HEADINGS - 28.0) <= 8.0] = 1.4
+
+        choice = policy._heading_from_profile(profile, 1.0)
+
+        self.assertIsNotNone(choice)
+        assert choice is not None
+        self.assertGreater(choice[0], 15.0)
+
     def test_exploration_heading_biases_an_open_corridor(self) -> None:
         policy = AutonomousPolicy(0.0, 118)
         policy.observe_exploration(ExplorationState(

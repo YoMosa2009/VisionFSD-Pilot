@@ -156,9 +156,11 @@ path. That is what lets it say "there is a 0.5 m gap 20 degrees to the right,
 the reason it can now curve around an object instead of treating a whole side
 as blocked.
 
-The chosen heading comes from that profile, preferring straight ahead when it
-has at least 1.1 m of clear travel, with a switch margin so scan noise cannot
-make it weave between two near-tied options. The selected corridor receives
+The chosen heading comes from that profile. Each candidate is scored by the
+minimum clearance across an 11-degree opening, so one long ray between nearby
+objects cannot masquerade as a usable route. It prefers straight ahead when
+that broad opening has at least 1.25 m of clear travel, with a switch margin so
+scan noise cannot make it weave between two near-tied options. The selected corridor receives
 arc-lead compensation because a differential-drive chassis cannot instantly
 assume a new straight heading. Avoidance uses a forward arc with both wheels
 powered, never a fast counter-rotating pivot. The outer wheel receives bounded
@@ -180,7 +182,10 @@ cd ~/visionfsd-pi && bash ./pi3b/run_robot.sh
 At boot the robot runtime starts in a **25-second STOP standby**. It will not
 move during that interval. Afterwards its authority order is fixed:
 
-1. A stale Uno, LD19, or webcam stops the robot; it will not drive blind.
+1. A stale Uno, LD19, or webcam stops the robot; it will not drive blind. After
+   the webcam has produced a live frame, a USB reset receives at most one second
+   of last-frame grace so one device event does not create a motor pulse. The
+   robot still requires a real webcam frame before initially driving.
 2. Robot mode does not run object or person detection. Low-resolution webcam
    optical flow provides a bounded non-IMU yaw cue during turns and reduces
    false commanded map translation when a high-confidence textured view shows
@@ -188,20 +193,22 @@ move during that interval. Afterwards its authority order is fixed:
    camera/display work small on Pi 3B.
 3. During standby, the mapper distinguishes observed free space from unknown
    space and persistent obstacle returns. A frontier planner selects a reachable
-   unexplored boundary, plans around inflated obstacles, and supplies a
+   unexplored boundary, rewards wider approaches, plans around inflated obstacles,
+   adds a graded cost near those obstacles, and supplies a
    persistent look-ahead route. The cached route advances its waypoint every
    control cycle instead of waiting for the next full replan. When all current
    frontiers are exhausted, it patrols the least-visited reachable mapped space.
 4. The LD19 begins a direction-locked forward arc when the straight inflated
-   corridor drops below 1.1 m. Steering can use up to a 28-PWM wheel split,
+   corridor drops below 1.25 m. Steering can use up to a 28-PWM wheel split,
    both motors stay above the loaded-wheel stall region, and steering changes
    are slew-limited. A very-high-confidence close return is retained even when
    a thin obstacle occupies only one angular bin; weaker isolated speckle is ignored.
    The frontier heading only biases among currently safe full-body corridors.
-5. A close straight return does not trigger recovery while another body-width
-   forward corridor is open; the controller follows that corridor as a
-   continuous differential arc. Only when every candidate corridor is below
-   28 cm (or ultrasonic is below 22 cm) does it run a finite recovery sequence:
+5. While the straight path is safely clear, the controller follows open
+   corridors as continuous differential arcs. If the straight body corridor
+   reaches 40 cm, it pivots toward the best broad opening instead of continuing
+   closer. If every candidate corridor is below 38 cm, or the Pi ultrasonic
+   reading is below 26 cm, it runs a finite recovery sequence:
    a short LiDAR-cleared reverse curve with
    both wheels driven, a slow one-wheel reverse turn toward the best full
    body-width LiDAR corridor, then a short forward commit and immediate return
@@ -215,7 +222,10 @@ move during that interval. Afterwards its authority order is fixed:
    both sides are ambiguous, one short straight reverse search obtains a new
    view before declaring itself boxed in. If reversing is blocked but one
    complete turn sweep has at least 34 cm clearance, it begins the same bounded
-   slow turn directly instead of giving up despite that opening.
+   slow turn directly instead of giving up despite that opening. The 38/40 cm
+   thresholds initiate manoeuvring; they do not mark every surrounding return
+   as boxed-in, and the narrower 30 cm escape-corridor threshold remains
+   available during recovery.
 6. Uno ultrasonic hard-stop (under 18 cm) always wins and blocks forward
    motor commands even if the Pi fails.
 7. A live, calibrated USB LSM6DS3 or GPIO MPU-6050 supplies measured yaw rate to the local mapper
@@ -289,7 +299,10 @@ register after writing it.
 The sampler ignores cycles without both new gyro and accelerometer data, uses
 the datasheet's 256 LSB/degree C temperature conversion, performs trimmed-mean
 stationary calibration, and slowly tracks gyro bias only during confirmed
-stationary periods. No manual `modprobe`, I2C scan, or launch command is required. During the
+stationary periods. Handling jolts and commanded motion pause unfinished
+calibration without deleting already collected still samples. A temporary
+webcam USB event therefore cannot restart valid progress from zero. No manual
+`modprobe`, I2C scan, or launch command is required. During the
 25-second stationary standby, the dashboard should change from
 `IMU LSM6DS3 USB CALIBRATING` to `IMU LSM6DS3 USB LIVE`.
 
@@ -317,7 +330,8 @@ export VISIONFSD_IMU_MOUNT_YAW_DEG=180
 ```
 
 The first stationary seconds of the existing 25-second standby calibrate gyro
-bias. Calibration rejects samples with excessive motion. USB LSM6DS3 is
+bias. Calibration rejects samples with excessive motion and pauses rather than
+resetting valid progress. USB LSM6DS3 is
 preferred, GPIO MPU-6050 is second, and `LD19+COMMAND POSE ACTIVE` remains the
 automatic fallback if neither IMU is usable. Missing IMU hardware never creates
 a no-motion boot failure.
@@ -336,9 +350,12 @@ remain obstacles. Bright current-scan points remain distinct from mapped
 history, while dark known-free cells are distinguishable from unknown space.
 Metre range rings make nearby geometry easier to read.
 
-The frontier explorer inflates obstacles by the robot body and safety margin,
-finds the free-space component connected to the robot, clusters reachable
-free/unknown boundaries, and runs bounded A* to the selected target. It guides
+The frontier explorer inflates obstacles by the robot body plus a 7.5 cm lateral
+safety margin, finds the free-space component connected to the robot, clusters
+reachable free/unknown boundaries, and runs bounded A* to the selected target.
+Frontier utility rewards obstacle clearance, while a graded A* traversal cost
+prefers the middle of available space without converting narrow free passages
+into blocked cells. It guides
 the local planner along a cached look-ahead route whose waypoint advances every
 control cycle. If map inflation temporarily places the estimated pose just
 outside free space, planning reconnects to nearby known free space while live
@@ -347,6 +364,17 @@ low-visit mapped cells to expose missed openings. Full replans run every 0.6
 seconds with a 45 ms A* budget. The current motor decision is sent before that
 advisory search, and a timed-out replan retains the last safe route rather than
 pausing the robot or dropping the Uno's 350 ms watchdog.
+
+The navigation design follows established local-navigation principles: broad
+polar openings rather than single range rays, dynamically safe progress and
+clearance objectives, reachable free/unknown frontiers, and graded obstacle
+costs. Reference material:
+
+- [Vector Field Histogram](https://public.websites.umich.edu/~ykoren/uploads/The_Vector_Field_HistogramuFast_Obstacle_Avoidance.pdf)
+- [Dynamic Window Approach](https://rse-lab.cs.washington.edu/abstracts/colli-ieee.abstract.html)
+- [Frontier-Based Exploration](https://www.cs.cmu.edu/~motionplanning/papers/sbp_papers/integrated2/yamauchi_frontier_explor.pdf)
+- [Nav2 cost-aware planning](https://docs.ros.org/en/ros2_packages/humble/api/nav2_theta_star_planner/)
+- [ST MotionGC gyroscope calibration](https://www.st.com/resource/en/user_manual/dm00372763-getting-started-with-motiongc-gyroscope-calibration-library-in-xcubemems1-expansion-for-stm32cube-stmicroelectronics.pdf)
 
 A heading correction is applied only when successive 360-bin LD19 scans have
 enough non-ambiguous support. Between accepted matches, a live USB LSM6DS3 or GPIO MPU-6050 supplies
