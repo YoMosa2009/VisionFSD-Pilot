@@ -107,6 +107,10 @@ class MPU6050Link:
     EXPECTED_IDS = (0x68, 0x69)
     RETRY_SECONDS = 1.0
     MAX_SAMPLE_AGE_S = 0.25
+    DATA_READY_TIMEOUT_S = 0.75
+    FILTER_CUTOFF_HZ = 5.0
+    BIAS_TRACK_MIN_SAMPLES = 20
+    BIAS_TRACK_ALPHA = 0.01
     SENSOR_NAME = "MPU-6050"
 
     def __init__(
@@ -125,10 +129,14 @@ class MPU6050Link:
         self._bus: _SMBusLike | None = None
         self._next_connect_at = 0.0
         self._error: str | None = None
-        self._calibration: list[tuple[float, float, float, float]] = []
+        self._calibration: list[
+            tuple[float, float, float, float, float, float, float]
+        ] = []
         self._gyro_bias = (0.0, 0.0, 0.0)
+        self._stationary_bias_samples = 0
         self._calibrated = False
         self._last_sample_at = 0.0
+        self._connected_at = 0.0
         self._accel = (0.0, 0.0, 0.0)
         self._gyro = (0.0, 0.0, 0.0)
         self._filtered_gyro = (0.0, 0.0, 0.0)
@@ -180,6 +188,7 @@ class MPU6050Link:
             bus.write_byte_data(self.address, self.GYRO_CONFIG, 0x00)
             bus.write_byte_data(self.address, self.ACCEL_CONFIG, 0x00)
             self._bus = bus
+            self._connected_at = now
             self._error = None
             return True
         except Exception as exc:
@@ -203,16 +212,36 @@ class MPU6050Link:
         self._error = str(error)
         self._next_connect_at = now + self.RETRY_SECONDS
         self._last_sample_at = 0.0
+        self._connected_at = 0.0
+
+    def _sample_ready(self, bus: _SMBusLike) -> bool:
+        return True
 
     def _finish_calibration(self) -> bool:
         gyro_axes = list(zip(*(sample[:3] for sample in self._calibration)))
         gyro_std = max(statistics.pstdev(axis) for axis in gyro_axes)
         mean_accel_norm = statistics.fmean(sample[3] for sample in self._calibration)
-        if gyro_std > 1.5 or not 0.75 <= mean_accel_norm <= 1.25:
+        mean_accel_z = statistics.fmean(sample[6] for sample in self._calibration)
+        mean_horizontal = math.hypot(
+            statistics.fmean(sample[4] for sample in self._calibration),
+            statistics.fmean(sample[5] for sample in self._calibration),
+        )
+        if (
+            gyro_std > 1.5
+            or not 0.80 <= mean_accel_norm <= 1.20
+            or mean_accel_z < 0.70
+            or mean_horizontal > 0.45
+        ):
             self._calibration.clear()
             return False
-        self._gyro_bias = tuple(statistics.fmean(axis) for axis in gyro_axes)
+        # A trimmed mean rejects an isolated USB/I2C or handling spike without
+        # biasing every later yaw integration step.
+        trim = max(1, len(self._calibration) // 10)
+        self._gyro_bias = tuple(
+            statistics.fmean(sorted(axis)[trim:-trim]) for axis in gyro_axes
+        )
         self._calibrated = True
+        self._stationary_bias_samples = 0
         self._yaw_deg = 0.0
         self._filtered_gyro = (0.0, 0.0, 0.0)
         self._calibration.clear()
@@ -225,6 +254,11 @@ class MPU6050Link:
         if self._bus is None:
             return self.state(now)
         try:
+            if not self._sample_ready(self._bus):
+                last_data = self._last_sample_at or self._connected_at
+                if last_data > 0.0 and now - last_data > self.DATA_READY_TIMEOUT_S:
+                    self._disconnect(now, OSError("sensor stopped producing fresh data"))
+                return self.state(now)
             raw = self._bus.read_i2c_block_data(self.address, self.DATA_START, 14)
             ax, ay, az, temperature, gx, gy, gz = self._decode_block(raw)
         except Exception as exc:
@@ -244,24 +278,50 @@ class MPU6050Link:
                 self._calibration.clear()
                 return self.state(now)
             accel_norm = math.sqrt(ax * ax + ay * ay + az * az)
-            self._calibration.append((gx, gy, gz, accel_norm))
+            self._calibration.append((gx, gy, gz, accel_norm, ax, ay, az))
             if len(self._calibration) >= self.calibration_samples:
                 self._finish_calibration()
             return self.state(now)
 
-        corrected = tuple(
+        accel_norm = math.sqrt(ax * ax + ay * ay + az * az)
+        bias_delta = tuple(
             value - bias for value, bias in zip((gx, gy, gz), self._gyro_bias)
         )
-        alpha = 0.35
+        if (
+            stationary
+            and 0.92 <= accel_norm <= 1.08
+            and max(abs(value) for value in bias_delta) <= 0.75
+        ):
+            self._stationary_bias_samples += 1
+            if self._stationary_bias_samples >= self.BIAS_TRACK_MIN_SAMPLES:
+                beta = self.BIAS_TRACK_ALPHA
+                self._gyro_bias = tuple(
+                    bias * (1.0 - beta) + value * beta
+                    for bias, value in zip(self._gyro_bias, (gx, gy, gz))
+                )
+                bias_delta = tuple(
+                    value - bias
+                    for value, bias in zip((gx, gy, gz), self._gyro_bias)
+                )
+        else:
+            self._stationary_bias_samples = 0
+
+        previous_filtered = self._filtered_gyro
+        elapsed = min(0.10, max(0.0, now - previous_at)) if previous_at > 0.0 else 0.0
+        alpha = (
+            min(0.85, max(0.10, 1.0 - math.exp(-2.0 * math.pi * self.FILTER_CUTOFF_HZ * elapsed)))
+            if elapsed > 0.0
+            else 0.35
+        )
         self._filtered_gyro = tuple(
             previous * (1.0 - alpha) + current * alpha
-            for previous, current in zip(self._filtered_gyro, corrected)
+            for previous, current in zip(previous_filtered, bias_delta)
         )
         self._gyro = self._filtered_gyro
-        if previous_at > 0.0:
-            elapsed = min(0.10, max(0.0, now - previous_at))
+        if elapsed > 0.0:
+            yaw_rate = (previous_filtered[2] + self._gyro[2]) * 0.5
             self._yaw_deg = (
-                self._yaw_deg + self._gyro[2] * elapsed + 180.0
+                self._yaw_deg + yaw_rate * elapsed + 180.0
             ) % 360.0 - 180.0
         return self.state(now)
 
@@ -306,6 +366,7 @@ class LSM6DS3MCP2221Link(MPU6050Link):
     CTRL1_XL = 0x10
     CTRL2_G = 0x11
     CTRL3_C = 0x12
+    STATUS_REG = 0x1E
     DATA_START = 0x20
     EXPECTED_IDS = (0x69,)
     SENSOR_NAME = "LSM6DS3 USB"
@@ -346,7 +407,7 @@ class LSM6DS3MCP2221Link(MPU6050Link):
             ax * 0.000061,
             ay * 0.000061,
             az * 0.000061,
-            25.0 + temperature / 16.0,
+            25.0 + temperature / 256.0,
             gx * 0.00875,
             gy * 0.00875,
             gz * 0.00875,
@@ -371,10 +432,22 @@ class LSM6DS3MCP2221Link(MPU6050Link):
                 raise OSError("LSM6DS3 not found (" + "; ".join(errors) + ")")
             # 104 Hz, +/-2 g accelerometer; 104 Hz, +/-245 dps gyro;
             # block-data update and automatic register increment enabled.
-            bus.write_byte_data(self.address, self.CTRL1_XL, 0x40)
-            bus.write_byte_data(self.address, self.CTRL2_G, 0x40)
-            bus.write_byte_data(self.address, self.CTRL3_C, 0x44)
+            configuration = (
+                (self.CTRL1_XL, 0x40),
+                (self.CTRL2_G, 0x40),
+                (self.CTRL3_C, 0x44),
+            )
+            for register, value in configuration:
+                bus.write_byte_data(self.address, register, value)
+            for register, expected in configuration:
+                actual = bus.read_byte_data(self.address, register)
+                if actual != expected:
+                    raise OSError(
+                        f"LSM6DS3 config verify failed at 0x{register:02X}: "
+                        f"wrote 0x{expected:02X}, read 0x{actual:02X}"
+                    )
             self._bus = bus
+            self._connected_at = now
             self._error = None
             return True
         except Exception as exc:
@@ -387,6 +460,12 @@ class LSM6DS3MCP2221Link(MPU6050Link):
             self._error = str(exc)
             self._next_connect_at = now + self.RETRY_SECONDS
             return False
+
+    def _sample_ready(self, bus: _SMBusLike) -> bool:
+        # Only count and integrate complete new gyro+accelerometer samples.
+        # This prevents a fast control loop from repeatedly integrating the
+        # same 104 Hz hardware output.
+        return bus.read_byte_data(self.address, self.STATUS_REG) & 0x03 == 0x03
 
 
 class AutoIMULink:

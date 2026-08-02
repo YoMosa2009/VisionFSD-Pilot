@@ -268,7 +268,14 @@ The preferred IMU path is:
 LSM6DS3 STEMMA QT -> MCP2221A I2C -> MCP2221A USB-C -> Pi USB-A
 ```
 
-Keep the board rigid, flat, and component-side up. The normal updater installs
+The installed orientation is specifically: component side up, with the left
+STEMMA connector and `SCX`/`SDX` end shown in the supplied photo facing the
+robot's front. In that position the breakout's printed `+X` points rearward and
+its printed `+Y` points toward the robot's right. The runtime's existing 180
+degree yaw transform converts those into robot `+X` forward and `+Y` left while
+leaving `+Z` upward. The board must remain rigid and flat.
+
+The normal updater installs
 the Linux prerequisites and Python USB transport, writes persistent MCP2221A
 USB permissions, and prevents the optional kernel MCP2221 driver from competing
 with the userspace transport. That system setup is recorded once and skipped on
@@ -276,8 +283,12 @@ later updates. Every robot boot still opens and validates the sensor because an
 IMU cannot remain open across a power cycle.
 
 At startup the runtime automatically checks both normal LSM6DS3 I2C addresses,
-`0x6A` and `0x6B`, and accepts the sensor only when its identity register returns
-`0x69`. No manual `modprobe`, I2C scan, or launch command is required. During the
+`0x6A` and `0x6B`, accepts the sensor only when its identity register returns
+`0x69`, and verifies every critical configuration register after writing it.
+The sampler ignores cycles without both new gyro and accelerometer data, uses
+the datasheet's 256 LSB/degree C temperature conversion, performs trimmed-mean
+stationary calibration, and slowly tracks gyro bias only during confirmed
+stationary periods. No manual `modprobe`, I2C scan, or launch command is required. During the
 25-second stationary standby, the dashboard should change from
 `IMU LSM6DS3 USB CALIBRATING` to `IMU LSM6DS3 USB LIVE`.
 

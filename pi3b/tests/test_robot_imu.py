@@ -78,12 +78,23 @@ class _FakeLSMBus(_FakeBus):
         super().__init__()
         self.sample = _lsm_sample()
         self.probed: list[int] = []
+        self.registers: dict[int, int] = {}
+        self.valid_config_readback = True
 
-    def read_byte_data(self, address: int, _register: int) -> int:
-        self.probed.append(address)
-        if address == 0x6A:
-            raise OSError("no response")
-        return 0x69
+    def read_byte_data(self, address: int, register: int) -> int:
+        if register == 0x1E:
+            return 0x03
+        if register == 0x0F:
+            self.probed.append(address)
+            if address == 0x6A:
+                raise OSError("no response")
+            return 0x69
+        value = self.registers.get(register, 0)
+        return value if self.valid_config_readback else value ^ 0x01
+
+    def write_byte_data(self, address: int, register: int, value: int) -> None:
+        super().write_byte_data(address, register, value)
+        self.registers[register] = value
 
 
 class _FakeLink:
@@ -181,6 +192,67 @@ class LSM6DS3Tests(unittest.TestCase):
             bus.writes,
             [(0x6B, 0x10, 0x40), (0x6B, 0x11, 0x40), (0x6B, 0x12, 0x44)],
         )
+
+    def test_actual_mount_rotates_board_xy_180_and_scales_temperature(self) -> None:
+        bus = _FakeLSMBus()
+        imu = LSM6DS3MCP2221Link(
+            calibration_samples=20,
+            bus_factory=lambda _number: bus,
+        )
+        for index in range(20):
+            imu.tick(1.0 + index * 0.03, stationary=True)
+        # On the installed board +X points rearward and +Y points rightward.
+        bus.sample = _lsm_sample(temperature=256, ax=-16393, ay=-8197, az=16393)
+        state = imu.tick(1.7, stationary=False)
+        self.assertAlmostEqual(state.accel_x_g, 1.0, places=3)
+        self.assertAlmostEqual(state.accel_y_g, 0.5, places=3)
+        self.assertAlmostEqual(state.accel_z_g, 1.0, places=3)
+        self.assertAlmostEqual(state.temperature_c, 26.0, places=3)
+
+    def test_not_ready_sample_does_not_advance_calibration(self) -> None:
+        bus = _FakeLSMBus()
+        original_read = bus.read_byte_data
+
+        def not_ready(address: int, register: int) -> int:
+            return 0x00 if register == 0x1E else original_read(address, register)
+
+        bus.read_byte_data = not_ready
+        imu = LSM6DS3MCP2221Link(
+            calibration_samples=20,
+            bus_factory=lambda _number: bus,
+        )
+        state = imu.tick(1.0, stationary=True)
+        self.assertTrue(state.connected)
+        self.assertEqual(state.calibration_progress, 0.0)
+        self.assertFalse(state.fresh)
+        timed_out = imu.tick(1.8, stationary=True)
+        self.assertFalse(timed_out.connected)
+        self.assertIn("stopped producing fresh data", timed_out.error)
+
+    def test_configuration_readback_failure_rejects_sensor(self) -> None:
+        bus = _FakeLSMBus()
+        bus.valid_config_readback = False
+        imu = LSM6DS3MCP2221Link(bus_factory=lambda _number: bus)
+        state = imu.tick(1.0)
+        self.assertFalse(state.connected)
+        self.assertIn("config verify failed", state.error)
+
+    def test_confirmed_stationary_period_tracks_small_gyro_bias_drift(self) -> None:
+        bus = _FakeLSMBus()
+        imu = LSM6DS3MCP2221Link(
+            mount_yaw_deg=0.0,
+            calibration_samples=20,
+            bus_factory=lambda _number: bus,
+        )
+        for index in range(20):
+            imu.tick(1.0 + index * 0.03, stationary=True)
+        bus.sample = _lsm_sample(gz=57)
+        initial = imu.tick(1.7, stationary=True)
+        state = initial
+        for index in range(100):
+            state = imu.tick(1.73 + index * 0.03, stationary=True)
+        self.assertGreater(initial.gyro_z_dps, 0.1)
+        self.assertLess(abs(state.gyro_z_dps), abs(initial.gyro_z_dps) * 0.6)
 
     def test_auto_link_prefers_usb_then_falls_back_to_gpio(self) -> None:
         lsm = _FakeLink(IMUState(connected=True, source="LSM6DS3 USB"))
