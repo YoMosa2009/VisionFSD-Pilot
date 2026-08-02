@@ -179,6 +179,72 @@ class SlamLiteTests(unittest.TestCase):
         reduced_distance = 4.0 - reduced.y
         self.assertAlmostEqual(reduced_distance / normal_distance, 0.20, places=2)
 
+    def test_recenter_moves_grid_content_by_the_same_shift_as_the_robot(self) -> None:
+        mapper = LidarSlamLite(cells=100, metres=5.0)
+        scale = mapper.cells / mapper.metres
+        mapper.x = 2.5
+        mapper.y = 0.10  # row ~2, well inside the 20-cell edge margin
+        marker_row, marker_col = 5, 50
+        mapper.grid[marker_row, marker_col] = 200
+        robot_row_before = int(round(mapper.y * scale))
+
+        shifted = mapper._recenter_if_needed()
+
+        self.assertTrue(shifted)
+        expected_shift_row = mapper.cells // 2 - robot_row_before
+        self.assertEqual(mapper.grid[marker_row + expected_shift_row, marker_col], 200)
+        self.assertAlmostEqual(mapper.y, 0.10 + expected_shift_row / scale, places=6)
+        self.assertEqual(int(round(mapper.y * scale)), mapper.cells // 2)
+
+    def test_recenter_preserves_nearby_content_but_clears_the_far_wrapped_band(self) -> None:
+        mapper = LidarSlamLite(cells=100, metres=5.0)
+        mapper.grid[10, 50] = 200  # near the robot -- should survive, shifted
+        mapper.grid[95, 50] = 255  # far side -- would wrap in via np.roll
+        mapper.x = 2.5
+        mapper.y = 0.10
+        scale = mapper.cells / mapper.metres
+        robot_row_before = int(round(mapper.y * scale))
+        shift_row = mapper.cells // 2 - robot_row_before
+
+        mapper._recenter_if_needed()
+
+        self.assertEqual(mapper.grid[10 + shift_row, 50], 200)
+        # Content that wrapped in from the far side of the array is stale
+        # (outside the robot's actual vicinity) and must be blanked rather
+        # than appearing as a phantom obstacle near the new position.
+        self.assertEqual(int(np.count_nonzero(mapper.grid[:shift_row, :])), 0)
+
+    def test_sustained_travel_recenters_instead_of_clamping_pose(self) -> None:
+        """A robot travelling far in one direction must not have its pose
+        pinned at the grid edge -- that was the visualizer's black-void bug,
+        where new scans kept projecting onto a stale, frozen position once
+        the old hard clamp engaged."""
+        mapper = LidarSlamLite(cells=100, metres=5.0)
+        mapper.heading = 90.0  # straight +x travel
+        now = 1.0
+        for _ in range(600):
+            now += 0.05
+            mapper.integrate_motion(200, 200, now)
+
+        scale = mapper.cells / mapper.metres
+        margin_cells = int(round(mapper.cells * mapper.RECENTER_MARGIN_FRACTION))
+        robot_col = mapper.x * scale
+
+        self.assertGreater(mapper._recenter_count, 0)
+        self.assertGreaterEqual(robot_col, margin_cells - 1)
+        self.assertLessEqual(robot_col, mapper.cells - margin_cells + 1)
+
+    def test_state_reports_recenter_count(self) -> None:
+        mapper = LidarSlamLite(cells=100, metres=5.0)
+        self.assertEqual(mapper.state().recenter_count, 0)
+        mapper.heading = 90.0
+        now = 1.0
+        for _ in range(400):
+            now += 0.05
+            mapper.integrate_motion(200, 200, now)
+
+        self.assertGreater(mapper.state().recenter_count, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

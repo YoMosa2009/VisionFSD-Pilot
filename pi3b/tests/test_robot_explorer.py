@@ -67,6 +67,47 @@ class FrontierExplorerTests(unittest.TestCase):
         self.assertEqual(retained.target_x_m, first.target_x_m)
         self.assertEqual(retained.target_y_m, first.target_y_m)
 
+    def test_invalidate_clears_cached_route_state(self) -> None:
+        cells = 120
+        metres = 6.0
+        grid = np.zeros((cells, cells), dtype=np.uint8)
+        observed = np.zeros_like(grid)
+        visits = np.zeros((cells, cells), dtype=np.uint16)
+        cv2.circle(observed, (60, 60), 32, 255, -1)
+        explorer = FrontierExplorer()
+        first = explorer.update(
+            grid, observed, visits, 3.0, 3.0, 0.0, metres, 10, 1.0
+        )
+        self.assertTrue(first.active)
+
+        explorer.invalidate()
+
+        self.assertIsNone(explorer._target_cell)
+        self.assertIsNone(explorer._waypoint_cell)
+        self.assertEqual(explorer._path_cells, [])
+        self.assertIsNone(explorer._route_free)
+
+    def test_invalidate_forces_a_full_replan_before_the_normal_throttle(self) -> None:
+        """A map recentre makes cached grid-index state point at the wrong
+        physical place; invalidate() must not make the caller wait out
+        REPLAN_PERIOD_S before a fresh route replaces it."""
+        cells = 120
+        metres = 6.0
+        grid = np.zeros((cells, cells), dtype=np.uint8)
+        observed = np.zeros_like(grid)
+        visits = np.zeros((cells, cells), dtype=np.uint16)
+        cv2.circle(observed, (60, 60), 32, 255, -1)
+        explorer = FrontierExplorer()
+        explorer.update(grid, observed, visits, 3.0, 3.0, 0.0, metres, 10, 1.0)
+        explorer.invalidate()
+
+        replanned = explorer.update(
+            grid, observed, visits, 3.0, 3.0, 0.0, metres, 11, 1.01
+        )
+
+        self.assertTrue(replanned.active)
+        self.assertIsNotNone(explorer._target_cell)
+
     def test_pose_inside_inflation_reconnects_to_nearby_known_free_space(self) -> None:
         cells = 120
         metres = 6.0

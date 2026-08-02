@@ -63,6 +63,21 @@ class FrontierExplorer:
         self._route_free: np.ndarray | None = None
         self._planning_ms = 0.0
 
+    def invalidate(self) -> None:
+        """Drop cached grid-index state and force an immediate replan.
+
+        Call this whenever the caller's occupancy grid was recentred (rolled
+        to keep the robot away from its edge): every cached target/waypoint
+        cell and the cached route mask are indices into the grid *before* the
+        shift, so reusing them would aim the robot at the wrong physical
+        place until the next scheduled replan caught up.
+        """
+        self._target_cell = None
+        self._waypoint_cell = None
+        self._path_cells = []
+        self._route_free = None
+        self._next_replan_at = 0.0
+
     @staticmethod
     def _relative_heading_deg(
         x_m: float,

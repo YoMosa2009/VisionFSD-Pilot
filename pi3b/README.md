@@ -214,7 +214,11 @@ move during that interval. Afterwards its authority order is fixed:
    a short LiDAR-cleared reverse curve with
    both wheels driven, a slow one-wheel reverse turn toward the best full
    body-width LiDAR corridor, then a short forward commit and immediate return
-   to live corridor planning. A calibrated USB LSM6DS3 or GPIO MPU-6050 releases the turn after
+   to live corridor planning. Which side counts as "open" for that turn is
+   scored with the same windowed body-width minimum used for forward path
+   selection rather than the single farthest ray in the sweep, so one lucky
+   LiDAR return narrower than the chassis can no longer look like a viable
+   escape direction. A calibrated USB LSM6DS3 or GPIO MPU-6050 releases the turn after
    measured yaw reaches the clear corridor and hard-limits each turn to
    88 degrees; a 2.4-second bound applies if IMU yaw is unavailable. It may try
    the opposite side once. It stops as `STOP:BOXED_IN` when neither bounded
@@ -238,6 +242,26 @@ move during that interval. Afterwards its authority order is fixed:
    or stale, navigation continues with command-predicted yaw corrected by
    successive LD19 scans. Recovery turns use that corrected pose heading when
    available, retaining the same 2.4-second hard timeout as the final bound.
+8. A stuck detector runs alongside the corridor/escape logic above. It has no
+   way to see the floor, so it infers "is the chassis actually responding" from
+   independent evidence instead: LD19 scan-to-obstacle progress against a
+   nearby tracked return, camera optical flow while translating, measured IMU
+   yaw rate while pivoting, and the Uno's own `blocked` flag. Each source only
+   ever votes that the chassis is or is not moving when it has a genuinely
+   fresh, currently-applicable signal; otherwise it abstains, and abstention
+   alone never counts as evidence of being stuck. If a commanded drive keeps
+   running for over a second with at least one source voting "not moving" and
+   none voting "moving" -- a wheel spinning uselessly on a rug, a caster
+   snagged on a threshold, a corner wedge mid-pivot -- it stops trusting that
+   command and tries a different, LiDAR-checked maneuver (the opposite turn
+   side, a reverse, or a center pivot) instead of repeating the one that
+   is not working. After three maneuvers still produce no evidence of motion,
+   it stops cleanly and reports `STOP:STUCK_SLIPPING_NEEDS_RESET` or
+   `STOP:STUCK_STALLED_NEEDS_RESET` (IMU vibration distinguishes the two only
+   for the operator; it never gates detection or recovery) rather than
+   grinding the motors indefinitely. It resumes on its own as soon as any
+   source reports real motion again, including a person picking the chassis
+   up and setting it back down, without needing a restart.
 
 This keeps roles separate: LD19 geometry chooses an open direction, the camera
 supplies only bounded optical-flow pose cues, and the Uno enforces the final
@@ -257,7 +281,11 @@ The full-screen LiDAR-only dashboard shows commanded PWM, Uno-reported actual PW
 ultrasonic `blocked` flag, `IMU LSM6DS3 USB CALIBRATING/LIVE/STALE`, frontier/patrol
 mode, target bearing/range, frontier count, observed-map coverage, and latest
 planner time. It also reports IMU motion/vibration magnitude and camera-flow
-confidence. The occupancy grid uses
+confidence. The `POLICY` line reports `STUCK_RECOVER_<maneuver>:<attempt>` while
+the stuck detector is trying an alternate maneuver, and `STOP:STUCK_*_NEEDS_RESET`
+once it has given up after three attempts; the log's `NAV`/`NAV_EVENT` lines carry
+the same information plus a per-source `M`/`N`/`U` (moving/not-moving/unknown)
+breakdown for diagnosing which evidence source triggered it. The occupancy grid uses
 about 2.1 cm cells, up to 240 current-scan free-space rays, and useful LD19
 returns up to 5.8 m where map bounds permit. These software changes do not
 increase the LD19's physical range or create true odometry.
@@ -357,7 +385,12 @@ bias. Calibration rejects samples with excessive motion and pauses rather than
 resetting valid progress. USB LSM6DS3 is
 preferred, GPIO MPU-6050 is second, and `LD19+COMMAND POSE ACTIVE` remains the
 automatic fallback if neither IMU is usable. Missing IMU hardware never creates
-a no-motion boot failure.
+a no-motion boot failure. The aggregate acceptance bar for a stationary
+calibration window (versus the noisier MPU-6050's) is tighter for the USB
+LSM6DS3, since its datasheet gyro/accel noise is meaningfully lower; this is a
+moderate tightening chosen to keep converging reliably, not the tightest bar
+that would pass on a bench sample, and its effect on real calibration retry
+rate still needs field verification on the robot.
 
 The gyro improves short-term turn measurement and smooths excessive yaw. Its
 accelerometer is not integrated into position because chassis vibration,
@@ -368,8 +401,18 @@ Neither supported IMU has a magnetometer, so neither provides absolute heading.
 
 The LD19-only panel keeps an 8 m occupancy map at about 2.1 cm per cell. Its
 6 m display viewport follows the estimated chassis position and keeps the robot
-marker centred, while the underlying map remains fixed in its estimated world
-coordinates. Every valid
+marker centred. The underlying grid is a fixed-size sliding window, not a
+buffer anchored at the start position: once the estimated pose approaches
+the edge of the 8 m buffer, the grid recenters around the robot (shifting its
+contents and blanking the band that scrolled in from the far side) rather than
+pinning the pose at the boundary. Earlier versions clamped position at that
+boundary instead, which froze the dead-reckoned pose while the robot kept
+moving physically -- every new scan then projected onto that stale position,
+so the map stopped updating and the display showed a growing region that was
+never drawn. The trade-off of the sliding window is that ground the robot
+already covered can scroll out of the buffer on a long one-direction traverse,
+so `coverage_ratio` and the least-visited patrol mode are relative to the
+current window, not a persistent record of the whole session. Every valid
 scan marks both obstacle endpoints and the observed free ray leading to each
 endpoint. Repeated free observations clear stale hit evidence; persistent hits
 remain obstacles. Bright current-scan points remain distinct from mapped

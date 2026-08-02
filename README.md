@@ -193,6 +193,25 @@ clearance, and the mapper consumes the IMU's asynchronously integrated yaw
 delta instead of estimating every turn only from the latest rate sample. The
 dashboard also reports acceleration deviation as a motion/vibration diagnostic;
 it is not treated as position.
+In v1.9.10, the occupancy grid recenters around the robot instead of clamping
+its dead-reckoned position at a fixed buffer edge, which previously froze the
+pose and stopped the map from updating on a long one-direction traverse. A new
+stuck detector combines LD19 approach-progress, camera optical flow, IMU yaw
+rate, and the Uno's `blocked` flag into independent motion evidence; when a
+commanded drive keeps running with no corroborating evidence of real motion,
+it tries a different LiDAR-checked maneuver instead of repeating one that
+is not working, and reports a clear `STOP:STUCK_*_NEEDS_RESET` rather than
+grinding the motors after a few failed attempts. It resumes automatically once
+any source reports real motion again, including a manual reposition. The
+escape state machine's turn-side scoring now uses the same body-width windowed
+minimum as forward path selection instead of the single farthest ray in a
+sweep, so a gap narrower than the chassis can no longer look like a viable
+escape direction. The USB LSM6DS3's stationary-calibration acceptance bar is
+moderately tighter than the GPIO MPU-6050's, reflecting its lower datasheet
+noise. The on-screen robot dashboard and window title now show the running
+version, not only the startup log line. This version's physical driving
+behavior has not yet been confirmed on the robot; software-only verification
+(compileall, pyflakes, targeted unit tests) is not a substitute for that.
 The Pi launcher uses the available XWayland display and reapplies fullscreen
 after the first dashboard frames so the LiDAR UI fills the connected screen.
 

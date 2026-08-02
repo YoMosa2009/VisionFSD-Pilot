@@ -31,6 +31,7 @@ class SlamLiteState:
     translation_matched: bool = False
     observed_cells: int = 0
     yaw_source: str = "COMMAND+LD19"
+    recenter_count: int = 0
 
 
 class LidarSlamLite:
@@ -46,6 +47,14 @@ class LidarSlamLite:
     BIN_DEGREES = 360.0 / BIN_COUNT
     MIN_MATCH_BINS = 75
     MAX_SCAN_AGE_S = 0.35
+    # Recenter once the robot enters the outer fraction of the grid on either
+    # axis, well before integrate_motion's safety clamp could ever bind. This
+    # keeps the map a sliding window around the robot instead of a fixed
+    # buffer anchored at the start position: without it, a robot that
+    # travelled far enough from its origin would have its dead-reckoned pose
+    # pinned at the array edge while it kept moving physically, so every new
+    # scan projected onto a stale position and the map stopped updating.
+    RECENTER_MARGIN_FRACTION = 0.20
 
     def __init__(self, cells: int = 384, metres: float = 8.0) -> None:
         self.cells = cells
@@ -56,6 +65,7 @@ class LidarSlamLite:
         self.x = metres / 2.0
         self.y = metres / 2.0
         self.heading = 0.0
+        self._recenter_count = 0
         self._last_motion_at: float | None = None
         self._last_scan_stamp = -1.0
         self._previous_bins: np.ndarray | None = None
@@ -229,9 +239,69 @@ class LidarSlamLite:
         radians = math.radians(self.heading)
         self.x += math.sin(radians) * linear_mps * elapsed
         self.y -= math.cos(radians) * linear_mps * elapsed
-        margin = 0.20
-        self.x = float(np.clip(self.x, margin, self.metres - margin))
-        self.y = float(np.clip(self.y, margin, self.metres - margin))
+        self._recenter_if_needed()
+
+    def _recenter_if_needed(self) -> bool:
+        """Keep the robot away from the fixed grid's edge by scrolling it.
+
+        Shifts grid/observed/visits by an integer cell offset so the robot
+        lands back near the centre, and moves self.x/self.y by the same
+        distance so the world-frame pose stays numerically consistent with
+        the new cell mapping.  Returns True when a shift happened, so the
+        caller can invalidate anything else holding cell-index coordinates
+        into this grid (frontier/route caches).
+        """
+        scale = self.cells / self.metres
+        margin_cells = max(1, int(round(self.cells * self.RECENTER_MARGIN_FRACTION)))
+        robot_row = int(round(self.y * scale))
+        robot_col = int(round(self.x * scale))
+        near_edge = (
+            robot_row < margin_cells
+            or robot_row > self.cells - 1 - margin_cells
+            or robot_col < margin_cells
+            or robot_col > self.cells - 1 - margin_cells
+        )
+        if not near_edge:
+            return False
+        centre = self.cells // 2
+        shift_row = centre - robot_row
+        shift_col = centre - robot_col
+        self.grid = self._rolled_and_cleared(self.grid, shift_row, shift_col)
+        self.observed = self._rolled_and_cleared(self.observed, shift_row, shift_col)
+        self.visits = self._rolled_and_cleared(self.visits, shift_row, shift_col)
+        if self._latest_hits.size:
+            shifted = self._latest_hits + np.array([shift_row, shift_col], dtype=np.int32)
+            inside = (
+                (shifted[:, 0] >= 0) & (shifted[:, 0] < self.cells)
+                & (shifted[:, 1] >= 0) & (shifted[:, 1] < self.cells)
+            )
+            self._latest_hits = shifted[inside]
+        self.y += shift_row / scale
+        self.x += shift_col / scale
+        self._recenter_count += 1
+        return True
+
+    @staticmethod
+    def _rolled_and_cleared(array: np.ndarray, shift_row: int, shift_col: int) -> np.ndarray:
+        """Roll array contents by an integer cell offset and blank the seam.
+
+        np.roll wraps cyclically: the band that wraps in from the far side of
+        the array is stale content from outside the robot's actual vicinity,
+        not real geometry adjacent to its new position, so it must be zeroed
+        rather than left to look like a phantom wall or false free space.
+        """
+        if shift_row == 0 and shift_col == 0:
+            return array
+        rolled = np.roll(array, (shift_row, shift_col), axis=(0, 1))
+        if shift_row > 0:
+            rolled[:shift_row, :] = 0
+        elif shift_row < 0:
+            rolled[shift_row:, :] = 0
+        if shift_col > 0:
+            rolled[:, :shift_col] = 0
+        elif shift_col < 0:
+            rolled[:, shift_col:] = 0
+        return rolled
 
     def _align_translation(
         self, points: list[tuple[int, object]]
@@ -484,6 +554,7 @@ class LidarSlamLite:
                 if self._using_camera
                 else "COMMAND+LD19"
             ),
+            self._recenter_count,
         )
 
     def render(
@@ -493,7 +564,10 @@ class LidarSlamLite:
         waypoint_xy: tuple[float, float] | None = None,
     ) -> np.ndarray:
         # Keep the estimated chassis at the centre of a robot-following local
-        # viewport. The underlying occupancy grid remains the full 8 m map.
+        # viewport. The underlying occupancy grid is a fixed-size sliding
+        # window that recenters around the robot (see _recenter_if_needed),
+        # not a buffer anchored at the start position, so it keeps covering
+        # new ground no matter how far the robot travels from its origin.
         view_metres = min(6.0, self.metres)
         view_cells = self.cells * view_metres / self.metres
         pixels_per_cell = size / view_cells

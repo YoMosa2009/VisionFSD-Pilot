@@ -38,7 +38,11 @@ from visionfsd_pi import (
 )
 
 
-WINDOW_TITLE = "VisionFSD Pi Robot - standby"
+_VERSION_FILE = Path(__file__).resolve().parent / "VERSION"
+RUNTIME_VERSION = (
+    _VERSION_FILE.read_text(encoding="utf-8").strip() if _VERSION_FILE.is_file() else "dev"
+)
+WINDOW_TITLE = f"VisionFSD Pi Robot v{RUNTIME_VERSION} - standby"
 UNO_BAUD = 115200
 UNO_HEARTBEAT_S = 0.09
 # Keep the last safe command across bounded USB-I2C/camera/planner stalls. The
@@ -102,6 +106,38 @@ CAMERA_CAPTURE_HEIGHT = 240
 CAMERA_CAPTURE_FPS = 15
 IMU_SOFT_YAW_RATE_DPS = 38.0
 IMU_HARD_YAW_RATE_DPS = 55.0
+
+# Stuck detection: independent evidence that the chassis is not actually
+# responding to a commanded drive (wheel slip on a rug, a snagged caster, a
+# corner wedge during a pivot), distinct from the LiDAR/ultrasonic geometry
+# checks above. Each source below only ever votes MOVING or NOT_MOVING when
+# it has a real, freshly corroborating signal; anything else is UNKNOWN, and
+# UNKNOWN alone never accumulates into a stuck declaration.
+STUCK_CONFIRM_WINDOW_S = 1.20
+STUCK_MIN_NOT_MOVING_VOTES = 3
+STUCK_RECOVERY_ATTEMPT_S = 0.80
+STUCK_MAX_RECOVERY_ATTEMPTS = 3
+# Without a live IMU, _external_motion_detected() has nothing to observe (its
+# only signals are gyro/accel), so a latched STOP could otherwise persist
+# until the process restarts even if the obstruction has since cleared on its
+# own. Re-arm periodically in every mode; a genuinely still-stuck chassis just
+# re-latches after another bounded attempt burst.
+STUCK_RELATCH_RETRY_S = 25.0
+STUCK_CAMERA_CONFIDENCE_MIN = 0.35
+STUCK_IMU_YAW_RATE_DPS = 5.0
+STUCK_TURN_COMMAND_MIN_SPLIT = 18
+STUCK_LIDAR_PROGRESS_MAX_M = 1.20
+STUCK_LIDAR_PROGRESS_MIN_WINDOW_S = 0.60
+STUCK_LIDAR_PROGRESS_MIN_ADVANCE_M = 0.025
+# Untuned pending a physical test: separates a slipping-wheel report from a
+# stalled one for the operator, but never gates detection or recovery.
+STUCK_VIBRATION_G = 0.12
+# Well above the gyro/accel noise this project observes while genuinely
+# stationary (bias tracking only runs "during confirmed stationary periods"),
+# so either crossing this bar while STOP-latched means a person is handling
+# the chassis, not sensor noise.
+STUCK_EXTERNAL_YAW_RATE_DPS = 12.0
+STUCK_EXTERNAL_ACCEL_G = 0.25
 
 # Measured chassis, in metres.  The planner needs its own width because a
 # rectangle fits through a gap that a point always would: this is what lets it
@@ -275,6 +311,23 @@ def corridor_profile(
     inside = (cos > 0.02) & (np.abs(lateral) <= CORRIDOR_HALF_WIDTH_M)
     limits = np.where(inside, along, np.inf).min(axis=1) - FRONT_OVERHANG_M
     return np.clip(limits, 0.0, PLANNING_HORIZON_M).astype(np.float32)
+
+
+def windowed_min_profile(
+    profile: np.ndarray, half_width_deg: int = OPENING_HALF_WIDTH_DEG
+) -> np.ndarray:
+    """Minimum clearance within a half_width_deg window around each heading.
+
+    A single heading with a long range can be a sampling gap between two
+    objects rather than a genuine opening. Scoring the minimum across a small
+    window requires the body to actually fit before a direction counts as
+    open, instead of one lucky LiDAR ray making a narrow gap look clear.
+    """
+    padded = np.pad(profile, (half_width_deg, half_width_deg), mode="edge")
+    return np.minimum.reduce([
+        padded[offset:offset + profile.size]
+        for offset in range(half_width_deg * 2 + 1)
+    ])
 
 
 def discover_arduino_port() -> str | None:
@@ -920,11 +973,26 @@ class AutonomousPolicy:
         self.pose_yaw_source = "COMMAND+LD19"
         self._escape_turn_yaw_source = "TIME"
         self.exploration = ExplorationState()
+        self.imu_accel_deviation_g: float | None = None
+        self._stuck_phase = "IDLE"
+        self._stuck_phase_until = 0.0
+        self._stuck_maneuver: str | None = None
+        self._stuck_recovery_attempts = 0
+        self._stuck_window_start: float | None = None
+        self._stuck_not_moving_ticks = 0
+        self._stuck_latched_reason = "STOP:STUCK_NEEDS_RESET"
+        self._stuck_latched_at = 0.0
+        self._progress_reference_m: float | None = None
+        self._progress_reference_at = 0.0
+        self._progress_direction: str | None = None
+        self.stuck_phase = "IDLE"
+        self.stuck_votes: dict[str, str] = {}
 
     def observe_imu(self, state: IMUState) -> None:
         ready = state.connected and state.calibrated and state.fresh
         self.imu_yaw_rate_dps = state.gyro_z_dps if ready else None
         self.imu_yaw_deg = state.yaw_deg if ready else None
+        self.imu_accel_deviation_g = state.accel_deviation_g if ready else None
 
     def observe_exploration(self, state: ExplorationState) -> None:
         self.exploration = state
@@ -1009,12 +1077,20 @@ class AutonomousPolicy:
         )
 
     def _turn_side_score(self, lidar: SectorClearance, direction: str) -> float | None:
-        """Use the full corridor sweep without ignoring a close side return."""
+        """Use the full corridor sweep without ignoring a close side return.
+
+        The sector is scored through the same windowed-minimum treatment as
+        forward heading selection. A bare max() over the sector let a single
+        lucky ray look like a clear escape direction, which could pick a gap
+        too narrow for the body and made the recovery state machine bounce
+        between a turn attempt and STOP.
+        """
         sector_score = self._raw_turn_side_score(lidar, direction)
         if lidar.profile is None:
             return sector_score
+        opening = windowed_min_profile(lidar.profile)
         mask = STEER_HEADINGS <= -20.0 if direction == "L" else STEER_HEADINGS >= 20.0
-        corridor_score = float(np.max(lidar.profile[mask]))
+        corridor_score = float(np.max(opening[mask]))
         if not np.isfinite(corridor_score):
             return sector_score
         if (
@@ -1417,12 +1493,7 @@ class AutonomousPolicy:
         # genuinely broad opening wins over one lucky LiDAR ray. The footprint
         # is already inflated in corridor_profile(); this adds steering-error
         # tolerance rather than pretending the robot is wider than measured.
-        half_width = OPENING_HALF_WIDTH_DEG
-        padded = np.pad(profile, (half_width, half_width), mode="edge")
-        opening = np.minimum.reduce([
-            padded[offset:offset + profile.size]
-            for offset in range(half_width * 2 + 1)
-        ])
+        opening = windowed_min_profile(profile)
         # Clear distance stops being worth anything once there is a decent run
         # ahead; without saturation the robot always turns toward whichever
         # direction is roomiest and curls instead of crossing the room.
@@ -1499,7 +1570,16 @@ class AutonomousPolicy:
         return self._set_output("STOP", 0, 0)
 
     def decide(self, lidar: SectorClearance, arduino: ArduinoStatus, _person: bool, now: float,
-               camera_ready: bool = True, imu_ready: bool = True) -> str:
+               camera_ready: bool = True, imu_ready: bool = True,
+               camera_motion: CameraMotionState | None = None) -> str:
+        previous_output = (self.left_pwm, self.right_pwm)
+        command = self._plan(lidar, arduino, _person, now, camera_ready, imu_ready)
+        return self._apply_stuck_check(
+            lidar, arduino, now, command, camera_motion, previous_output
+        )
+
+    def _plan(self, lidar: SectorClearance, arduino: ArduinoStatus, _person: bool, now: float,
+              camera_ready: bool = True, imu_ready: bool = True) -> str:
         if now - self.started_at < self.standby_s:
             return self._set_stop(f"STANDBY {max(0, int(self.standby_s - (now - self.started_at)))}s")
         if now - arduino.received_at > 1.5:
@@ -1612,6 +1692,280 @@ class AutonomousPolicy:
         self.reason = "CLEAR:GUIDED_FORWARD" if abs(bias) >= 0.04 else "CLEAR:FORWARD"
         return self._set_output("F", left_pwm, right_pwm)
 
+    # -- Stuck detection -------------------------------------------------
+    #
+    # The escape state machine above reacts to LiDAR/ultrasonic geometry: it
+    # assumes that a command which *should* be safe actually moves the
+    # chassis. It has no way to notice a loaded wheel spinning uselessly on a
+    # rug, a caster snagged on a threshold, or a corner wedge during a pivot.
+    # This layer wraps every decision with independent evidence of whether
+    # the world is actually changing the way a commanded drive predicts, and
+    # only overrides the plan once several independent signals agree nothing
+    # is happening.
+
+    def _lidar_progress_evidence(
+        self, lidar: SectorClearance, left_pwm: int, right_pwm: int, now: float
+    ) -> str:
+        """Track whether a nearby tracked range is closing as commanded.
+
+        Requires a real scan timestamp (scan_at) so this only ever engages
+        against live LD19 telemetry, and only tracks a reference within
+        STUCK_LIDAR_PROGRESS_MAX_M: a wall metres away closes too slowly per
+        control tick to separate real progress from LiDAR bin noise.
+        """
+        if lidar.scan_at is None:
+            self._progress_reference_m = None
+            return "UNKNOWN"
+        forward = left_pwm > 0 and right_pwm > 0
+        reverse = left_pwm < 0 and right_pwm < 0
+        if forward:
+            reference_m, direction = lidar.front_m, "F"
+        elif reverse:
+            reference_m, direction = lidar.rear_m, "B"
+        else:
+            self._progress_reference_m = None
+            return "UNKNOWN"
+        if reference_m is None or reference_m > STUCK_LIDAR_PROGRESS_MAX_M:
+            self._progress_reference_m = None
+            return "UNKNOWN"
+        if self._progress_direction != direction or self._progress_reference_m is None:
+            self._progress_reference_m = reference_m
+            self._progress_reference_at = now
+            self._progress_direction = direction
+            return "UNKNOWN"
+        elapsed = now - self._progress_reference_at
+        if elapsed < STUCK_LIDAR_PROGRESS_MIN_WINDOW_S:
+            return "UNKNOWN"
+        advanced = abs(self._progress_reference_m - reference_m)
+        self._progress_reference_m = reference_m
+        self._progress_reference_at = now
+        return "MOVING" if advanced >= STUCK_LIDAR_PROGRESS_MIN_ADVANCE_M else "NOT_MOVING"
+
+    def _motion_evidence(
+        self,
+        lidar: SectorClearance,
+        arduino: ArduinoStatus,
+        now: float,
+        camera_motion: CameraMotionState | None,
+    ) -> dict[str, str]:
+        """Vote MOVING/NOT_MOVING/UNKNOWN per independent evidence source.
+
+        Every source defaults to UNKNOWN unless it has a genuinely fresh,
+        currently-applicable signal; UNKNOWN never counts as evidence of
+        being stuck, only silence.
+        """
+        left_pwm, right_pwm = self.left_pwm, self.right_pwm
+        votes: dict[str, str] = {}
+
+        translating = (
+            (left_pwm > 0 and right_pwm > 0) or (left_pwm < 0 and right_pwm < 0)
+        )
+        if (
+            translating
+            and camera_motion is not None
+            and camera_motion.fresh
+            and camera_motion.confidence >= STUCK_CAMERA_CONFIDENCE_MIN
+        ):
+            votes["camera"] = "MOVING" if camera_motion.motion_observed else "NOT_MOVING"
+        else:
+            votes["camera"] = "UNKNOWN"
+
+        turning = abs(left_pwm - right_pwm) >= STUCK_TURN_COMMAND_MIN_SPLIT
+        if turning and self.imu_yaw_rate_dps is not None:
+            votes["imu"] = (
+                "MOVING"
+                if abs(self.imu_yaw_rate_dps) >= STUCK_IMU_YAW_RATE_DPS
+                else "NOT_MOVING"
+            )
+        else:
+            votes["imu"] = "UNKNOWN"
+
+        forward_component = left_pwm >= 0 and right_pwm >= 0 and (left_pwm > 0 or right_pwm > 0)
+        votes["uno"] = "NOT_MOVING" if (arduino.blocked and forward_component) else "UNKNOWN"
+
+        votes["lidar"] = self._lidar_progress_evidence(lidar, left_pwm, right_pwm, now)
+        return votes
+
+    def _stuck_reason_detail(self) -> str:
+        if self.imu_accel_deviation_g is None:
+            return "STUCK"
+        return "SLIPPING" if self.imu_accel_deviation_g >= STUCK_VIBRATION_G else "STALLED"
+
+    def _external_motion_detected(self) -> bool:
+        """Detect the chassis being freed/repositioned while STOP-latched.
+
+        Every vote in _motion_evidence is defined relative to a commanded
+        drive, but a latched STUCK state commands zero PWM, so those sources
+        can never fire again on their own. IMU rotation or vibration clearly
+        above the stationary bias/noise band is the only signal available
+        that a person picked the chassis up, and is exactly the condition
+        that should let it resume automatically once released.
+        """
+        if (
+            self.imu_yaw_rate_dps is not None
+            and abs(self.imu_yaw_rate_dps) >= STUCK_EXTERNAL_YAW_RATE_DPS
+        ):
+            return True
+        return (
+            self.imu_accel_deviation_g is not None
+            and self.imu_accel_deviation_g >= STUCK_EXTERNAL_ACCEL_G
+        )
+
+    def _stuck_candidate_maneuvers(self, lidar: SectorClearance) -> list[str]:
+        """Geometrically-safe recovery options, reusing the escape helpers'
+        own LiDAR clearance checks rather than driving open-loop."""
+        candidates: list[str] = []
+        rear_ok = lidar.rear_m is not None and lidar.rear_m >= ESCAPE_REAR_CLEARANCE_M
+        if rear_ok:
+            candidates.append("REVERSE")
+        if self._can_turn_without_reverse(lidar, "L"):
+            candidates.append("PIVOT_L")
+            if rear_ok:
+                candidates.append("REVERSE_ARC_L")
+        if self._can_turn_without_reverse(lidar, "R"):
+            candidates.append("PIVOT_R")
+            if rear_ok:
+                candidates.append("REVERSE_ARC_R")
+        return candidates
+
+    def _drive_stuck_maneuver(self, maneuver: str, lidar: SectorClearance) -> str | None:
+        """Execute a recovery maneuver, re-checking its own safety condition
+        against the current scan rather than trusting a stale selection."""
+        if maneuver == "REVERSE":
+            if lidar.rear_m is None or lidar.rear_m < ESCAPE_REAR_CLEARANCE_M:
+                return None
+            return self._reverse_straight()
+        if maneuver in ("PIVOT_L", "PIVOT_R"):
+            direction = "L" if maneuver == "PIVOT_L" else "R"
+            if not self._can_turn_without_reverse(lidar, direction):
+                return None
+            return self._pivot_crawl(direction)
+        if maneuver in ("REVERSE_ARC_L", "REVERSE_ARC_R"):
+            direction = "L" if maneuver == "REVERSE_ARC_L" else "R"
+            if lidar.rear_m is None or lidar.rear_m < ESCAPE_REAR_CLEARANCE_M:
+                return None
+            return self._reverse_arc(direction)
+        return None
+
+    def _latch_stuck(self, now: float) -> str:
+        self._stuck_phase = "LATCHED"
+        self._stuck_latched_at = now
+        self._stuck_latched_reason = f"STOP:STUCK_{self._stuck_reason_detail()}_NEEDS_RESET"
+        self.reason = self._stuck_latched_reason
+        self.stuck_phase = self._stuck_phase
+        return self._hold_stop(self._stuck_latched_reason)
+
+    def _advance_stuck_recovery(self, lidar: SectorClearance, now: float) -> str:
+        # A confirmed stuck condition means the escape state machine's own
+        # assumptions (that its chosen action moves the chassis) are already
+        # false; let stuck-recovery own the drive output instead of leaving
+        # stale escape timers to fight it once cleared.
+        self._reset_escape()
+        self._stuck_recovery_attempts += 1
+        candidates = self._stuck_candidate_maneuvers(lidar)
+        if self._stuck_recovery_attempts > STUCK_MAX_RECOVERY_ATTEMPTS or not candidates:
+            return self._latch_stuck(now)
+        maneuver = candidates[(self._stuck_recovery_attempts - 1) % len(candidates)]
+        command = self._drive_stuck_maneuver(maneuver, lidar)
+        if command is None:
+            return self._latch_stuck(now)
+        self._stuck_phase = "RECOVER"
+        self._stuck_maneuver = maneuver
+        self._stuck_phase_until = now + STUCK_RECOVERY_ATTEMPT_S
+        self._stuck_window_start = None
+        self._stuck_not_moving_ticks = 0
+        self.reason = f"STUCK_RECOVER_{maneuver}:{self._stuck_recovery_attempts}"
+        self.drive_confidence = 0.15
+        self.stuck_phase = self._stuck_phase
+        return command
+
+    def _apply_stuck_check(
+        self,
+        lidar: SectorClearance,
+        arduino: ArduinoStatus,
+        now: float,
+        command: str,
+        camera_motion: CameraMotionState | None,
+        previous_output: tuple[int, int],
+    ) -> str:
+        if self._stuck_phase == "LATCHED":
+            re_armed = now - self._stuck_latched_at >= STUCK_RELATCH_RETRY_S
+            if not self._external_motion_detected() and not re_armed:
+                self.stuck_phase = self._stuck_phase
+                return self._hold_stop(self._stuck_latched_reason)
+            self._stuck_phase = "IDLE"
+            self._stuck_recovery_attempts = 0
+
+        votes = self._motion_evidence(lidar, arduino, now, camera_motion)
+        self.stuck_votes = votes
+        if "MOVING" in votes.values():
+            verdict = "MOVING"
+        elif "NOT_MOVING" in votes.values():
+            verdict = "NOT_MOVING"
+        else:
+            verdict = "UNKNOWN"
+
+        if verdict == "MOVING":
+            self._stuck_window_start = None
+            self._stuck_not_moving_ticks = 0
+            self._stuck_phase = "IDLE"
+            self._stuck_recovery_attempts = 0
+            self.stuck_phase = self._stuck_phase
+            return command
+
+        if command == "STOP":
+            # _plan() already refused to drive this tick for its own reason
+            # (stale camera/LiDAR/Uno status, standby, IMU calibrating, an
+            # existing boxed-in stop, ...). Those safety stops must win over
+            # stuck-recovery: driving a maneuver through a stale-sensor STOP
+            # would be blind driving, and a single stale LD19 scan would
+            # otherwise make every candidate maneuver look unsafe and latch
+            # STUCK permanently. Let the plan's own STOP stand and simply
+            # stop accumulating suspicion while it holds.
+            self._stuck_window_start = None
+            self._stuck_not_moving_ticks = 0
+            self.stuck_phase = self._stuck_phase
+            return command
+
+        if self._stuck_phase == "RECOVER":
+            self.left_pwm, self.right_pwm = previous_output
+            if now < self._stuck_phase_until:
+                maneuver_command = self._drive_stuck_maneuver(self._stuck_maneuver, lidar)
+                if maneuver_command is not None:
+                    # _plan() unconditionally overwrites self.reason every
+                    # tick; restate the recovery reason so the dashboard and
+                    # NAV log reflect what is actually being driven.
+                    self.reason = f"STUCK_RECOVER_{self._stuck_maneuver}:{self._stuck_recovery_attempts}"
+                    self.stuck_phase = self._stuck_phase
+                    return maneuver_command
+            return self._advance_stuck_recovery(lidar, now)
+
+        commanding = self.left_pwm != 0 or self.right_pwm != 0
+        if not commanding:
+            self._stuck_window_start = None
+            self._stuck_not_moving_ticks = 0
+            self.stuck_phase = self._stuck_phase
+            return command
+
+        if verdict == "NOT_MOVING":
+            if self._stuck_window_start is None:
+                self._stuck_window_start = now
+                self._stuck_not_moving_ticks = 0
+            self._stuck_not_moving_ticks += 1
+        elif self._stuck_window_start is None:
+            self.stuck_phase = self._stuck_phase
+            return command
+
+        if (
+            self._stuck_not_moving_ticks >= STUCK_MIN_NOT_MOVING_VOTES
+            and now - self._stuck_window_start >= STUCK_CONFIRM_WINDOW_S
+        ):
+            self.left_pwm, self.right_pwm = previous_output
+            return self._advance_stuck_recovery(lidar, now)
+
+        self.stuck_phase = self._stuck_phase
+        return command
+
     def send(self, link: ArduinoLink, command: str, now: float) -> None:
         # Renew a short control lease every decision.  ArduinoLink refreshes
         # the selected output independently, so bounded planner/display stalls
@@ -1643,7 +1997,7 @@ def draw_dashboard(local_map: np.ndarray, policy: AutonomousPolicy,
     camera_state = "LIVE" if camera_ready else "STALE"
     if camera_motion is not None and camera_motion.fresh:
         camera_state += f" FLOW {camera_motion.confidence:.2f}/{camera_motion.tracked_features}"
-    cv2.putText(panel, "VisionFSD Robot - LiDAR navigation", (12, 24),
+    cv2.putText(panel, f"VisionFSD Robot v{RUNTIME_VERSION} - LiDAR navigation", (12, 24),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, (238, 244, 250), 1, cv2.LINE_AA)
     cv2.putText(panel, f"POLICY {policy.reason}", (12, 49), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
                 (90, 235, 130) if policy.last_command == "F" else (80, 190, 245), 1, cv2.LINE_AA)
@@ -1785,6 +2139,7 @@ def main() -> int:
     fullscreen_refreshes = 12
     next_telemetry_at = 0.0
     last_policy_state: tuple[str, str, str] | None = None
+    last_recenter_count = slam_lite.recenter_count
     last_imu_error: str | None = None
     calibrated_source: str | None = None
     imu_probe_until = policy.started_at + IMU_PROBE_GRACE_S
@@ -1865,6 +2220,14 @@ def main() -> int:
                 imu_yaw,
             )
             policy.observe_pose(slam_lite)
+            if slam_lite.recenter_count != last_recenter_count:
+                # The occupancy grid just scrolled to keep the robot off its
+                # edge. Cached frontier/route cell indices point at the grid
+                # as it existed before the shift, so they now aim at the
+                # wrong physical place; drop them and force a fresh plan
+                # against the recentred grid rather than translating indices.
+                explorer.invalidate()
+                last_recenter_count = slam_lite.recenter_count
             # Make the safety decision and refresh the Uno watchdog before the
             # advisory global planner runs.  A bounded but non-trivial A* search
             # must never turn route computation into periodic motor dropouts.
@@ -1876,11 +2239,13 @@ def main() -> int:
                 control_now,
                 camera_ready,
                 imu_start_ready,
+                camera_motion,
             )
             policy.send(arduino, command, control_now)
             policy_state = (
                 command,
                 policy._escape_phase,
+                policy.stuck_phase,
                 policy.reason.split(":", 1)[0],
             )
             if policy_state != last_policy_state:
@@ -1890,7 +2255,9 @@ def main() -> int:
                 print(
                     f"NAV_EVENT reason={policy.reason} "
                     f"cmd={policy.left_pwm}/{policy.right_pwm} "
-                    f"front_path={event_front:.2f}"
+                    f"front_path={event_front:.2f} "
+                    f"stuck={policy.stuck_phase} "
+                    f"recenter={slam_lite.recenter_count}"
                 )
                 last_policy_state = policy_state
             exploration = explorer.update(
@@ -1909,6 +2276,9 @@ def main() -> int:
                 next_telemetry_at = now + TELEMETRY_PERIOD_S
                 front = "--" if clearance.front_m is None else f"{clearance.front_m:.2f}"
                 ultra = "--" if status.front_cm is None else f"{status.front_cm:.0f}"
+                stuck_votes = ",".join(
+                    f"{source}:{vote[0]}" for source, vote in sorted(policy.stuck_votes.items())
+                )
                 print(
                     f"NAV reason={policy.reason} front_m={front} ultra_cm={ultra} "
                     f"cmd={policy.left_pwm}/{policy.right_pwm} "
@@ -1922,7 +2292,9 @@ def main() -> int:
                     f"explore={exploration.mode} "
                     f"target_m={exploration.target_distance_m:.2f} "
                     f"bearing={exploration.heading_error_deg:+.0f} "
-                    f"plan_ms={exploration.planning_ms:.1f}"
+                    f"plan_ms={exploration.planning_ms:.1f} "
+                    f"stuck={policy.stuck_phase}[{stuck_votes}] "
+                    f"recenter={slam_lite.recenter_count}"
                 )
             if not args.no_display and now >= next_display_at:
                 next_display_at = now + DISPLAY_PERIOD_S

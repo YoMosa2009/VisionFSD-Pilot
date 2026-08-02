@@ -159,6 +159,17 @@ class MPU6050Tests(unittest.TestCase):
                 break
         self.assertTrue(state.calibrated)
 
+    def test_moderate_gyro_variance_still_converges_within_the_wider_aggregate_bar(self) -> None:
+        bus = _FakeBus()
+        imu = MPU6050Link(calibration_samples=20, bus_factory=lambda _number: bus)
+        state = None
+        for index in range(20):
+            # +/-2.0 dps alternating, population std 2.0 dps: inside the
+            # MPU-6050's CALIBRATION_GYRO_STD_MAX_DPS (2.5) aggregate bar.
+            bus.sample = _sample(gz=262 if index % 2 else -262)
+            state = imu.tick(1.0 + index * 0.03, stationary=True)
+        self.assertTrue(state.calibrated)
+
     def test_async_sampler_calibrates_without_main_loop_ticks(self) -> None:
         link = _ProgressLink()
         imu = AsyncIMULink(link, sample_period_s=0.005)
@@ -254,6 +265,23 @@ class MPU6050Tests(unittest.TestCase):
 
 
 class LSM6DS3Tests(unittest.TestCase):
+    def test_tighter_aggregate_bar_rejects_variance_the_mpu_would_accept(self) -> None:
+        self.assertLess(
+            LSM6DS3MCP2221Link.CALIBRATION_GYRO_STD_MAX_DPS,
+            MPU6050Link.CALIBRATION_GYRO_STD_MAX_DPS,
+        )
+        bus = _FakeLSMBus()
+        imu = LSM6DS3MCP2221Link(calibration_samples=20, bus_factory=lambda _number: bus)
+        state = None
+        for index in range(100):
+            # +/-2.1875 dps alternating, population std ~2.19 dps: inside the
+            # MPU-6050's 2.5 dps bar (see the MPU6050Tests counterpart of this
+            # test) but outside the LSM6DS3's tighter 1.5 dps bar, so this
+            # window should never converge no matter how long it runs.
+            bus.sample = _lsm_sample(gz=250 if index % 2 else -250)
+            state = imu.tick(1.0 + index * 0.03, stationary=True)
+        self.assertFalse(state.calibrated)
+
     def test_usb_imu_uses_short_startup_calibration_window(self) -> None:
         imu = LSM6DS3MCP2221Link(bus_factory=lambda _number: _FakeLSMBus())
         self.assertEqual(imu.calibration_samples, 40)

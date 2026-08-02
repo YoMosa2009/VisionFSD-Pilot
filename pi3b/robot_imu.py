@@ -117,6 +117,13 @@ class MPU6050Link:
     CALIBRATION_ACCEL_MIN_G = 0.70
     CALIBRATION_ACCEL_MAX_G = 1.30
     CALIBRATION_MAX_GYRO_DPS = 35.0
+    # Aggregate acceptance bar for the whole trimmed calibration window (see
+    # _finish_calibration), distinct from the CALIBRATION_MAX_GYRO_DPS/ACCEL_*
+    # per-sample stillness filter above. Overridable per sensor: a lower-noise
+    # part can demand a tighter bias fit without risking spurious retries.
+    CALIBRATION_GYRO_STD_MAX_DPS = 2.5
+    CALIBRATION_ACCEL_NORM_MIN = 0.75
+    CALIBRATION_ACCEL_NORM_MAX = 1.25
     SENSOR_NAME = "MPU-6050"
 
     def __init__(
@@ -232,8 +239,8 @@ class MPU6050Link:
         gyro_std = max(statistics.pstdev(axis) for axis in trimmed_axes)
         mean_accel_norm = statistics.fmean(sample[3] for sample in self._calibration)
         if (
-            gyro_std > 2.5
-            or not 0.75 <= mean_accel_norm <= 1.25
+            gyro_std > self.CALIBRATION_GYRO_STD_MAX_DPS
+            or not self.CALIBRATION_ACCEL_NORM_MIN <= mean_accel_norm <= self.CALIBRATION_ACCEL_NORM_MAX
         ):
             # Keep a rolling window instead of throwing valid progress back to
             # zero. A cable insertion or mild chassis jolt can spoil one
@@ -414,6 +421,17 @@ class LSM6DS3MCP2221Link(MPU6050Link):
     # LSM6DS3TR-C identifies as 0x6A. The older non-C LSM6DS3 uses 0x69.
     EXPECTED_IDS = (0x6A,)
     SENSOR_NAME = "LSM6DS3 USB"
+    # The LSM6DS3's datasheet gyro/accel noise is meaningfully lower than the
+    # MPU-6050's, so a stationary calibration window should settle well
+    # inside a tighter aggregate bar than the one tuned for the noisier
+    # part above. This is a moderate tightening, not the tightest bar that
+    # would pass a bench sample: the "Make USB IMU calibration converge
+    # reliably" fix depends on this step actually finishing, so pushing it
+    # too tight would trade a better bias fit for calibration that stalls.
+    # Field-verify the retry rate once this is running on the robot.
+    CALIBRATION_GYRO_STD_MAX_DPS = 1.5
+    CALIBRATION_ACCEL_NORM_MIN = 0.85
+    CALIBRATION_ACCEL_NORM_MAX = 1.15
 
     def __init__(
         self,

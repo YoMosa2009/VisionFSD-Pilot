@@ -17,8 +17,11 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from robot_autonomy import (
     MAX_PWM,
     MIN_MOVE_PWM,
+    RUNTIME_VERSION,
     STEER_HEADINGS,
+    STUCK_RELATCH_RETRY_S,
     UNO_CONTROL_LEASE_S,
+    WINDOW_TITLE,
     ArduinoLink,
     ArduinoStatus,
     AutonomousPolicy,
@@ -815,7 +818,7 @@ class CameraSafetyTests(unittest.TestCase):
         ):
             open_dashboard_window()
         named.assert_called_once()
-        move.assert_called_once_with("VisionFSD Pi Robot - standby", 0, 0)
+        move.assert_called_once_with(WINDOW_TITLE, 0, 0)
         fullscreen.assert_called_once()
 
     def test_dashboard_fullscreen_can_be_reapplied_after_first_frame(self) -> None:
@@ -824,9 +827,9 @@ class CameraSafetyTests(unittest.TestCase):
             mock.patch("robot_autonomy.cv2.setWindowProperty") as fullscreen,
         ):
             maximize_dashboard_window()
-        move.assert_called_once_with("VisionFSD Pi Robot - standby", 0, 0)
+        move.assert_called_once_with(WINDOW_TITLE, 0, 0)
         fullscreen.assert_called_once_with(
-            "VisionFSD Pi Robot - standby",
+            WINDOW_TITLE,
             cv2.WND_PROP_FULLSCREEN,
             cv2.WINDOW_FULLSCREEN,
         )
@@ -964,7 +967,7 @@ class NavigationSimulationTests(unittest.TestCase):
     def test_close_obstacle_recovery_turns_and_resumes_exploration(self) -> None:
         """A close obstacle must not leave the policy permanently stopped."""
         policy = AutonomousPolicy(0.0, 118)
-        x = y = heading = 0.0
+        x = y = heading = previous_heading = 0.0
         obstacle_x, obstacle_y, obstacle_radius = 0.0, 0.45, 0.16
         moved_after_recovery = False
         entered_turn = False
@@ -1000,11 +1003,19 @@ class NavigationSimulationTests(unittest.TestCase):
                 _sector_clearance(points, 180.0, 25.0),
             )
             now = policy.started_at + step * 0.1
+            # A live gyro reports the rotation the chassis actually just made,
+            # not just the derived heading used elsewhere in this simulation;
+            # keep it consistent so the stuck detector's IMU-progress source
+            # sees a real turn rate during the escape turn below instead of a
+            # permanently zero rate that would misread as not moving.
+            gyro_z_dps = -math.degrees(heading - previous_heading) / 0.1
+            previous_heading = heading
             policy.observe_imu(IMUState(
                 connected=True,
                 calibrated=True,
                 fresh=True,
                 yaw_deg=-math.degrees(heading),
+                gyro_z_dps=gyro_z_dps,
             ))
             front_cm = None if clearance.front_m is None else clearance.front_m * 100.0
             status = ArduinoStatus(front_cm=front_cm, motion="S", received_at=now)
@@ -1080,6 +1091,322 @@ class NavigationSimulationTests(unittest.TestCase):
 
         self.assertFalse(collided)
         self.assertGreater(y, 1.25)
+
+
+class DashboardVersionTests(unittest.TestCase):
+    def test_runtime_version_matches_the_version_file_and_reaches_the_dashboard(self) -> None:
+        version_file = pathlib.Path(__file__).resolve().parents[1] / "VERSION"
+        self.assertEqual(RUNTIME_VERSION, version_file.read_text(encoding="utf-8").strip())
+        self.assertIn(RUNTIME_VERSION, WINDOW_TITLE)
+
+
+class TurnSideScoreTests(unittest.TestCase):
+    """_turn_side_score must not be fooled by a single lucky LiDAR ray."""
+
+    def test_ignores_a_single_ray_spike_in_an_otherwise_narrow_sector(self) -> None:
+        policy = AutonomousPolicy(0.0, 118)
+        profile = np.full(STEER_HEADINGS.size, 0.20, dtype=np.float32)
+        profile[int(np.argmin(np.abs(STEER_HEADINGS - 40.0)))] = 3.0
+        clearance = SectorClearance(0.30, 1.8, 0.20, True, 1.7, 0.19, profile, 1.0)
+
+        score = policy._turn_side_score(clearance, "R")
+
+        self.assertLess(score, 0.25)
+
+    def test_recognizes_a_genuinely_broad_opening(self) -> None:
+        policy = AutonomousPolicy(0.0, 118)
+        profile = np.full(STEER_HEADINGS.size, 0.20, dtype=np.float32)
+        profile[STEER_HEADINGS >= 30.0] = 3.0
+        clearance = SectorClearance(0.30, 1.8, 0.20, True, 1.7, 0.19, profile, 1.0)
+
+        score = policy._turn_side_score(clearance, "R")
+
+        self.assertGreater(score, 1.0)
+
+
+class StuckDetectionTests(unittest.TestCase):
+    """Independent motion evidence, and recovery when it disagrees with a
+    commanded drive for long enough. See robot_autonomy.py's "Stuck
+    detection" section for the MOVING/NOT_MOVING/UNKNOWN contract."""
+
+    def _status(self, now: float, blocked: bool = False) -> ArduinoStatus:
+        return ArduinoStatus(front_cm=80.0, motion="S", received_at=now, blocked=blocked)
+
+    def test_all_unknown_evidence_never_latches_stuck(self) -> None:
+        """A static test fixture that never reports real progress must not
+        misread as being stuck: every source has to opt in with a real
+        signal (fresh camera flow, a live IMU, a real scan timestamp, or a
+        Uno block) before silence counts as evidence."""
+        policy = AutonomousPolicy(0.0, 118)
+        clear = SectorClearance(1.0, 2.0, 2.0, True, 2.0, 2.0)
+        now = time.monotonic()
+        for index in range(80):
+            tick_now = now + index * 0.05
+            policy.decide(clear, self._status(tick_now), False, tick_now)
+        self.assertEqual(policy.stuck_phase, "IDLE")
+
+    def test_camera_confirms_no_motion_triggers_recovery(self) -> None:
+        policy = AutonomousPolicy(0.0, 118)
+        clear = SectorClearance(2.0, 2.0, 2.0, True, 2.0, 2.0)
+        stalled_camera = CameraMotionState(fresh=True, confidence=0.9, motion_observed=False)
+        now = time.monotonic()
+        command = "F"
+        for index in range(60):
+            tick_now = now + index * 0.05
+            command = policy.decide(
+                clear, self._status(tick_now), False, tick_now, True, True, stalled_camera
+            )
+        self.assertEqual(policy.stuck_phase, "RECOVER")
+        self.assertTrue(policy.reason.startswith("STUCK_RECOVER_"))
+        self.assertNotEqual(command, "F")
+
+    def test_moving_vote_resets_accumulating_suspicion(self) -> None:
+        policy = AutonomousPolicy(0.0, 118)
+        clear = SectorClearance(2.0, 2.0, 2.0, True, 2.0, 2.0)
+        stalled = CameraMotionState(fresh=True, confidence=0.9, motion_observed=False)
+        moving = CameraMotionState(fresh=True, confidence=0.9, motion_observed=True)
+        now = time.monotonic()
+        for index in range(20):
+            tick_now = now + index * 0.05
+            policy.decide(clear, self._status(tick_now), False, tick_now, True, True, stalled)
+        self.assertIsNotNone(policy._stuck_window_start)
+
+        tick_now = now + 20 * 0.05
+        policy.decide(clear, self._status(tick_now), False, tick_now, True, True, moving)
+
+        self.assertIsNone(policy._stuck_window_start)
+        self.assertEqual(policy.stuck_phase, "IDLE")
+
+    def test_a_stale_sensor_stop_is_not_overridden_while_recovering(self) -> None:
+        """decide()'s own safety stops (stale camera/LiDAR/Uno status,
+        standby, IMU calibrating, an existing boxed-in stop) must win over an
+        in-progress stuck-recovery maneuver: driving through one would be
+        blind driving, and a single stale LD19 scan would otherwise make
+        every candidate maneuver look unsafe and latch STUCK permanently."""
+        policy = AutonomousPolicy(0.0, 118)
+        clear = SectorClearance(2.0, 2.0, 2.0, True, 2.0, 2.0)
+        stalled_camera = CameraMotionState(fresh=True, confidence=0.9, motion_observed=False)
+        now = time.monotonic()
+        for index in range(40):
+            tick_now = now + index * 0.05
+            policy.decide(
+                clear, self._status(tick_now), False, tick_now, True, True, stalled_camera
+            )
+        self.assertEqual(policy.stuck_phase, "RECOVER")
+
+        tick_now = now + 40 * 0.05
+        command = policy.decide(
+            clear,
+            self._status(tick_now),
+            False,
+            tick_now,
+            camera_ready=False,
+            imu_ready=True,
+            camera_motion=stalled_camera,
+        )
+
+        self.assertEqual(command, "STOP")
+        self.assertEqual(policy.reason, "STOP:CAMERA_STALE")
+        self.assertEqual(policy.left_pwm, 0)
+        self.assertEqual(policy.right_pwm, 0)
+
+    def test_recovery_exhausts_attempts_and_latches_with_a_clear_reason(self) -> None:
+        policy = AutonomousPolicy(0.0, 118)
+        clear = SectorClearance(2.0, 2.0, 2.0, True, 2.0, 2.0)
+        stalled_camera = CameraMotionState(fresh=True, confidence=0.9, motion_observed=False)
+        now = time.monotonic()
+        command = "F"
+        for index in range(140):
+            tick_now = now + index * 0.05
+            command = policy.decide(
+                clear, self._status(tick_now), False, tick_now, True, True, stalled_camera
+            )
+        self.assertEqual(policy.stuck_phase, "LATCHED")
+        self.assertEqual(command, "STOP")
+        self.assertIn("NEEDS_RESET", policy.reason)
+        self.assertEqual(policy.left_pwm, 0)
+        self.assertEqual(policy.right_pwm, 0)
+
+    def test_no_safe_recovery_candidates_latches_immediately(self) -> None:
+        policy = AutonomousPolicy(0.0, 118)
+        boxed = SectorClearance(0.30, 0.24, 0.23, True, 0.22, 0.21, None, 0.20)
+
+        command = policy._advance_stuck_recovery(boxed, time.monotonic())
+
+        self.assertEqual(command, "STOP")
+        self.assertEqual(policy.stuck_phase, "LATCHED")
+        self.assertIn("NEEDS_RESET", policy.reason)
+
+    def test_latched_stuck_clears_on_external_motion_and_resumes(self) -> None:
+        policy = AutonomousPolicy(0.0, 118)
+        now = time.monotonic()
+        policy._stuck_phase = "LATCHED"
+        policy._stuck_latched_reason = "STOP:STUCK_STALLED_NEEDS_RESET"
+        policy._stuck_latched_at = now
+        policy.imu_yaw_rate_dps = 20.0  # well above STUCK_EXTERNAL_YAW_RATE_DPS
+        clear = SectorClearance(2.0, 2.0, 2.0, True, 2.0, 2.0)
+
+        command = policy.decide(clear, self._status(now), False, now)
+
+        self.assertEqual(policy.stuck_phase, "IDLE")
+        self.assertEqual(command, "F")
+
+    def test_latched_stuck_holds_without_external_motion(self) -> None:
+        policy = AutonomousPolicy(0.0, 118)
+        now = time.monotonic()
+        policy._stuck_phase = "LATCHED"
+        policy._stuck_latched_reason = "STOP:STUCK_STALLED_NEEDS_RESET"
+        policy._stuck_latched_at = now
+        clear = SectorClearance(2.0, 2.0, 2.0, True, 2.0, 2.0)
+
+        command = policy.decide(clear, self._status(now), False, now)
+
+        self.assertEqual(command, "STOP")
+        self.assertEqual(policy.stuck_phase, "LATCHED")
+
+    def test_latched_stuck_re_arms_after_a_timeout_without_an_imu(self) -> None:
+        """Without a live IMU, _external_motion_detected() has nothing to
+        observe, so a periodic re-arm is the only way a latch clears on its
+        own; confirm it does, and that a still-genuinely-stuck chassis
+        re-latches after another bounded attempt burst rather than driving
+        forever."""
+        policy = AutonomousPolicy(0.0, 118)
+        now = time.monotonic()
+        policy._stuck_phase = "LATCHED"
+        policy._stuck_latched_reason = "STOP:STUCK_STALLED_NEEDS_RESET"
+        policy._stuck_latched_at = now
+        clear = SectorClearance(2.0, 2.0, 2.0, True, 2.0, 2.0)
+
+        re_armed_at = now + STUCK_RELATCH_RETRY_S + 0.01
+        command = policy.decide(clear, self._status(re_armed_at), False, re_armed_at)
+
+        self.assertNotEqual(policy.stuck_phase, "LATCHED")
+        self.assertEqual(command, "F")
+
+    def test_still_stuck_after_re_arm_latches_again(self) -> None:
+        policy = AutonomousPolicy(0.0, 118)
+        now = time.monotonic()
+        policy._stuck_phase = "LATCHED"
+        policy._stuck_latched_reason = "STOP:STUCK_STALLED_NEEDS_RESET"
+        policy._stuck_latched_at = now
+        clear = SectorClearance(2.0, 2.0, 2.0, True, 2.0, 2.0)
+        stalled_camera = CameraMotionState(fresh=True, confidence=0.9, motion_observed=False)
+
+        re_armed_at = now + STUCK_RELATCH_RETRY_S + 0.01
+        command = "F"
+        for index in range(140):
+            tick_now = re_armed_at + index * 0.05
+            command = policy.decide(
+                clear, self._status(tick_now), False, tick_now, True, True, stalled_camera
+            )
+
+        self.assertEqual(policy.stuck_phase, "LATCHED")
+        self.assertEqual(command, "STOP")
+
+    def test_camera_evidence_requires_fresh_confident_translation(self) -> None:
+        policy = AutonomousPolicy(0.0, 118)
+        policy.left_pwm, policy.right_pwm = 118, 118
+        lidar = SectorClearance(2.0, 2.0, 2.0, True, 2.0, 2.0)
+        arduino = self._status(time.monotonic())
+        now = time.monotonic()
+
+        stale = CameraMotionState(fresh=False, confidence=0.9, motion_observed=False)
+        self.assertEqual(policy._motion_evidence(lidar, arduino, now, stale)["camera"], "UNKNOWN")
+
+        low_confidence = CameraMotionState(fresh=True, confidence=0.1, motion_observed=False)
+        self.assertEqual(
+            policy._motion_evidence(lidar, arduino, now, low_confidence)["camera"], "UNKNOWN"
+        )
+
+        confident_still = CameraMotionState(fresh=True, confidence=0.9, motion_observed=False)
+        self.assertEqual(
+            policy._motion_evidence(lidar, arduino, now, confident_still)["camera"], "NOT_MOVING"
+        )
+
+        confident_moving = CameraMotionState(fresh=True, confidence=0.9, motion_observed=True)
+        self.assertEqual(
+            policy._motion_evidence(lidar, arduino, now, confident_moving)["camera"], "MOVING"
+        )
+
+        policy.left_pwm, policy.right_pwm = -118, 0  # pivot, not a translation
+        self.assertEqual(
+            policy._motion_evidence(lidar, arduino, now, confident_moving)["camera"], "UNKNOWN"
+        )
+
+    def test_imu_evidence_requires_a_meaningful_commanded_turn(self) -> None:
+        policy = AutonomousPolicy(0.0, 118)
+        lidar = SectorClearance(2.0, 2.0, 2.0, True, 2.0, 2.0)
+        arduino = self._status(time.monotonic())
+        now = time.monotonic()
+
+        policy.left_pwm, policy.right_pwm = 118, 118  # straight, not a turn
+        policy.imu_yaw_rate_dps = 0.0
+        self.assertEqual(policy._motion_evidence(lidar, arduino, now, None)["imu"], "UNKNOWN")
+
+        policy.left_pwm, policy.right_pwm = -105, 105  # pivot
+        policy.imu_yaw_rate_dps = None  # IMU not ready
+        self.assertEqual(policy._motion_evidence(lidar, arduino, now, None)["imu"], "UNKNOWN")
+
+        policy.imu_yaw_rate_dps = 0.5
+        self.assertEqual(policy._motion_evidence(lidar, arduino, now, None)["imu"], "NOT_MOVING")
+
+        policy.imu_yaw_rate_dps = 30.0
+        self.assertEqual(policy._motion_evidence(lidar, arduino, now, None)["imu"], "MOVING")
+
+    def test_uno_blocked_flag_only_counts_during_a_forward_component(self) -> None:
+        policy = AutonomousPolicy(0.0, 118)
+        lidar = SectorClearance(2.0, 2.0, 2.0, True, 2.0, 2.0)
+        blocked_status = self._status(time.monotonic(), blocked=True)
+        now = time.monotonic()
+
+        policy.left_pwm, policy.right_pwm = 118, 118
+        self.assertEqual(
+            policy._motion_evidence(lidar, blocked_status, now, None)["uno"], "NOT_MOVING"
+        )
+
+        policy.left_pwm, policy.right_pwm = -118, -118  # reverse: the firmware
+        # guard only ever gates a forward component.
+        self.assertEqual(
+            policy._motion_evidence(lidar, blocked_status, now, None)["uno"], "UNKNOWN"
+        )
+
+    def test_lidar_progress_evidence_requires_a_real_scan_timestamp(self) -> None:
+        policy = AutonomousPolicy(0.0, 118)
+        stale_fixture = SectorClearance(0.50, 2.0, 2.0, True, 2.0, 2.0)
+        now = time.monotonic()
+        vote = "UNKNOWN"
+        for index in range(30):
+            tick_now = now + index * 0.05
+            vote = policy._lidar_progress_evidence(stale_fixture, 118, 118, tick_now)
+        self.assertEqual(vote, "UNKNOWN")
+
+    def test_lidar_progress_evidence_detects_no_advance_with_a_real_scan(self) -> None:
+        # Every window-close tick resets the reference for the next window,
+        # so only that closing tick reports a verdict; the following ticks
+        # go back to UNKNOWN until the next window elapses. Collect votes
+        # across several windows instead of asserting on an arbitrary tick.
+        policy = AutonomousPolicy(0.0, 118)
+        now = time.monotonic()
+        votes = []
+        for index in range(60):
+            tick_now = now + index * 0.05
+            clearance = SectorClearance(0.50, 2.0, 2.0, True, 2.0, 2.0, scan_at=tick_now)
+            votes.append(policy._lidar_progress_evidence(clearance, 118, 118, tick_now))
+        self.assertIn("NOT_MOVING", votes)
+        self.assertNotIn("MOVING", votes)
+
+    def test_lidar_progress_evidence_detects_real_advance(self) -> None:
+        policy = AutonomousPolicy(0.0, 118)
+        now = time.monotonic()
+        votes = []
+        front = 1.00
+        for index in range(60):
+            tick_now = now + index * 0.05
+            clearance = SectorClearance(front, 2.0, 2.0, True, 2.0, 2.0, scan_at=tick_now)
+            votes.append(policy._lidar_progress_evidence(clearance, 118, 118, tick_now))
+            front -= 0.01
+        self.assertIn("MOVING", votes)
+        self.assertNotIn("NOT_MOVING", votes)
 
 
 if __name__ == "__main__":
