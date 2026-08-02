@@ -1593,6 +1593,13 @@ def draw_dashboard(local_map: np.ndarray, policy: AutonomousPolicy,
 
 def open_dashboard_window() -> None:
     cv2.namedWindow(WINDOW_TITLE, cv2.WINDOW_NORMAL)
+    maximize_dashboard_window()
+
+
+def maximize_dashboard_window() -> None:
+    # Moving first prevents some X11 window managers from preserving a stale
+    # small-window position when the following fullscreen request is applied.
+    cv2.moveWindow(WINDOW_TITLE, 0, 0)
     cv2.setWindowProperty(
         WINDOW_TITLE, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN
     )
@@ -1657,6 +1664,9 @@ def main() -> int:
     exploration = ExplorationState()
     imu_state = IMUState(error="disabled") if imu is None else imu.state()
     next_display_at = 0.0
+    # Qt creates the native window asynchronously. Reapply fullscreen over the
+    # first rendered frames so the request is not lost before the window maps.
+    fullscreen_refreshes = 12
     next_telemetry_at = 0.0
     last_policy_state: tuple[str, str, str] | None = None
     last_imu_error: str | None = None
@@ -1802,6 +1812,9 @@ def main() -> int:
                     camera_motion,
                 )
                 cv2.imshow(WINDOW_TITLE, panel)
+                if fullscreen_refreshes > 0:
+                    maximize_dashboard_window()
+                    fullscreen_refreshes -= 1
                 if cv2.waitKey(1) & 0xFF in (27, ord("q"), ord("Q")):
                     break
             time.sleep(0.03)

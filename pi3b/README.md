@@ -392,6 +392,12 @@ holds STOP for 25 seconds. Use `--no-robot-autostart` with `install.sh` if you
 do not want that. Raspberry Pi OS Lite has no graphical autostart session, so
 it needs a separate headless service and does not show the visualizer.
 
+On the standard Pi Desktop Wayland session, the launcher selects Qt's XWayland
+backend and reapplies fullscreen during the first rendered frames. This avoids
+the small 640-pixel OpenCV window and makes the LiDAR dashboard occupy the
+connected display. Set `QT_QPA_PLATFORM` manually only when using a different
+custom desktop backend.
+
 The launcher discovers the Uno by its exact `2341:0043` USB identity and the
 LD19 adapter by its exact CP210x `10C4:EA60` identity. It does not hardcode
 `/dev/ttyACM0`, because Linux may assign a different ACM number after a USB

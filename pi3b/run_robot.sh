@@ -37,11 +37,18 @@ for _ in $(seq 1 30); do
   sleep 0.5
 done
 
+# OpenCV's Qt Wayland backend can ignore fullscreen requests made by an
+# autostarted application. Raspberry Pi OS exposes XWayland as DISPLAY=:0, so
+# use Qt's X11 backend where the fullscreen window property is reliable.
+if [[ -n "${DISPLAY:-}" && -z "${QT_QPA_PLATFORM:-}" ]]; then
+  export QT_QPA_PLATFORM=xcb
+fi
+
 {
   echo "=== VisionFSD robot start: $(date -Is) ==="
   echo "version: $(tr -d '\r\n' < "$ROOT/VERSION" 2>/dev/null)"
   echo "serial: $(ls /dev/ttyACM* /dev/ttyUSB* 2>/dev/null | tr '\n' ' ')"
-  echo "display: DISPLAY=${DISPLAY:-unset} WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-unset}"
+  echo "display: DISPLAY=${DISPLAY:-unset} WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-unset} QT_QPA_PLATFORM=${QT_QPA_PLATFORM:-unset}"
   if command -v vcgencmd >/dev/null 2>&1; then
     echo "power: $(vcgencmd get_throttled 2>/dev/null || echo unavailable)"
   fi

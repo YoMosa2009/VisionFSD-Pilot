@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
+import cv2
 import numpy as np
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
@@ -27,6 +28,7 @@ from robot_autonomy import (
     corridor_profile,
     discover_arduino_port,
     discover_ld19_port,
+    maximize_dashboard_window,
     open_dashboard_window,
 )
 from robot_imu import IMUState
@@ -675,11 +677,26 @@ class CameraSafetyTests(unittest.TestCase):
     def test_dashboard_window_opens_full_screen(self) -> None:
         with (
             mock.patch("robot_autonomy.cv2.namedWindow") as named,
+            mock.patch("robot_autonomy.cv2.moveWindow") as move,
             mock.patch("robot_autonomy.cv2.setWindowProperty") as fullscreen,
         ):
             open_dashboard_window()
         named.assert_called_once()
+        move.assert_called_once_with("VisionFSD Pi Robot - standby", 0, 0)
         fullscreen.assert_called_once()
+
+    def test_dashboard_fullscreen_can_be_reapplied_after_first_frame(self) -> None:
+        with (
+            mock.patch("robot_autonomy.cv2.moveWindow") as move,
+            mock.patch("robot_autonomy.cv2.setWindowProperty") as fullscreen,
+        ):
+            maximize_dashboard_window()
+        move.assert_called_once_with("VisionFSD Pi Robot - standby", 0, 0)
+        fullscreen.assert_called_once_with(
+            "VisionFSD Pi Robot - standby",
+            cv2.WND_PROP_FULLSCREEN,
+            cv2.WINDOW_FULLSCREEN,
+        )
 
     def test_missing_camera_keeps_runtime_in_safe_stale_state(self) -> None:
         with (
