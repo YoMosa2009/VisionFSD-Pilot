@@ -95,6 +95,7 @@ TELEMETRY_PERIOD_S = 1.0
 CAPS_RETRY_S = 0.50
 CAMERA_RETRY_S = 1.0
 CAMERA_START_TIMEOUT_S = 2.0
+CAMERA_IMU_DEFER_LIMIT_S = 8.0
 CAMERA_AUTO_INDEX_LIMIT = 8
 CAMERA_CAPTURE_WIDTH = 320
 CAMERA_CAPTURE_HEIGHT = 240
@@ -672,7 +673,7 @@ class LocalLidarMap:
 class CameraSafety:
     """Camera health and optical flow support non-IMU pose prediction."""
 
-    def __init__(self, camera: str, fov: float) -> None:
+    def __init__(self, camera: str, fov: float, auto_start: bool = True) -> None:
         self._fov = fov
         self._last_camera_sequence = 0
         self._last_frame_at = 0.0
@@ -680,6 +681,8 @@ class CameraSafety:
         self.frame: np.ndarray | None = None
         self.camera: LatestCamera | None = None
         self.camera_source = "none"
+        self._started = False
+        self._current_camera_has_frame = False
         self._camera_sources = self._candidate_sources(camera)
         self._next_camera_source = 0
         self._next_camera_retry_at = 0.0
@@ -688,7 +691,15 @@ class CameraSafety:
         self._flow_gray: np.ndarray | None = None
         self._flow_at = 0.0
         self.motion = CameraMotionState()
-        self._open_next_camera(time.monotonic())
+        if auto_start:
+            self.start()
+
+    def start(self, now: float | None = None) -> None:
+        """Start capture once; robot boot can calibrate the USB IMU first."""
+        if self._started:
+            return
+        self._started = True
+        self._open_next_camera(time.monotonic() if now is None else now)
 
     @staticmethod
     def _candidate_sources(requested: str) -> list[str]:
@@ -719,11 +730,15 @@ class CameraSafety:
                 continue
             self.camera_source = source
             self._camera_opened_at = now
+            self._current_camera_has_frame = False
+            self.frame = None
+            self._last_camera_sequence = 0
             self._last_camera_error = ""
             print(f"Camera candidate opened: {source}")
             return
         self.camera = None
         self.camera_source = "none"
+        self._current_camera_has_frame = False
         self._next_camera_retry_at = now + CAMERA_RETRY_S
         error = "; ".join(errors) if errors else "no camera candidates"
         if error != self._last_camera_error:
@@ -735,6 +750,7 @@ class CameraSafety:
             self.camera.close()
         self.camera = None
         self.camera_source = "none"
+        self._current_camera_has_frame = False
         self.frame = None
         self._last_camera_sequence = 0
         self._flow_gray = None
@@ -746,6 +762,14 @@ class CameraSafety:
     def _update_motion(
         self, frame: np.ndarray, captured: float, left_pwm: int, right_pwm: int
     ) -> None:
+        # Optical flow has no pose value while the chassis is stopped. Avoid
+        # spending scarce Pi 3B CPU during IMU calibration and stationary
+        # safety holds; the first moving frame establishes a new reference.
+        if left_pwm == 0 and right_pwm == 0:
+            self._flow_gray = None
+            self._flow_at = 0.0
+            self.motion = CameraMotionState(captured_at=captured)
+            return
         gray = cv2.cvtColor(
             cv2.resize(frame, (160, 120), interpolation=cv2.INTER_AREA),
             cv2.COLOR_BGR2GRAY,
@@ -813,14 +837,22 @@ class CameraSafety:
 
     def tick(self, left_pwm: int = 0, right_pwm: int = 0) -> None:
         now = time.monotonic()
+        if not self._started:
+            return
         if self.camera is None:
             if now >= self._next_camera_retry_at:
                 self._open_next_camera(now)
             return
         sequence, frame, captured = self.camera.latest()
         timed_out = (
-            (self.frame is None and now - self._camera_opened_at >= CAMERA_START_TIMEOUT_S)
-            or (self._last_frame_at > 0.0 and now - self._last_frame_at >= CAMERA_START_TIMEOUT_S)
+            (
+                not self._current_camera_has_frame
+                and now - self._camera_opened_at >= CAMERA_START_TIMEOUT_S
+            )
+            or (
+                self._current_camera_has_frame
+                and now - self._last_frame_at >= CAMERA_START_TIMEOUT_S
+            )
         )
         if self.camera.error or timed_out:
             self._drop_camera(now, self.camera.error or "no live frames")
@@ -832,6 +864,7 @@ class CameraSafety:
                 self._last_camera_sequence = sequence
                 self._last_frame_at = captured
                 self._has_live_frame = True
+                self._current_camera_has_frame = True
 
     def ready(self, now: float) -> bool:
         """Require a recent frame without turning one camera reset into a pulse."""
@@ -1674,7 +1707,11 @@ def main() -> int:
     cv2.setUseOptimized(True)
     arduino = ArduinoLink(arduino_port)
     lidar = LD19Link(lidar_port, args.lidar_front_offset_deg)
-    camera = CameraSafety(args.camera, args.fov)
+    # Streaming a webcam and calculating optical flow can contend with the
+    # userspace MCP2221 USB transport on a Pi 3B. Keep capture closed for the
+    # short stationary IMU calibration, then require a real camera frame before
+    # motor authority is granted. A bounded fallback preserves non-IMU mode.
+    camera = CameraSafety(args.camera, args.fov, auto_start=False)
     imu = None if args.no_imu else AutoIMULink(
         args.imu_bus, args.imu_address, args.imu_mount_yaw_deg
     )
@@ -1698,6 +1735,7 @@ def main() -> int:
     last_policy_state: tuple[str, str, str] | None = None
     last_imu_error: str | None = None
     calibrated_source: str | None = None
+    camera_defer_until = policy.started_at + CAMERA_IMU_DEFER_LIMIT_S
     keep_running = True
 
     def stop(_signum: int, _frame: object) -> None:
@@ -1726,6 +1764,13 @@ def main() -> int:
                     print(f"{imu_state.source} calibrated; measured yaw enabled")
                     calibrated_source = imu_state.source
             policy.observe_imu(imu_state)
+            if (
+                imu is None
+                or imu_state.calibrated
+                or not imu_state.connected
+                or now >= camera_defer_until
+            ):
+                camera.start(now)
             camera.tick(policy.left_pwm, policy.right_pwm)
             clearance = lidar.clearance()
             status = arduino.status()

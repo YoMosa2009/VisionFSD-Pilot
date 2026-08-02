@@ -22,6 +22,7 @@ from robot_autonomy import (
     ArduinoLink,
     ArduinoStatus,
     AutonomousPolicy,
+    CameraMotionState,
     CameraSafety,
     LD19Link,
     SectorClearance,
@@ -673,6 +674,68 @@ class ArduinoLinkTests(unittest.TestCase):
 
 
 class CameraSafetyTests(unittest.TestCase):
+    def test_camera_capture_can_wait_for_imu_calibration(self) -> None:
+        camera = mock.Mock()
+        with (
+            mock.patch.object(CameraSafety, "_candidate_sources", return_value=["0"]),
+            mock.patch("robot_autonomy.LatestCamera", return_value=camera) as latest,
+        ):
+            safety = CameraSafety("auto", 62.0, auto_start=False)
+            latest.assert_not_called()
+            safety.start(10.0)
+            latest.assert_called_once()
+            self.assertIs(safety.camera, camera)
+            safety.start(11.0)
+            latest.assert_called_once()
+            safety.close()
+
+    def test_reopened_camera_gets_its_own_startup_timeout(self) -> None:
+        frame = np.zeros((24, 32, 3), dtype=np.uint8)
+        first = mock.Mock()
+        first.error = ""
+        first.latest.return_value = (1, frame, 1.0)
+        second = mock.Mock()
+        second.error = ""
+        second.latest.return_value = (0, None, 0.0)
+
+        with (
+            mock.patch.object(CameraSafety, "_candidate_sources", return_value=["0"]),
+            mock.patch("robot_autonomy.LatestCamera", side_effect=[first, second]),
+        ):
+            with mock.patch("robot_autonomy.time.monotonic", return_value=1.0):
+                safety = CameraSafety("auto", 62.0)
+            with mock.patch("robot_autonomy.time.monotonic", return_value=1.1):
+                safety.tick()
+            first.error = "unplugged"
+            with mock.patch("robot_autonomy.time.monotonic", return_value=3.1):
+                safety.tick()
+            with mock.patch("robot_autonomy.time.monotonic", return_value=4.2):
+                safety.tick()
+            with mock.patch("robot_autonomy.time.monotonic", return_value=4.3):
+                safety.tick()
+
+            self.assertIs(safety.camera, second)
+            second.close.assert_not_called()
+            second.latest.return_value = (1, frame, 4.4)
+            with mock.patch("robot_autonomy.time.monotonic", return_value=4.4):
+                safety.tick()
+            self.assertTrue(safety.ready(4.4))
+            safety.close()
+
+    def test_stationary_camera_frame_skips_optical_flow_work(self) -> None:
+        safety = object.__new__(CameraSafety)
+        safety._flow_gray = np.ones((120, 160), dtype=np.uint8)
+        safety._flow_at = 1.0
+        safety.motion = CameraMotionState(fresh=True)
+        frame = np.zeros((240, 320, 3), dtype=np.uint8)
+
+        with mock.patch("robot_autonomy.cv2.resize") as resize:
+            safety._update_motion(frame, 2.0, 0, 0)
+
+        resize.assert_not_called()
+        self.assertIsNone(safety._flow_gray)
+        self.assertFalse(safety.motion.fresh)
+
     def test_recent_live_frame_bridges_a_short_camera_usb_reset(self) -> None:
         safety = object.__new__(CameraSafety)
         safety._has_live_frame = True

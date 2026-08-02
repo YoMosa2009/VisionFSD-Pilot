@@ -258,9 +258,15 @@ returns up to 5.8 m where map bounds permit. These software changes do not
 increase the LD19's physical range or create true odometry.
 
 Camera startup defaults to `auto`. The runtime tries stable V4L by-id paths and
-camera indexes 0 through 7. If no webcam currently delivers frames, the LiDAR
+camera indexes 0 through 7. When a USB IMU is connected, webcam capture is
+deferred until IMU calibration completes, or for at most eight seconds. This
+keeps webcam streaming and optical flow from competing with MCP2221 calibration
+on the Pi 3B. Optical flow is skipped while both motors are stopped. If no
+webcam currently delivers frames, the LiDAR
 dashboard remains open in `CAMERA STALE` safe-STOP mode and retries instead of
-terminating the complete robot runtime. Optical-flow pose assistance assumes the
+terminating the complete robot runtime. A reopened camera gets a fresh two-second
+startup window; an old frame timestamp cannot force it back into a permanent
+reconnect loop. Optical-flow pose assistance assumes the
 webcam is rigidly mounted and faces forward; low-confidence flow is ignored.
 
 `run_robot.sh` holds a process lock before opening USB devices. This prevents

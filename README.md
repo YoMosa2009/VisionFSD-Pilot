@@ -171,7 +171,12 @@ a camera reset receives at most one second of last-frame grace, and sustained
 camera loss still stops the robot. The local planner selects an 11-degree-wide
 opening instead of trusting one long LiDAR ray, pivots away before a straight
 obstacle reaches 40 cm, and uses clearance-weighted frontier routes to avoid
-unnecessary wall-hugging while retaining reachable narrow passages.
+unnecessary wall-hugging while retaining reachable narrow passages. In v1.9.6,
+robot boot calibrates a connected USB IMU before starting webcam streaming,
+avoiding Pi 3B USB/CPU contention during the stationary calibration window.
+Stationary frames no longer run optical flow, and each reopened webcam receives
+its own startup timeout instead of being rejected against the previous camera's
+stale timestamp.
 The Pi launcher uses the available XWayland display and reapplies fullscreen
 after the first dashboard frames so the LiDAR UI fills the connected screen.
 
