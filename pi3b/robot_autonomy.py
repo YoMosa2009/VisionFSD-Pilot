@@ -1615,7 +1615,8 @@ def draw_dashboard(local_map: np.ndarray, policy: AutonomousPolicy,
         imu_state = "MISSING - LD19+COMMAND POSE ACTIVE"
         imu_color = (80, 190, 245)
     elif not imu.calibrated:
-        imu_state = f"CALIBRATING {imu.calibration_progress * 100:.0f}%"
+        hold = f"  HOLD {imu.calibration_hold}" if imu.calibration_hold else ""
+        imu_state = f"CALIBRATING {imu.calibration_progress * 100:.0f}%{hold}"
         imu_color = (80, 190, 245)
     elif not imu.fresh:
         imu_state = "STALE - LD19+COMMAND POSE ACTIVE"

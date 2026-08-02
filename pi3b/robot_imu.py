@@ -51,6 +51,7 @@ class IMUState:
     updated_at: float = 0.0
     error: str | None = None
     source: str = "NONE"
+    calibration_hold: str = ""
 
 
 class _MCP2221Bus:
@@ -112,10 +113,9 @@ class MPU6050Link:
     FILTER_CUTOFF_HZ = 5.0
     BIAS_TRACK_MIN_SAMPLES = 20
     BIAS_TRACK_ALPHA = 0.01
-    CALIBRATION_ACCEL_MIN_G = 0.88
-    CALIBRATION_ACCEL_MAX_G = 1.12
-    CALIBRATION_MAX_GYRO_DPS = 8.0
-    CALIBRATION_MAX_HORIZONTAL_G = 0.45
+    CALIBRATION_ACCEL_MIN_G = 0.70
+    CALIBRATION_ACCEL_MAX_G = 1.30
+    CALIBRATION_MAX_GYRO_DPS = 35.0
     SENSOR_NAME = "MPU-6050"
 
     def __init__(
@@ -140,6 +140,7 @@ class MPU6050Link:
         self._gyro_bias = (0.0, 0.0, 0.0)
         self._stationary_bias_samples = 0
         self._calibrated = False
+        self._calibration_hold = "WAITING"
         self._last_sample_at = 0.0
         self._connected_at = 0.0
         self._accel = (0.0, 0.0, 0.0)
@@ -224,18 +225,13 @@ class MPU6050Link:
 
     def _finish_calibration(self) -> bool:
         gyro_axes = list(zip(*(sample[:3] for sample in self._calibration)))
-        gyro_std = max(statistics.pstdev(axis) for axis in gyro_axes)
+        trim = max(1, len(self._calibration) // 10)
+        trimmed_axes = [sorted(axis)[trim:-trim] for axis in gyro_axes]
+        gyro_std = max(statistics.pstdev(axis) for axis in trimmed_axes)
         mean_accel_norm = statistics.fmean(sample[3] for sample in self._calibration)
-        mean_accel_z = statistics.fmean(sample[6] for sample in self._calibration)
-        mean_horizontal = math.hypot(
-            statistics.fmean(sample[4] for sample in self._calibration),
-            statistics.fmean(sample[5] for sample in self._calibration),
-        )
         if (
-            gyro_std > 1.5
-            or not 0.80 <= mean_accel_norm <= 1.20
-            or mean_accel_z < 0.70
-            or mean_horizontal > 0.45
+            gyro_std > 2.5
+            or not 0.75 <= mean_accel_norm <= 1.25
         ):
             # Keep a rolling window instead of throwing valid progress back to
             # zero. A cable insertion or mild chassis jolt can spoil one
@@ -244,14 +240,15 @@ class MPU6050Link:
             # oldest candidate and calibration completes once the full window
             # is internally consistent.
             self._calibration.pop(0)
+            self._calibration_hold = "UNSTABLE"
             return False
         # A trimmed mean rejects an isolated USB/I2C or handling spike without
         # biasing every later yaw integration step.
-        trim = max(1, len(self._calibration) // 10)
         self._gyro_bias = tuple(
-            statistics.fmean(sorted(axis)[trim:-trim]) for axis in gyro_axes
+            statistics.fmean(axis) for axis in trimmed_axes
         )
         self._calibrated = True
+        self._calibration_hold = ""
         self._stationary_bias_samples = 0
         self._yaw_deg = 0.0
         self._filtered_gyro = (0.0, 0.0, 0.0)
@@ -264,9 +261,6 @@ class MPU6050Link:
         gy: float,
         gz: float,
         accel_norm: float,
-        ax: float,
-        ay: float,
-        az: float,
     ) -> bool:
         """Reject handling/USB-plug jolts before they enter the bias window."""
         return (
@@ -275,8 +269,6 @@ class MPU6050Link:
             <= self.CALIBRATION_ACCEL_MAX_G
             and max(abs(gx), abs(gy), abs(gz))
             <= self.CALIBRATION_MAX_GYRO_DPS
-            and math.hypot(ax, ay) <= self.CALIBRATION_MAX_HORIZONTAL_G
-            and az >= 0.70
         )
 
     def tick(self, now: float | None = None, stationary: bool = True) -> IMUState:
@@ -287,6 +279,8 @@ class MPU6050Link:
             return self.state(now)
         try:
             if not self._sample_ready(self._bus):
+                if not self._calibrated:
+                    self._calibration_hold = "WAIT DATA"
                 last_data = self._last_sample_at or self._connected_at
                 if last_data > 0.0 and now - last_data > self.DATA_READY_TIMEOUT_S:
                     self._disconnect(now, OSError("sensor stopped producing fresh data"))
@@ -311,12 +305,15 @@ class MPU6050Link:
             # momentarily delay the loop or jolt the chassis; neither should
             # make a nearly complete calibration visibly restart at zero.
             if not stationary:
+                self._calibration_hold = "MOTION"
                 return self.state(now)
             accel_norm = math.sqrt(ax * ax + ay * ay + az * az)
             if not self._calibration_sample_is_still(
-                gx, gy, gz, accel_norm, ax, ay, az
+                gx, gy, gz, accel_norm
             ):
+                self._calibration_hold = "SAMPLE"
                 return self.state(now)
+            self._calibration_hold = ""
             self._calibration.append((gx, gy, gz, accel_norm, ax, ay, az))
             if len(self._calibration) >= self.calibration_samples:
                 self._finish_calibration()
@@ -387,6 +384,7 @@ class MPU6050Link:
             updated_at=self._last_sample_at,
             error=self._error,
             source=self.SENSOR_NAME,
+            calibration_hold=self._calibration_hold,
         )
 
     def close(self) -> None:
@@ -415,7 +413,7 @@ class LSM6DS3MCP2221Link(MPU6050Link):
         self,
         address: int | None = None,
         mount_yaw_deg: float = 180.0,
-        calibration_samples: int = 80,
+        calibration_samples: int = 40,
         bus_factory: Callable[[int], _SMBusLike] | None = None,
     ) -> None:
         super().__init__(

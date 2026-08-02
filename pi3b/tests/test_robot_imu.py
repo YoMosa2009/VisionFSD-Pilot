@@ -253,6 +253,26 @@ class MPU6050Tests(unittest.TestCase):
 
 
 class LSM6DS3Tests(unittest.TestCase):
+    def test_usb_imu_uses_short_startup_calibration_window(self) -> None:
+        imu = LSM6DS3MCP2221Link(bus_factory=lambda _number: _FakeLSMBus())
+        self.assertEqual(imu.calibration_samples, 40)
+
+    def test_stationary_tilt_and_moderate_zero_rate_bias_calibrate(self) -> None:
+        bus = _FakeLSMBus()
+        # One g total acceleration on a slightly tilted mount, plus a stable
+        # 10.5 dps zero-rate bias that the previous absolute 8 dps gate rejected.
+        bus.sample = _lsm_sample(gx=1200, ax=8197, az=14197)
+        imu = LSM6DS3MCP2221Link(
+            calibration_samples=20,
+            bus_factory=lambda _number: bus,
+        )
+
+        for index in range(20):
+            state = imu.tick(1.0 + index * 0.03, stationary=True)
+
+        self.assertTrue(state.calibrated)
+        self.assertEqual(state.calibration_progress, 1.0)
+
     def test_tr_c_identity_auto_probes_second_address_and_decodes_little_endian(self) -> None:
         bus = _FakeLSMBus()
         imu = LSM6DS3MCP2221Link(

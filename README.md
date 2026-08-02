@@ -181,6 +181,10 @@ and planner work. Once an IMU is detected, motor authority remains locked until
 that IMU reaches `LIVE`; only a genuinely absent IMU enters non-IMU mode.
 Calibration uses a rolling still-sample window and retains partial progress
 through a temporary MCP2221 USB reset instead of falling back to a displayed 0%.
+In v1.9.8, the USB LSM6DS3 calibration window is 40 valid samples. Calibration
+uses total acceleration and robust trimmed gyro variance instead of requiring a
+perfectly level board or rejecting the stationary bias it needs to measure. The
+dashboard reports the reason whenever sample collection is intentionally held.
 The Pi launcher uses the available XWayland display and reapplies fullscreen
 after the first dashboard frames so the LiDAR UI fills the connected screen.
 

@@ -312,10 +312,16 @@ stationary calibration, and slowly tracks gyro bias only during confirmed
 stationary periods. Handling jolts and commanded motion pause unfinished
 calibration without deleting already collected still samples. IMU reads run on
 a dedicated 50 Hz sampler thread, independent of camera, display, and planner
-latency. A rejected aggregate window advances as a rolling still-sample window
-rather than clearing to zero. If webcam insertion briefly resets the MCP2221,
+latency. The USB LSM6DS3 needs 40 accepted samples, approximately 0.8 seconds
+at that sampler rate. Acceptance uses total acceleration magnitude and a broad
+handling-rate bound; it does not require the board to be perfectly level or
+reject a stable zero-rate bias merely because that is the bias being measured.
+Final validation uses trimmed gyro variance so isolated edge samples cannot
+poison the whole window. A rejected aggregate window advances as a rolling
+still-sample window rather than clearing to zero. If webcam insertion briefly resets the MCP2221,
 the USB LSM6DS3 remains the selected calibration source and retains its partial
-progress while reconnecting. No manual
+progress while reconnecting. A dashboard `HOLD` suffix identifies motion,
+rejected samples, missing fresh data, or an unstable window. No manual
 `modprobe`, I2C scan, or launch command is required. During the
 25-second stationary standby, the dashboard should change from
 `IMU LSM6DS3 USB CALIBRATING` to `IMU LSM6DS3 USB LIVE`.
