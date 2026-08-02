@@ -4,6 +4,7 @@ import math
 import pathlib
 import sys
 import time
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -23,6 +24,8 @@ from robot_autonomy import (
     SectorClearance,
     _sector_clearance,
     corridor_profile,
+    discover_arduino_port,
+    discover_ld19_port,
     open_dashboard_window,
 )
 from robot_imu import IMUState
@@ -36,6 +39,37 @@ class _Return:
         self.angle_deg = angle_deg
         self.distance_mm = distance_mm
         self.confidence = confidence
+
+
+class SerialDiscoveryTests(unittest.TestCase):
+    @staticmethod
+    def _port(device: str, vid: int | None, pid: int | None, description: str = ""):
+        return SimpleNamespace(
+            device=device,
+            vid=vid,
+            pid=pid,
+            description=description,
+            manufacturer=None,
+        )
+
+    @mock.patch("robot_autonomy.list_ports.comports")
+    def test_exact_robot_usb_identities_win_over_ambiguous_descriptions(self, comports) -> None:
+        comports.return_value = [
+            self._port("/dev/ttyUSB0", 0x10C4, 0xEA60, "USB UART"),
+            self._port("/dev/ttyACM0", 0x2341, 0x0043, "USB Serial"),
+            self._port("/dev/ttyUSB1", 0x1A86, 0x7523, "USB Serial"),
+        ]
+        self.assertEqual(discover_arduino_port(), "/dev/ttyACM0")
+        self.assertEqual(discover_ld19_port("/dev/ttyACM0"), "/dev/ttyUSB0")
+
+    @mock.patch("robot_autonomy.list_ports.comports")
+    def test_unique_device_node_fallback_handles_missing_metadata(self, comports) -> None:
+        comports.return_value = [
+            self._port("/dev/ttyACM0", None, None),
+            self._port("/dev/ttyUSB0", None, None),
+        ]
+        self.assertEqual(discover_arduino_port(), "/dev/ttyACM0")
+        self.assertEqual(discover_ld19_port("/dev/ttyACM0"), "/dev/ttyUSB0")
 
 
 def wall_scene(front_m: float, gap: tuple[int, int] | None = None, span: int = 75):

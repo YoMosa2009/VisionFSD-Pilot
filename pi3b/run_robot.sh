@@ -51,6 +51,8 @@ done
 # loaded-wheel movement floor, never into the buzzing/no-motion PWM band.
 ARGS=(
   "$ROOT/robot_autonomy.py"
+  --arduino-port "${VISIONFSD_ARDUINO_PORT:-/dev/ttyACM0}"
+  --lidar-port "${VISIONFSD_LIDAR_PORT:-/dev/ttyUSB0}"
   --camera "${VISIONFSD_CAMERA:-auto}"
   --standby-seconds "${VISIONFSD_STANDBY_SECONDS:-25}"
   --speed "${VISIONFSD_ROBOT_SPEED:-118}"

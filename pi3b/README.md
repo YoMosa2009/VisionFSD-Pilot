@@ -391,6 +391,12 @@ holds STOP for 25 seconds. Use `--no-robot-autostart` with `install.sh` if you
 do not want that. Raspberry Pi OS Lite has no graphical autostart session, so
 it needs a separate headless service and does not show the visualizer.
 
+The installed launcher explicitly uses `/dev/ttyACM0` for the Uno R3 and
+`/dev/ttyUSB0` for the LD19 adapter, matching this robot's verified USB layout.
+Set `VISIONFSD_ARDUINO_PORT` or `VISIONFSD_LIDAR_PORT` only if Linux assigns a
+different device node. Direct Python launches also prefer the exact Uno
+`2341:0043` and CP210x `10C4:EA60` USB identities before descriptive metadata.
+
 The short normal update command is:
 
 ```bash

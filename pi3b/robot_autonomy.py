@@ -269,8 +269,21 @@ def corridor_profile(
 
 def discover_arduino_port() -> str | None:
     """Pick an Uno-compatible USB serial device without choosing the LD19."""
+    ports = list(list_ports.comports())
+    # This robot's genuine Uno R3 reports Arduino VID:PID 2341:0043. Prefer
+    # that stable identity over descriptive strings, which vary across pyserial
+    # and Raspberry Pi OS releases.
+    exact = [
+        item.device for item in ports
+        if item.vid == 0x2341 and item.pid == 0x0043
+    ]
+    if len(exact) == 1:
+        return exact[0]
+    acm = [item.device for item in ports if item.device.startswith("/dev/ttyACM")]
+    if len(acm) == 1:
+        return acm[0]
     matches: list[str] = []
-    for item in list_ports.comports():
+    for item in ports:
         text = f"{item.device} {item.description} {item.manufacturer or ''}".upper()
         if any(name in text for name in ("ARDUINO", "UNO", "CH340", "CH341", "ACM")):
             matches.append(item.device)
@@ -278,10 +291,19 @@ def discover_arduino_port() -> str | None:
 
 
 def discover_ld19_port(exclude: str | None = None) -> str | None:
+    ports = [item for item in list_ports.comports() if item.device != exclude]
+    # The installed LD19 USB adapter is the Silicon Labs CP210x 10C4:EA60.
+    exact = [
+        item.device for item in ports
+        if item.vid == 0x10C4 and item.pid == 0xEA60
+    ]
+    if len(exact) == 1:
+        return exact[0]
+    usb = [item.device for item in ports if item.device.startswith("/dev/ttyUSB")]
+    if len(usb) == 1:
+        return usb[0]
     matches: list[str] = []
-    for item in list_ports.comports():
-        if item.device == exclude:
-            continue
+    for item in ports:
         text = f"{item.description} {item.manufacturer or ''}".upper()
         if any(name in text for name in ("CP210", "SILICON LABS", "USB SERIAL", "UART", "FTDI")):
             matches.append(item.device)
