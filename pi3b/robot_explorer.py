@@ -46,8 +46,10 @@ class FrontierExplorer:
     MAX_ASTAR_VISITS = 12_000
     PLAN_TIME_BUDGET_S = 0.045
     ROBOT_RECONNECT_M = 0.30
-    ROUTE_CLEARANCE_WEIGHT = 1.25
+    ROUTE_CLEARANCE_WEIGHT = 0.80
     FRONTIER_CLEARANCE_WEIGHT = 0.55
+    ROUTE_LENGTH_WEIGHT = 0.28
+    ROUTE_DETOUR_WEIGHT = 0.45
 
     def __init__(self) -> None:
         self._next_replan_at = 0.0
@@ -236,7 +238,7 @@ class FrontierExplorer:
             )
             score = (
                 math.log1p(area) * 0.85
-                + min(distance, 3.0) * 0.18
+                + min(distance, 3.0) * 0.07
                 + persistence
                 + clearance_reward
                 - visit_penalty
@@ -245,6 +247,21 @@ class FrontierExplorer:
         self._frontier_count = len(candidates)
         candidates.sort(reverse=True)
         return candidates
+
+    @classmethod
+    def _route_utility(
+        cls,
+        candidate_score: float,
+        route_length_m: float,
+        direct_distance_m: float,
+    ) -> float:
+        """Balance useful/open targets against unnecessary route detours."""
+        detour_m = max(0.0, route_length_m - direct_distance_m)
+        return (
+            candidate_score
+            - route_length_m * cls.ROUTE_LENGTH_WEIGHT
+            - detour_m * cls.ROUTE_DETOUR_WEIGHT
+        )
 
     @staticmethod
     def _patrol_candidates(
@@ -471,7 +488,21 @@ class FrontierExplorer:
         chosen_target: tuple[int, int] | None = None
         chosen_path: list[tuple[int, int]] | None = None
         chosen_utility = float("-inf")
-        for candidate_score, target in candidates[:6]:
+        # Do not spend the bounded A* budget on a distant candidate merely
+        # because it has a large frontier. Prefer high-value nearby openings,
+        # then use actual route detour as a second efficiency penalty.
+        ranked_candidates = sorted(
+            candidates,
+            key=lambda item: (
+                item[0]
+                - math.hypot(
+                    item[1][0] - planning_start[0],
+                    item[1][1] - planning_start[1],
+                ) / scale * self.ROUTE_LENGTH_WEIGHT
+            ),
+            reverse=True,
+        )
+        for candidate_score, target in ranked_candidates[:6]:
             path = self._astar(
                 reachable,
                 planning_start,
@@ -487,7 +518,15 @@ class FrontierExplorer:
                     )
                     for previous, current in zip(path, path[1:])
                 ) / scale
-                utility = candidate_score - route_length_m * 0.12
+                direct_distance_m = math.hypot(
+                    target[0] - planning_start[0],
+                    target[1] - planning_start[1],
+                ) / scale
+                utility = self._route_utility(
+                    candidate_score,
+                    route_length_m,
+                    direct_distance_m,
+                )
                 if utility > chosen_utility:
                     chosen_utility = utility
                     chosen_target = target

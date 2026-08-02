@@ -298,6 +298,33 @@ class AutonomousPolicyTests(unittest.TestCase):
         clearance = SectorClearance(0.30, 0.24, 0.23, True, 0.22, 0.21, None, 0.20)
         self.assertEqual(policy.decide(clearance, blocked, False, time.monotonic()), "STOP")
 
+    def test_rear_becoming_blocked_uses_lidar_cleared_centre_pivot(self) -> None:
+        policy = AutonomousPolicy(0.0, 118)
+        now = time.monotonic()
+        blocked = ArduinoStatus(front_cm=15.0, motion="S", received_at=now)
+        reverse_first = SectorClearance(
+            0.30, 0.32, 0.20, True, 0.31, 0.20, None, 1.0
+        )
+        self.assertEqual(policy.decide(reverse_first, blocked, False, now), "L")
+        self.assertEqual(policy._escape_phase, "REVERSE")
+        self.assertLess(policy.left_pwm, 0)
+        self.assertLess(policy.right_pwm, 0)
+
+        left_open_rear_blocked = SectorClearance(
+            0.30, 1.6, 0.20, True, 1.5, 0.20, None, 0.18
+        )
+        self.assertEqual(
+            policy.decide(
+                left_open_rear_blocked, blocked, False, now + 0.10
+            ),
+            "L",
+        )
+        policy.decide(left_open_rear_blocked, blocked, False, now + 0.14)
+        self.assertEqual(policy._escape_phase, "TURN")
+        self.assertEqual(policy.reason.split()[0], "ESCAPE_TURN:L")
+        self.assertLess(policy.left_pwm, 0)
+        self.assertGreater(policy.right_pwm, 0)
+
     def test_no_imu_side_opening_turn_flows_directly_into_forward_commit(self) -> None:
         policy = AutonomousPolicy(0.0, 118)
         now = time.monotonic()

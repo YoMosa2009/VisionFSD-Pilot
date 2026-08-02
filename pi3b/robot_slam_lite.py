@@ -66,6 +66,7 @@ class LidarSlamLite:
         self._map_updates = 0
         self._latest_hits = np.empty((0, 2), dtype=np.int32)
         self._using_imu = False
+        self._last_imu_yaw_deg: float | None = None
         self._using_camera = False
         self._translation_confidence = 0.0
         self._translation_correction_m = 0.0
@@ -174,9 +175,11 @@ class LidarSlamLite:
         imu_yaw_rate_dps: float | None = None,
         camera_yaw_rate_dps: float | None = None,
         camera_translation_scale: float = 1.0,
+        imu_yaw_deg: float | None = None,
     ) -> None:
         if self._last_motion_at is None:
             self._last_motion_at = now
+            self._last_imu_yaw_deg = imu_yaw_deg
             return
         elapsed = min(0.20, max(0.0, now - self._last_motion_at))
         self._last_motion_at = now
@@ -193,7 +196,20 @@ class LidarSlamLite:
         # counter-clockwise.  Negate the IMU rate to preserve map convention.
         command_turn_rate = ((left_pwm - right_pwm) / 255.0) * 130.0
         if imu_yaw_rate_dps is not None:
-            turn_rate_dps = -imu_yaw_rate_dps
+            if imu_yaw_deg is not None and self._last_imu_yaw_deg is not None:
+                measured_delta = self._signed_angle(
+                    imu_yaw_deg - self._last_imu_yaw_deg
+                )
+                # Reject an impossible discontinuity caused by a reconnect or
+                # a stale async state. The LSM6DS3 has no absolute heading, so
+                # this remains bounded short-term yaw, not global position.
+                max_delta = max(3.0, 240.0 * elapsed)
+                yaw_delta = -float(np.clip(
+                    measured_delta, -max_delta, max_delta
+                ))
+            else:
+                yaw_delta = -imu_yaw_rate_dps * elapsed
+            self._last_imu_yaw_deg = imu_yaw_deg
         elif (
             camera_yaw_rate_dps is not None
             and abs(command_turn_rate) >= 4.0
@@ -202,9 +218,12 @@ class LidarSlamLite:
             camera_rate = float(np.clip(camera_yaw_rate_dps, -180.0, 180.0))
             turn_rate_dps = command_turn_rate * 0.65 + camera_rate * 0.35
             self._using_camera = True
+            yaw_delta = turn_rate_dps * elapsed
         else:
             turn_rate_dps = command_turn_rate
-        yaw_delta = turn_rate_dps * elapsed
+            yaw_delta = turn_rate_dps * elapsed
+        if imu_yaw_rate_dps is None:
+            self._last_imu_yaw_deg = None
         self.heading = (self.heading + yaw_delta) % 360.0
         self._yaw_since_scan += yaw_delta
         radians = math.radians(self.heading)
@@ -393,6 +412,7 @@ class LidarSlamLite:
         imu_yaw_rate_dps: float | None = None,
         camera_yaw_rate_dps: float | None = None,
         camera_translation_scale: float = 1.0,
+        imu_yaw_deg: float | None = None,
     ) -> SlamLiteState:
         self.integrate_motion(
             left_pwm,
@@ -401,6 +421,7 @@ class LidarSlamLite:
             imu_yaw_rate_dps,
             camera_yaw_rate_dps,
             camera_translation_scale,
+            imu_yaw_deg,
         )
         bins, scan_stamp = self.bins_from_points(points)
         self._matched = False
@@ -471,55 +492,89 @@ class LidarSlamLite:
         target_xy: tuple[float, float] | None = None,
         waypoint_xy: tuple[float, float] | None = None,
     ) -> np.ndarray:
-        image = cv2.resize(self.grid, (size, size), interpolation=cv2.INTER_NEAREST)
+        # Keep the estimated chassis at the centre of a robot-following local
+        # viewport. The underlying occupancy grid remains the full 8 m map.
+        view_metres = min(6.0, self.metres)
+        view_cells = self.cells * view_metres / self.metres
+        pixels_per_cell = size / view_cells
+        scale = self.cells / self.metres
+        robot_col = self.x * scale
+        robot_row = self.y * scale
+        centre = size * 0.5
+        transform = np.array(
+            (
+                (pixels_per_cell, 0.0, centre - robot_col * pixels_per_cell),
+                (0.0, pixels_per_cell, centre - robot_row * pixels_per_cell),
+            ),
+            dtype=np.float32,
+        )
+        image = cv2.warpAffine(
+            self.grid,
+            transform,
+            (size, size),
+            flags=cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
         panel = cv2.applyColorMap(image, cv2.COLORMAP_BONE)
-        observed = cv2.resize(
-            self.observed, (size, size), interpolation=cv2.INTER_NEAREST
+        observed = cv2.warpAffine(
+            self.observed,
+            transform,
+            (size, size),
+            flags=cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
         )
         panel[(observed > 0) & (image < 18)] = (25, 34, 42)
         if self._latest_hits.size:
-            hit_y = np.clip(
-                ((self._latest_hits[:, 0] + 0.5) * size / self.cells).astype(np.int32),
-                1,
-                size - 2,
+            hit_y = np.rint(
+                centre + (self._latest_hits[:, 0] + 0.5 - robot_row)
+                * pixels_per_cell
+            ).astype(np.int32)
+            hit_x = np.rint(
+                centre + (self._latest_hits[:, 1] + 0.5 - robot_col)
+                * pixels_per_cell
+            ).astype(np.int32)
+            visible_hits = (
+                (hit_y >= 1) & (hit_y < size - 1)
+                & (hit_x >= 1) & (hit_x < size - 1)
             )
-            hit_x = np.clip(
-                ((self._latest_hits[:, 1] + 0.5) * size / self.cells).astype(np.int32),
-                1,
-                size - 2,
-            )
+            hit_y = hit_y[visible_hits]
+            hit_x = hit_x[visible_hits]
             # Bright current-scan points stay metrically sharper than the
             # fading dead-reckoned history underneath them.
             for dy in (-1, 0, 1):
                 for dx in (-1, 0, 1):
                     panel[hit_y + dy, hit_x + dx] = (0, 220, 255)
-        px = int(np.clip(self.x / self.metres * size, 0, size - 1))
-        py = int(np.clip(self.y / self.metres * size, 0, size - 1))
-        pixels_per_metre = size / self.metres
-        for metres in range(1, int(self.metres / 2.0) + 1):
+        px = py = size // 2
+        pixels_per_metre = size / view_metres
+        for metres in range(1, int(view_metres / 2.0) + 1):
             cv2.circle(panel, (px, py), int(metres * pixels_per_metre),
                        (45, 65, 75), 1, cv2.LINE_AA)
         radians = math.radians(self.heading)
         tip = (int(px + math.sin(radians) * 20), int(py - math.cos(radians) * 20))
         if target_xy is not None:
             target = (
-                int(np.clip(target_xy[0] / self.metres * size, 0, size - 1)),
-                int(np.clip(target_xy[1] / self.metres * size, 0, size - 1)),
+                int(round(px + (target_xy[0] - self.x) * pixels_per_metre)),
+                int(round(py + (target_xy[1] - self.y) * pixels_per_metre)),
             )
-            cv2.circle(panel, target, 9, (225, 90, 225), 2, cv2.LINE_AA)
+            if 0 <= target[0] < size and 0 <= target[1] < size:
+                cv2.circle(panel, target, 9, (225, 90, 225), 2, cv2.LINE_AA)
         if waypoint_xy is not None:
             waypoint = (
-                int(np.clip(waypoint_xy[0] / self.metres * size, 0, size - 1)),
-                int(np.clip(waypoint_xy[1] / self.metres * size, 0, size - 1)),
+                int(round(px + (waypoint_xy[0] - self.x) * pixels_per_metre)),
+                int(round(py + (waypoint_xy[1] - self.y) * pixels_per_metre)),
             )
-            cv2.line(panel, (px, py), waypoint, (80, 210, 255), 1, cv2.LINE_AA)
-            cv2.circle(panel, waypoint, 6, (80, 210, 255), -1, cv2.LINE_AA)
+            if 0 <= waypoint[0] < size and 0 <= waypoint[1] < size:
+                cv2.line(panel, (px, py), waypoint, (80, 210, 255), 1, cv2.LINE_AA)
+                cv2.circle(panel, waypoint, 6, (80, 210, 255), -1, cv2.LINE_AA)
         cv2.circle(panel, (px, py), 8, (80, 240, 100), -1, cv2.LINE_AA)
         cv2.arrowedLine(panel, (px, py), tip, (255, 255, 255), 2, cv2.LINE_AA, tipLength=0.35)
-        label = "LIDAR+IMU EXPLORATION MAP - ESTIMATED POSE"
+        label = "LIDAR+IMU EXPLORATION MAP - ROBOT FOLLOW VIEW"
         yaw_source = "IMU+LD19" if self._using_imu else "COMMAND+LD19"
         detail = (
-            f"{self.metres / self.cells * 100:.1f} cm/cell  scans {self._map_updates}  "
+            f"FOLLOW {view_metres:.1f}m  {self.metres / self.cells * 100:.1f} cm/cell  "
+            f"scans {self._map_updates}  "
             f"yaw {yaw_source} {self._yaw_confidence:.2f}  "
             f"xy match {self._translation_confidence:.2f}"
         )

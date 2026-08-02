@@ -185,6 +185,14 @@ In v1.9.8, the USB LSM6DS3 calibration window is 40 valid samples. Calibration
 uses total acceleration and robust trimmed gyro variance instead of requiring a
 perfectly level board or rejecting the stationary bias it needs to measure. The
 dashboard reports the reason whenever sample collection is intentionally held.
+In v1.9.9, a blocked reverse path no longer leaves recovery stopped when a
+complete LiDAR-cleared turn sweep exists: it uses a bounded low-PWM centre
+pivot and then resumes planning. The map display follows the estimated robot
+pose, route selection penalizes unnecessary detours while retaining obstacle
+clearance, and the mapper consumes the IMU's asynchronously integrated yaw
+delta instead of estimating every turn only from the latest rate sample. The
+dashboard also reports acceleration deviation as a motion/vibration diagnostic;
+it is not treated as position.
 The Pi launcher uses the available XWayland display and reapplies fullscreen
 after the first dashboard frames so the LiDAR UI fills the connected screen.
 

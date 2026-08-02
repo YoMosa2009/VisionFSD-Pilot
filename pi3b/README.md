@@ -224,13 +224,15 @@ move during that interval. Afterwards its authority order is fixed:
    both sides are ambiguous, one short straight reverse search obtains a new
    view before declaring itself boxed in. If reversing is blocked but one
    complete turn sweep has at least 34 cm clearance, it begins the same bounded
-   slow turn directly instead of giving up despite that opening. The 38/40 cm
+   low-PWM centre pivot directly instead of giving up despite that opening.
+   The 38/40 cm
    thresholds initiate manoeuvring; they do not mark every surrounding return
    as boxed-in, and the narrower 30 cm escape-corridor threshold remains
    available during recovery.
 6. Uno ultrasonic hard-stop (under 18 cm) always wins and blocks forward
    motor commands even if the Pi fails.
-7. A live, calibrated USB LSM6DS3 or GPIO MPU-6050 supplies measured yaw rate to the local mapper
+7. A live, calibrated USB LSM6DS3 or GPIO MPU-6050 supplies measured yaw rate
+   and integrated yaw change to the local mapper
    and recovery controller, and progressively removes steering split above
    38 deg/s, reaching zero additional split at 55 deg/s. If the IMU is absent
    or stale, navigation continues with command-predicted yaw corrected by
@@ -254,7 +256,8 @@ capability request every 0.5 seconds until it receives that exact response.
 The full-screen LiDAR-only dashboard shows commanded PWM, Uno-reported actual PWM, the Uno
 ultrasonic `blocked` flag, `IMU LSM6DS3 USB CALIBRATING/LIVE/STALE`, frontier/patrol
 mode, target bearing/range, frontier count, observed-map coverage, and latest
-planner time. It also reports camera-flow confidence. The occupancy grid uses
+planner time. It also reports IMU motion/vibration magnitude and camera-flow
+confidence. The occupancy grid uses
 about 2.1 cm cells, up to 240 current-scan free-space rays, and useful LD19
 returns up to 5.8 m where map bounds permit. These software changes do not
 increase the LD19's physical range or create true odometry.
@@ -363,7 +366,10 @@ Neither supported IMU has a magnetometer, so neither provides absolute heading.
 
 ### LiDAR + IMU exploration map
 
-The LD19-only panel keeps an 8 m occupancy map at 2.5 cm per cell. Every valid
+The LD19-only panel keeps an 8 m occupancy map at about 2.1 cm per cell. Its
+6 m display viewport follows the estimated chassis position and keeps the robot
+marker centred, while the underlying map remains fixed in its estimated world
+coordinates. Every valid
 scan marks both obstacle endpoints and the observed free ray leading to each
 endpoint. Repeated free observations clear stale hit evidence; persistent hits
 remain obstacles. Bright current-scan points remain distinct from mapped
@@ -375,7 +381,9 @@ safety margin, finds the free-space component connected to the robot, clusters
 reachable free/unknown boundaries, and runs bounded A* to the selected target.
 Frontier utility rewards obstacle clearance, while a graded A* traversal cost
 prefers the middle of available space without converting narrow free passages
-into blocked cells. It guides
+into blocked cells. Target scoring also penalizes total path length and excess
+detour length so a slightly larger distant frontier does not override a clear,
+efficient nearby opening. It guides
 the local planner along a cached look-ahead route whose waypoint advances every
 control cycle. If map inflation temporarily places the estimated pose just
 outside free space, planning reconnects to nearby known free space while live
@@ -398,10 +406,16 @@ costs. Reference material:
 
 A heading correction is applied only when successive 360-bin LD19 scans have
 enough non-ambiguous support. Between accepted matches, a live USB LSM6DS3 or GPIO MPU-6050 supplies
-measured yaw rate; if it is unavailable, the mapper uses conservative
+measured yaw rate and its asynchronously integrated yaw change; if it is
+unavailable, the mapper uses conservative
 commanded-motion prediction. Bounded scan-to-map correlation also corrects
 small translation errors when a moving scan uniquely agrees with established
 obstacle geometry.
+
+The dashboard's IMU `MOTION` value is filtered deviation from one-g total
+acceleration. It exposes handling, vibration, or wheel-slip symptoms but is not
+integrated into position. Without encoders or an external position reference,
+accelerometer integration would drift too rapidly to improve this chassis map.
 
 The estimated map supplies exploration intent, not safety permission. Current
 LD19 body-width corridors remain the range authority for steering, and the Uno

@@ -136,6 +136,12 @@ class FrontierExplorerTests(unittest.TestCase):
         assert path is not None
         self.assertTrue(any(abs(row - 15) >= 4 for row, _col in path))
 
+    def test_route_utility_rejects_large_detour_for_small_frontier_gain(self) -> None:
+        direct_open = FrontierExplorer._route_utility(1.50, 1.20, 1.00)
+        distant_detour = FrontierExplorer._route_utility(1.80, 3.20, 1.00)
+
+        self.assertGreater(direct_open, distant_detour)
+
     def test_narrow_single_heading_peak_loses_to_broad_opening(self) -> None:
         policy = AutonomousPolicy(0.0, 118)
         profile = np.full(STEER_HEADINGS.shape, 0.65, dtype=np.float32)

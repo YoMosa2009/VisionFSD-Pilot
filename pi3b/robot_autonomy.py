@@ -901,6 +901,7 @@ class AutonomousPolicy:
         self._escape_phase = "IDLE"
         self._escape_phase_until = 0.0
         self._escape_turn_start_yaw_deg: float | None = None
+        self._escape_center_pivot = False
         self._escape_attempt = 0
         self._arc_active = False
         self._guidance_bias = 0.0
@@ -1083,6 +1084,19 @@ class AutonomousPolicy:
             return self._set_output("L", -self.min_move_pwm, 0)
         return self._set_output("R", 0, -self.min_move_pwm)
 
+    def _center_pivot_crawl(self, direction: str) -> str:
+        """Turn about the chassis centre when reversing is no longer safe."""
+        if direction == "L":
+            return self._set_output("L", -self.min_move_pwm, self.min_move_pwm)
+        return self._set_output("R", self.min_move_pwm, -self.min_move_pwm)
+
+    def _escape_turn_drive(self) -> str:
+        return (
+            self._center_pivot_crawl(self.turn_command)
+            if self._escape_center_pivot
+            else self._pivot_crawl(self.turn_command)
+        )
+
     @staticmethod
     def _yaw_delta_deg(current: float, start: float) -> float:
         return (current - start + 180.0) % 360.0 - 180.0
@@ -1092,6 +1106,7 @@ class AutonomousPolicy:
         self._escape_phase_until = 0.0
         self._escape_turn_start_yaw_deg = None
         self._escape_turn_yaw_source = "TIME"
+        self._escape_center_pivot = False
         self._escape_attempt = 0
 
     def _mark_escape_blocked(self, _lidar: SectorClearance, now: float) -> str:
@@ -1134,7 +1149,12 @@ class AutonomousPolicy:
             self.drive_confidence = 0.30
             return self._pivot_crawl(self.turn_command)
         if lidar.rear_m is None or lidar.rear_m < ESCAPE_REAR_CLEARANCE_M:
-            return self._hold_stop("STOP:ESCAPE_REAR_BLOCKED")
+            rear_turn = self._try_rear_blocked_turn(lidar, now)
+            return (
+                rear_turn
+                if rear_turn is not None
+                else self._mark_escape_blocked(lidar, now)
+            )
         self.turn_command = choice[0]
         self._escape_phase = "REVERSE"
         self._escape_phase_until = now + ESCAPE_REVERSE_SECONDS
@@ -1144,13 +1164,29 @@ class AutonomousPolicy:
         self.drive_confidence = 0.35
         return self._reverse_arc(self.turn_command)
 
-    def _start_escape_turn(self, now: float) -> None:
+    def _start_escape_turn(self, now: float, center_pivot: bool = False) -> None:
         self._escape_phase = "TURN"
         self._escape_phase_until = now + ESCAPE_TURN_TIMEOUT_S
+        self._escape_center_pivot = center_pivot
         (
             self._escape_turn_start_yaw_deg,
             self._escape_turn_yaw_source,
         ) = self._turn_reference_yaw_deg()
+
+    def _try_rear_blocked_turn(
+        self, lidar: SectorClearance, now: float
+    ) -> str | None:
+        """Use a bounded centre pivot when reverse clearance disappears."""
+        choice = self._choose_turn(lidar, now)
+        if choice is None or not self._can_turn_without_reverse(
+            lidar, choice[0], choice[1]
+        ):
+            return None
+        self.turn_command = choice[0]
+        self._start_escape_turn(now, center_pivot=True)
+        self.reason = f"ESCAPE_REAR_BLOCKED_TURN:{self.turn_command}"
+        self.drive_confidence = 0.22
+        return self._center_pivot_crawl(self.turn_command)
 
     def _start_escape_commit(self, now: float) -> None:
         self._escape_phase = "COMMIT"
@@ -1247,7 +1283,12 @@ class AutonomousPolicy:
 
         if self._escape_phase == "REVERSE_SEARCH":
             if lidar.rear_m is None or lidar.rear_m < ESCAPE_REAR_CLEARANCE_M:
-                return self._hold_stop("STOP:ESCAPE_REAR_BLOCKED")
+                rear_turn = self._try_rear_blocked_turn(lidar, now)
+                return (
+                    rear_turn
+                    if rear_turn is not None
+                    else self._mark_escape_blocked(lidar, now)
+                )
             if now < self._escape_phase_until:
                 self.reason = "ESCAPE_REVERSE_SEARCH"
                 self.drive_confidence = 0.20
@@ -1260,7 +1301,12 @@ class AutonomousPolicy:
 
         if self._escape_phase == "REVERSE":
             if lidar.rear_m is None or lidar.rear_m < ESCAPE_REAR_CLEARANCE_M:
-                return self._hold_stop("STOP:ESCAPE_REAR_BLOCKED")
+                rear_turn = self._try_rear_blocked_turn(lidar, now)
+                return (
+                    rear_turn
+                    if rear_turn is not None
+                    else self._mark_escape_blocked(lidar, now)
+                )
             if (
                 now < self._escape_phase_until
                 and straight_clearance < ESCAPE_FRONT_RELEASE_M
@@ -1299,7 +1345,7 @@ class AutonomousPolicy:
                 )
                 self.reason = f"ESCAPE_TURN:{self.turn_command} {progress_label}"
                 self.drive_confidence = 0.30
-                return self._pivot_crawl(self.turn_command)
+                return self._escape_turn_drive()
 
         if self._escape_phase == "COMMIT":
             if close_ultrasonic or straight_clearance < CLOSE_LIDAR_M:
@@ -1623,7 +1669,10 @@ def draw_dashboard(local_map: np.ndarray, policy: AutonomousPolicy,
         imu_color = (70, 95, 255)
     else:
         limiter = " RATE LIMIT" if policy.imu_limited else ""
-        imu_state = f"LIVE  YAW {imu.yaw_deg:+.1f}deg  RATE {imu.gyro_z_dps:+.1f}dps{limiter}"
+        imu_state = (
+            f"LIVE  YAW {imu.yaw_deg:+.1f}deg  RATE {imu.gyro_z_dps:+.1f}dps  "
+            f"MOTION {imu.accel_deviation_g:.2f}g{limiter}"
+        )
         imu_color = (90, 235, 130)
     cv2.putText(panel, f"IMU {imu.source} {imu_state}", (12, 121),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.37, imu_color, 1, cv2.LINE_AA)
@@ -1794,6 +1843,11 @@ def main() -> int:
                 if imu_state.connected and imu_state.calibrated and imu_state.fresh
                 else None
             )
+            imu_yaw = (
+                imu_state.yaw_deg
+                if imu_state.connected and imu_state.calibrated and imu_state.fresh
+                else None
+            )
             camera_motion = camera.motion
             camera_flow_fresh = (
                 camera_motion.fresh
@@ -1808,6 +1862,7 @@ def main() -> int:
                 imu_yaw_rate,
                 camera_motion.yaw_rate_dps if camera_flow_fresh else None,
                 camera_motion.translation_scale if camera_flow_fresh else 1.0,
+                imu_yaw,
             )
             policy.observe_pose(slam_lite)
             # Make the safety decision and refresh the Uno watchdog before the

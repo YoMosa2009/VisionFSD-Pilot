@@ -43,6 +43,7 @@ class IMUState:
     accel_x_g: float = 0.0
     accel_y_g: float = 0.0
     accel_z_g: float = 0.0
+    accel_deviation_g: float = 0.0
     gyro_x_dps: float = 0.0
     gyro_y_dps: float = 0.0
     gyro_z_dps: float = 0.0
@@ -144,6 +145,7 @@ class MPU6050Link:
         self._last_sample_at = 0.0
         self._connected_at = 0.0
         self._accel = (0.0, 0.0, 0.0)
+        self._accel_deviation_g = 0.0
         self._gyro = (0.0, 0.0, 0.0)
         self._filtered_gyro = (0.0, 0.0, 0.0)
         self._temperature_c = 0.0
@@ -296,6 +298,11 @@ class MPU6050Link:
         previous_at = self._last_sample_at
         self._last_sample_at = now
         self._accel = (ax, ay, az)
+        accel_norm = math.sqrt(ax * ax + ay * ay + az * az)
+        deviation = abs(accel_norm - 1.0)
+        self._accel_deviation_g = (
+            self._accel_deviation_g * 0.82 + deviation * 0.18
+        )
         self._temperature_c = temperature
 
         if not self._calibrated:
@@ -307,7 +314,6 @@ class MPU6050Link:
             if not stationary:
                 self._calibration_hold = "MOTION"
                 return self.state(now)
-            accel_norm = math.sqrt(ax * ax + ay * ay + az * az)
             if not self._calibration_sample_is_still(
                 gx, gy, gz, accel_norm
             ):
@@ -319,7 +325,6 @@ class MPU6050Link:
                 self._finish_calibration()
             return self.state(now)
 
-        accel_norm = math.sqrt(ax * ax + ay * ay + az * az)
         bias_delta = tuple(
             value - bias for value, bias in zip((gx, gy, gz), self._gyro_bias)
         )
@@ -376,6 +381,7 @@ class MPU6050Link:
             accel_x_g=self._accel[0],
             accel_y_g=self._accel[1],
             accel_z_g=self._accel[2],
+            accel_deviation_g=self._accel_deviation_g,
             gyro_x_dps=self._gyro[0],
             gyro_y_dps=self._gyro[1],
             gyro_z_dps=self._gyro[2],

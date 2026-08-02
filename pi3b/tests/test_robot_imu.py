@@ -205,6 +205,7 @@ class MPU6050Tests(unittest.TestCase):
         self.assertAlmostEqual(state.accel_z_g, 1.0, places=3)
         self.assertGreater(state.gyro_z_dps, 0.0)
         self.assertGreater(state.yaw_deg, 0.0)
+        self.assertGreater(state.accel_deviation_g, 0.05)
 
     def test_motion_pauses_unfinished_calibration_without_resetting_progress(self) -> None:
         bus = _FakeBus()
