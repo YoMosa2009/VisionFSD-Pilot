@@ -31,7 +31,7 @@ from serial.tools import list_ports
 
 from lidar_visualizer import LD19Parser, LivePolarMap
 from robot_explorer import ExplorationState, FrontierExplorer
-from robot_imu import AutoIMULink, IMUState
+from robot_imu import AsyncIMULink, AutoIMULink, IMUState
 from robot_slam_lite import LidarSlamLite, SlamLiteState
 from visionfsd_pi import (
     LatestCamera,
@@ -95,7 +95,7 @@ TELEMETRY_PERIOD_S = 1.0
 CAPS_RETRY_S = 0.50
 CAMERA_RETRY_S = 1.0
 CAMERA_START_TIMEOUT_S = 2.0
-CAMERA_IMU_DEFER_LIMIT_S = 8.0
+IMU_PROBE_GRACE_S = 5.0
 CAMERA_AUTO_INDEX_LIMIT = 8
 CAMERA_CAPTURE_WIDTH = 320
 CAMERA_CAPTURE_HEIGHT = 240
@@ -1453,13 +1453,15 @@ class AutonomousPolicy:
         return self._set_output("STOP", 0, 0)
 
     def decide(self, lidar: SectorClearance, arduino: ArduinoStatus, _person: bool, now: float,
-               camera_ready: bool = True) -> str:
+               camera_ready: bool = True, imu_ready: bool = True) -> str:
         if now - self.started_at < self.standby_s:
             return self._set_stop(f"STANDBY {max(0, int(self.standby_s - (now - self.started_at)))}s")
         if now - arduino.received_at > 1.5:
             return self._set_stop("STOP:UNO_STATUS_STALE")
         if not lidar.fresh:
             return self._set_stop("STOP:LD19_STALE")
+        if not imu_ready:
+            return self._set_stop("STOP:IMU_CALIBRATING")
         if not camera_ready:
             return self._set_stop("STOP:CAMERA_STALE")
         if lidar.front_m is None and lidar.profile is None:
@@ -1710,10 +1712,10 @@ def main() -> int:
     # Streaming a webcam and calculating optical flow can contend with the
     # userspace MCP2221 USB transport on a Pi 3B. Keep capture closed for the
     # short stationary IMU calibration, then require a real camera frame before
-    # motor authority is granted. A bounded fallback preserves non-IMU mode.
+    # motor authority is granted.
     camera = CameraSafety(args.camera, args.fov, auto_start=False)
-    imu = None if args.no_imu else AutoIMULink(
-        args.imu_bus, args.imu_address, args.imu_mount_yaw_deg
+    imu = None if args.no_imu else AsyncIMULink(
+        AutoIMULink(args.imu_bus, args.imu_address, args.imu_mount_yaw_deg)
     )
     print(
         f"VisionFSD Robot: Uno={arduino_port}, LD19={lidar_port}, "
@@ -1735,7 +1737,9 @@ def main() -> int:
     last_policy_state: tuple[str, str, str] | None = None
     last_imu_error: str | None = None
     calibrated_source: str | None = None
-    camera_defer_until = policy.started_at + CAMERA_IMU_DEFER_LIMIT_S
+    imu_probe_until = policy.started_at + IMU_PROBE_GRACE_S
+    imu_detected = False
+    imu_calibration_complete = False
     keep_running = True
 
     def stop(_signum: int, _frame: object) -> None:
@@ -1763,13 +1767,21 @@ def main() -> int:
                 if imu_state.calibrated and imu_state.source != calibrated_source:
                     print(f"{imu_state.source} calibrated; measured yaw enabled")
                     calibrated_source = imu_state.source
+                imu_detected = imu_detected or imu_state.connected
+                imu_calibration_complete = (
+                    imu_calibration_complete or imu_state.calibrated
+                )
             policy.observe_imu(imu_state)
-            if (
+            imu_start_ready = (
                 imu is None
-                or imu_state.calibrated
-                or not imu_state.connected
-                or now >= camera_defer_until
-            ):
+                or imu_calibration_complete
+                or (
+                    not imu_detected
+                    and bool(imu_state.error)
+                    and now >= imu_probe_until
+                )
+            )
+            if imu_start_ready:
                 camera.start(now)
             camera.tick(policy.left_pwm, policy.right_pwm)
             clearance = lidar.clearance()
@@ -1807,6 +1819,7 @@ def main() -> int:
                 False,
                 control_now,
                 camera_ready,
+                imu_start_ready,
             )
             policy.send(arduino, command, control_now)
             policy_state = (

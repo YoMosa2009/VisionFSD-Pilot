@@ -2,11 +2,18 @@ from __future__ import annotations
 
 import pathlib
 import sys
+import time
 import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from robot_imu import AutoIMULink, IMUState, LSM6DS3MCP2221Link, MPU6050Link
+from robot_imu import (
+    AsyncIMULink,
+    AutoIMULink,
+    IMUState,
+    LSM6DS3MCP2221Link,
+    MPU6050Link,
+)
 
 
 def _word(value: int) -> list[int]:
@@ -112,7 +119,59 @@ class _FakeLink:
         self.closed = True
 
 
+class _ProgressLink:
+    def __init__(self) -> None:
+        self.samples = 0
+        self.closed = False
+
+    def tick(self, _now: float, _stationary: bool) -> IMUState:
+        self.samples += 1
+        return IMUState(
+            connected=True,
+            calibrated=self.samples >= 4,
+            fresh=True,
+            calibration_progress=min(1.0, self.samples / 4.0),
+            source="LSM6DS3 USB",
+        )
+
+    def state(self, _now: float | None = None) -> IMUState:
+        return IMUState(connected=True, source="LSM6DS3 USB")
+
+    def close(self) -> None:
+        self.closed = True
+
+
 class MPU6050Tests(unittest.TestCase):
+    def test_rejected_aggregate_window_retains_progress_and_recovers(self) -> None:
+        bus = _FakeBus()
+        imu = MPU6050Link(calibration_samples=20, bus_factory=lambda _number: bus)
+
+        for index in range(20):
+            bus.sample = _sample(gz=786 if index % 2 else -786)
+            state = imu.tick(1.0 + index * 0.03, stationary=True)
+
+        self.assertFalse(state.calibrated)
+        self.assertGreaterEqual(state.calibration_progress, 0.90)
+        for index in range(30):
+            bus.sample = _sample(gz=131)
+            state = imu.tick(2.0 + index * 0.03, stationary=True)
+            if state.calibrated:
+                break
+        self.assertTrue(state.calibrated)
+
+    def test_async_sampler_calibrates_without_main_loop_ticks(self) -> None:
+        link = _ProgressLink()
+        imu = AsyncIMULink(link, sample_period_s=0.005)
+        try:
+            deadline = time.monotonic() + 0.5
+            while not imu.state().calibrated and time.monotonic() < deadline:
+                time.sleep(0.005)
+            self.assertTrue(imu.state().calibrated)
+            self.assertGreaterEqual(link.samples, 4)
+        finally:
+            imu.close()
+        self.assertTrue(link.closed)
+
     def test_stationary_samples_calibrate_and_report_live(self) -> None:
         bus = _FakeBus()
         imu = MPU6050Link(
@@ -292,6 +351,26 @@ class LSM6DS3Tests(unittest.TestCase):
         self.assertEqual(missing.source, "AUTO")
         self.assertIn("unplugged", missing.error)
         self.assertIn("missing", missing.error)
+
+    def test_auto_link_keeps_partial_usb_calibration_across_hub_reset(self) -> None:
+        lsm = _FakeLink(IMUState(
+            connected=True,
+            calibration_progress=0.25,
+            source="LSM6DS3 USB",
+        ))
+        mpu = _FakeLink(IMUState(connected=True, source="MPU-6050"))
+        auto = AutoIMULink(lsm_link=lsm, mpu_link=mpu)
+        self.assertEqual(auto.tick(1.0).calibration_progress, 0.25)
+
+        lsm.current = IMUState(
+            calibration_progress=0.25,
+            error="USB reset",
+            source="LSM6DS3 USB",
+        )
+        interrupted = auto.tick(2.0)
+
+        self.assertEqual(interrupted.source, "LSM6DS3 USB")
+        self.assertEqual(interrupted.calibration_progress, 0.25)
 
 
 if __name__ == "__main__":

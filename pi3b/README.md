@@ -185,7 +185,9 @@ move during that interval. Afterwards its authority order is fixed:
 1. A stale Uno, LD19, or webcam stops the robot; it will not drive blind. After
    the webcam has produced a live frame, a USB reset receives at most one second
    of last-frame grace so one device event does not create a motor pulse. The
-   robot still requires a real webcam frame before initially driving.
+   robot still requires a real webcam frame before initially driving. If an IMU
+   is detected during startup, `IMU CALIBRATING` also holds STOP until calibration
+   reaches `IMU LIVE`. An absent IMU still selects the supported non-IMU mode.
 2. Robot mode does not run object or person detection. Low-resolution webcam
    optical flow provides a bounded non-IMU yaw cue during turns and reduces
    false commanded map translation when a high-confidence textured view shows
@@ -259,9 +261,11 @@ increase the LD19's physical range or create true odometry.
 
 Camera startup defaults to `auto`. The runtime tries stable V4L by-id paths and
 camera indexes 0 through 7. When a USB IMU is connected, webcam capture is
-deferred until IMU calibration completes, or for at most eight seconds. This
-keeps webcam streaming and optical flow from competing with MCP2221 calibration
-on the Pi 3B. Optical flow is skipped while both motors are stopped. If no
+deferred until IMU calibration completes. The runtime allows five seconds to
+confirm that no IMU is present before starting the webcam in non-IMU mode. A
+detected but unfinished IMU does not use that fallback. This keeps webcam
+streaming and optical flow from competing with MCP2221 calibration on the Pi 3B.
+Optical flow is skipped while both motors are stopped. If no
 webcam currently delivers frames, the LiDAR
 dashboard remains open in `CAMERA STALE` safe-STOP mode and retries instead of
 terminating the complete robot runtime. A reopened camera gets a fresh two-second
@@ -306,8 +310,12 @@ The sampler ignores cycles without both new gyro and accelerometer data, uses
 the datasheet's 256 LSB/degree C temperature conversion, performs trimmed-mean
 stationary calibration, and slowly tracks gyro bias only during confirmed
 stationary periods. Handling jolts and commanded motion pause unfinished
-calibration without deleting already collected still samples. A temporary
-webcam USB event therefore cannot restart valid progress from zero. No manual
+calibration without deleting already collected still samples. IMU reads run on
+a dedicated 50 Hz sampler thread, independent of camera, display, and planner
+latency. A rejected aggregate window advances as a rolling still-sample window
+rather than clearing to zero. If webcam insertion briefly resets the MCP2221,
+the USB LSM6DS3 remains the selected calibration source and retains its partial
+progress while reconnecting. No manual
 `modprobe`, I2C scan, or launch command is required. During the
 25-second stationary standby, the dashboard should change from
 `IMU LSM6DS3 USB CALIBRATING` to `IMU LSM6DS3 USB LIVE`.

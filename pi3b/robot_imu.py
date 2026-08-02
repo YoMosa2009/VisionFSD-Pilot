@@ -11,6 +11,7 @@ from dataclasses import dataclass, replace
 import math
 import os
 import statistics
+import threading
 import time
 from typing import Callable, Protocol
 
@@ -236,7 +237,13 @@ class MPU6050Link:
             or mean_accel_z < 0.70
             or mean_horizontal > 0.45
         ):
-            self._calibration.clear()
+            # Keep a rolling window instead of throwing valid progress back to
+            # zero. A cable insertion or mild chassis jolt can spoil one
+            # aggregate window even though per-sample stillness filtering
+            # rejected the obvious motion. The next stable sample replaces the
+            # oldest candidate and calibration completes once the full window
+            # is internally consistent.
+            self._calibration.pop(0)
             return False
         # A trimmed mean rejects an isolated USB/I2C or handling spike without
         # biasing every later yaw integration step.
@@ -522,11 +529,23 @@ class AutoIMULink:
             mount_yaw_deg=mount_yaw_deg,
         )
         self._using_lsm = False
+        self._lsm_calibration_started = False
 
     def tick(self, now: float | None = None, stationary: bool = True) -> IMUState:
         now = time.monotonic() if now is None else now
         lsm_state = self._lsm.tick(now, stationary)
         if lsm_state.connected:
+            self._using_lsm = True
+            self._lsm_calibration_started = (
+                self._lsm_calibration_started
+                or (not lsm_state.calibrated and lsm_state.calibration_progress > 0.0)
+            )
+            return lsm_state
+        if self._lsm_calibration_started and not lsm_state.calibrated:
+            # A USB hub reset can briefly remove the MCP2221 when another device
+            # is inserted. Keep reporting the LSM calibration state so its
+            # retained samples do not appear to reset to the unused GPIO
+            # fallback's zero-percent state.
             self._using_lsm = True
             return lsm_state
         self._using_lsm = False
@@ -548,3 +567,48 @@ class AutoIMULink:
     def close(self) -> None:
         self._lsm.close()
         self._mpu.close()
+
+
+class AsyncIMULink:
+    """Sample an IMU independently of camera, display, and planner latency."""
+
+    def __init__(self, link: AutoIMULink, sample_period_s: float = 0.02) -> None:
+        self._link = link
+        self._sample_period_s = max(0.005, sample_period_s)
+        self._lock = threading.Lock()
+        self._stationary = True
+        self._state = link.state()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="imu-sampler",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            with self._lock:
+                stationary = self._stationary
+            now = time.monotonic()
+            try:
+                state = self._link.tick(now, stationary)
+            except Exception as exc:
+                state = IMUState(error=f"IMU sampler error: {exc}", source="AUTO")
+            with self._lock:
+                self._state = state
+            self._stop.wait(self._sample_period_s)
+
+    def tick(self, _now: float | None = None, stationary: bool = True) -> IMUState:
+        with self._lock:
+            self._stationary = stationary
+            return self._state
+
+    def state(self, _now: float | None = None) -> IMUState:
+        with self._lock:
+            return self._state
+
+    def close(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=2.0)
+        self._link.close()

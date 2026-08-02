@@ -176,7 +176,11 @@ robot boot calibrates a connected USB IMU before starting webcam streaming,
 avoiding Pi 3B USB/CPU contention during the stationary calibration window.
 Stationary frames no longer run optical flow, and each reopened webcam receives
 its own startup timeout instead of being rejected against the previous camera's
-stale timestamp.
+stale timestamp. In v1.9.7, IMU sampling runs independently of camera, display,
+and planner work. Once an IMU is detected, motor authority remains locked until
+that IMU reaches `LIVE`; only a genuinely absent IMU enters non-IMU mode.
+Calibration uses a rolling still-sample window and retains partial progress
+through a temporary MCP2221 USB reset instead of falling back to a displayed 0%.
 The Pi launcher uses the available XWayland display and reapplies fullscreen
 after the first dashboard frames so the LiDAR UI fills the connected screen.
 

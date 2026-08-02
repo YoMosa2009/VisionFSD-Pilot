@@ -441,6 +441,22 @@ class AutonomousPolicyTests(unittest.TestCase):
         clear = SectorClearance(2.0, 2.0, 2.0, True, 2.0, 2.0)
         self.assertEqual(policy.decide(clear, self.status, False, time.monotonic(), False), "STOP")
 
+    def test_detected_uncalibrated_imu_blocks_motion(self) -> None:
+        policy = AutonomousPolicy(0.0, 70)
+        clear = SectorClearance(2.0, 2.0, 2.0, True, 2.0, 2.0)
+
+        command = policy.decide(
+            clear,
+            self.status,
+            False,
+            time.monotonic(),
+            camera_ready=True,
+            imu_ready=False,
+        )
+
+        self.assertEqual(command, "STOP")
+        self.assertEqual(policy.reason, "STOP:IMU_CALIBRATING")
+
     def test_unseen_front_stops(self) -> None:
         policy = AutonomousPolicy(0.0, 70)
         unseen = SectorClearance(None, 2.0, 2.0, True, 2.0, 2.0)
