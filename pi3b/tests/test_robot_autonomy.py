@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import pathlib
 import sys
+import threading
 import time
 from types import SimpleNamespace
 import unittest
@@ -553,6 +554,7 @@ class ArduinoLinkTests(unittest.TestCase):
 
     def test_capability_handshake_retries_until_drive_is_confirmed(self) -> None:
         link = object.__new__(ArduinoLink)
+        link._serial = mock.Mock()
         link._supports_differential = False
         link._last_caps_sent_at = float("-inf")
         commands = []
@@ -566,6 +568,59 @@ class ArduinoLinkTests(unittest.TestCase):
         link._supports_differential = True
         link.poll_capabilities(11.2)
         self.assertEqual(commands, ["CAPS", "CAPS"])
+
+    def test_write_io_error_drops_port_without_crashing_runtime(self) -> None:
+        connection = mock.Mock()
+        connection.is_open = True
+        connection.write.side_effect = OSError(5, "Input/output error")
+        link = object.__new__(ArduinoLink)
+        link._write_lock = threading.Lock()
+        link._running = True
+        link._serial = connection
+        link._supports_differential = True
+        link._status = ArduinoStatus(80.0, "F", 10.0, False, 110, 112)
+        link._last_io_error = None
+        link._next_reconnect_at = 0.0
+
+        self.assertFalse(link._write("STOP"))
+        self.assertIsNone(link._serial)
+        self.assertFalse(link.differential_ready)
+        self.assertEqual(link.status().motion, "S")
+        self.assertEqual(link.status().received_at, 0.0)
+        self.assertIn("Input/output error", link._last_io_error)
+        connection.close.assert_called_once()
+
+    @mock.patch("robot_autonomy.time.sleep")
+    @mock.patch("robot_autonomy.serial.Serial")
+    @mock.patch("robot_autonomy.discover_arduino_port", return_value="/dev/ttyACM2")
+    def test_reconnect_rediscovers_current_uno_node_and_restarts_handshake(
+        self, discover, serial_open, sleep
+    ) -> None:
+        connection = mock.Mock()
+        connection.is_open = True
+        serial_open.return_value = connection
+        link = object.__new__(ArduinoLink)
+        link._port = "/dev/ttyACM0"
+        link._serial = None
+        link._running = True
+        link._write_lock = threading.Lock()
+        link._supports_differential = False
+        link._last_caps_sent_at = float("-inf")
+        link._last_io_error = "Input/output error"
+        link._next_reconnect_at = 9.0
+
+        link.poll_capabilities(10.0)
+
+        discover.assert_called_once_with()
+        serial_open.assert_called_once_with(
+            "/dev/ttyACM2", 115200, timeout=0.05, write_timeout=0.2
+        )
+        sleep.assert_called_once_with(2.1)
+        self.assertEqual(link._port, "/dev/ttyACM2")
+        self.assertEqual(
+            connection.write.call_args_list,
+            [mock.call(b"STOP\n"), mock.call(b"CAPS\n")],
+        )
 
     def test_status_parser_exposes_actual_motor_outputs_and_hard_stop(self) -> None:
         status = ArduinoLink._parse_status(

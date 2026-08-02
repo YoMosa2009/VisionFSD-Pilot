@@ -368,7 +368,8 @@ class LSM6DS3MCP2221Link(MPU6050Link):
     CTRL3_C = 0x12
     STATUS_REG = 0x1E
     DATA_START = 0x20
-    EXPECTED_IDS = (0x69,)
+    # LSM6DS3TR-C identifies as 0x6A. The older non-C LSM6DS3 uses 0x69.
+    EXPECTED_IDS = (0x6A,)
     SENSOR_NAME = "LSM6DS3 USB"
 
     def __init__(

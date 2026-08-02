@@ -284,7 +284,8 @@ IMU cannot remain open across a power cycle.
 
 At startup the runtime automatically checks both normal LSM6DS3 I2C addresses,
 `0x6A` and `0x6B`, accepts the sensor only when its identity register returns
-`0x69`, and verifies every critical configuration register after writing it.
+`0x6A` for the installed LSM6DS3TR-C, and verifies every critical configuration
+register after writing it.
 The sampler ignores cycles without both new gyro and accelerometer data, uses
 the datasheet's 256 LSB/degree C temperature conversion, performs trimmed-mean
 stationary calibration, and slowly tracks gyro bias only during confirmed
@@ -391,11 +392,14 @@ holds STOP for 25 seconds. Use `--no-robot-autostart` with `install.sh` if you
 do not want that. Raspberry Pi OS Lite has no graphical autostart session, so
 it needs a separate headless service and does not show the visualizer.
 
-The installed launcher explicitly uses `/dev/ttyACM0` for the Uno R3 and
-`/dev/ttyUSB0` for the LD19 adapter, matching this robot's verified USB layout.
-Set `VISIONFSD_ARDUINO_PORT` or `VISIONFSD_LIDAR_PORT` only if Linux assigns a
-different device node. Direct Python launches also prefer the exact Uno
-`2341:0043` and CP210x `10C4:EA60` USB identities before descriptive metadata.
+The launcher discovers the Uno by its exact `2341:0043` USB identity and the
+LD19 adapter by its exact CP210x `10C4:EA60` identity. It does not hardcode
+`/dev/ttyACM0`, because Linux may assign a different ACM number after a USB
+reset. If an active Uno port returns a serial I/O error, the runtime keeps the
+motors stopped, rediscovers the current node, waits for the Uno reset, and
+repeats `CAPS` before differential motion can resume. The dashboard remains
+running during this recovery. `VISIONFSD_ARDUINO_PORT` and
+`VISIONFSD_LIDAR_PORT` remain optional manual overrides for other hardware.
 
 The short normal update command is:
 

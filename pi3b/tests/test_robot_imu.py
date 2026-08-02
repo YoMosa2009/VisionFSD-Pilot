@@ -88,7 +88,7 @@ class _FakeLSMBus(_FakeBus):
             self.probed.append(address)
             if address == 0x6A:
                 raise OSError("no response")
-            return 0x69
+            return 0x6A
         value = self.registers.get(register, 0)
         return value if self.valid_config_readback else value ^ 0x01
 
@@ -171,7 +171,7 @@ class MPU6050Tests(unittest.TestCase):
 
 
 class LSM6DS3Tests(unittest.TestCase):
-    def test_auto_probes_second_address_and_decodes_little_endian(self) -> None:
+    def test_tr_c_identity_auto_probes_second_address_and_decodes_little_endian(self) -> None:
         bus = _FakeLSMBus()
         imu = LSM6DS3MCP2221Link(
             mount_yaw_deg=0.0,

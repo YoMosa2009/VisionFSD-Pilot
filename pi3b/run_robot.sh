@@ -51,15 +51,23 @@ done
 # loaded-wheel movement floor, never into the buzzing/no-motion PWM band.
 ARGS=(
   "$ROOT/robot_autonomy.py"
-  --arduino-port "${VISIONFSD_ARDUINO_PORT:-/dev/ttyACM0}"
-  --lidar-port "${VISIONFSD_LIDAR_PORT:-/dev/ttyUSB0}"
   --camera "${VISIONFSD_CAMERA:-auto}"
   --standby-seconds "${VISIONFSD_STANDBY_SECONDS:-25}"
   --speed "${VISIONFSD_ROBOT_SPEED:-118}"
   --lidar-front-offset-deg "${VISIONFSD_LIDAR_FRONT_OFFSET_DEG:-0}"
   --imu-mount-yaw-deg "${VISIONFSD_IMU_MOUNT_YAW_DEG:-180}"
-  "$@"
 )
+
+# Automatic USB identity discovery is the stable default because Linux ttyACM
+# numbers can change after a USB reset. Explicit overrides remain available for
+# nonstandard hardware without forcing this robot to a stale device node.
+if [[ -n "${VISIONFSD_ARDUINO_PORT:-}" ]]; then
+  ARGS+=(--arduino-port "$VISIONFSD_ARDUINO_PORT")
+fi
+if [[ -n "${VISIONFSD_LIDAR_PORT:-}" ]]; then
+  ARGS+=(--lidar-port "$VISIONFSD_LIDAR_PORT")
+fi
+ARGS+=("$@")
 
 # With a terminal attached, print straight to it so errors are visible now.
 if [[ -t 1 ]]; then

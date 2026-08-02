@@ -314,9 +314,8 @@ class ArduinoLink:
     """Bounded serial link.  The Uno independently times out motion commands."""
 
     def __init__(self, port: str) -> None:
-        self._serial = serial.Serial(port, UNO_BAUD, timeout=0.05, write_timeout=0.2)
-        # Opening an Uno serial port resets it; wait for the sketch banner.
-        time.sleep(2.1)
+        self._port = port
+        self._serial = None
         self._lines: queue.Queue[str] = queue.Queue()
         self._running = True
         self._write_lock = threading.Lock()
@@ -328,6 +327,9 @@ class ArduinoLink:
         self._status = ArduinoStatus(None, "S", 0.0)
         self._supports_differential = False
         self._last_caps_sent_at = float("-inf")
+        self._last_io_error: str | None = None
+        self._next_reconnect_at = 0.0
+        self._open_serial(port)
         self._reader = threading.Thread(target=self._read_loop, name="uno-status", daemon=True)
         self._reader.start()
         self.send("STOP")
@@ -336,6 +338,52 @@ class ArduinoLink:
             target=self._heartbeat_loop, name="uno-drive-heartbeat", daemon=True
         )
         self._heartbeat.start()
+
+    def _open_serial(self, port: str) -> bool:
+        try:
+            connection = serial.Serial(
+                port, UNO_BAUD, timeout=0.05, write_timeout=0.2
+            )
+            # Opening an Uno resets it. Let the firmware finish setup before
+            # STOP/CAPS are sent, including after a USB reconnect.
+            time.sleep(2.1)
+        except (serial.SerialException, OSError, TypeError, ValueError) as exc:
+            self._last_io_error = str(exc)
+            self._next_reconnect_at = time.monotonic() + 1.0
+            return False
+        with self._write_lock:
+            if not self._running:
+                connection.close()
+                return False
+            old = self._serial
+            self._serial = connection
+            self._port = port
+            self._last_io_error = None
+            self._supports_differential = False
+            self._last_caps_sent_at = float("-inf")
+        if old is not None:
+            try:
+                old.close()
+            except (serial.SerialException, OSError, TypeError):
+                pass
+        return True
+
+    def _drop_serial_locked(self, connection: object, error: Exception) -> None:
+        if self._serial is not connection:
+            return
+        self._serial = None
+        self._last_io_error = str(error)
+        self._next_reconnect_at = time.monotonic() + 0.5
+        self._supports_differential = False
+        self._status = ArduinoStatus(None, "S", 0.0)
+        try:
+            connection.close()
+        except (serial.SerialException, OSError, TypeError):
+            pass
+
+    def _drop_serial(self, connection: object, error: Exception) -> None:
+        with self._write_lock:
+            self._drop_serial_locked(connection, error)
 
     @staticmethod
     def _parse_status(line: str, received_at: float) -> ArduinoStatus:
@@ -363,10 +411,15 @@ class ArduinoLink:
 
     def _read_loop(self) -> None:
         while self._running:
+            connection = self._serial
+            if connection is None:
+                time.sleep(0.05)
+                continue
             try:
-                line = self._serial.readline().decode("ascii", "replace").strip()
-            except (serial.SerialException, OSError, TypeError):
-                break
+                line = connection.readline().decode("ascii", "replace").strip()
+            except (serial.SerialException, OSError, TypeError) as exc:
+                self._drop_serial(connection, exc)
+                continue
             if not line:
                 continue
             if line.startswith("STATUS "):
@@ -375,10 +428,17 @@ class ArduinoLink:
                 self._supports_differential = True
             self._lines.put(line)
 
-    def _write(self, command: str) -> None:
+    def _write(self, command: str) -> bool:
         with self._write_lock:
-            if self._running and self._serial.is_open:
-                self._serial.write((command + "\n").encode("ascii"))
+            connection = self._serial
+            if not self._running or connection is None or not connection.is_open:
+                return False
+            try:
+                connection.write((command + "\n").encode("ascii"))
+                return True
+            except (serial.SerialException, OSError, TypeError) as exc:
+                self._drop_serial_locked(connection, exc)
+                return False
 
     def send(self, command: str) -> None:
         self._write(command)
@@ -428,6 +488,18 @@ class ArduinoLink:
 
     def poll_capabilities(self, now: float) -> None:
         """Retry the Uno capability handshake until differential drive is confirmed."""
+        if self._serial is None:
+            if now < self._next_reconnect_at:
+                return
+            port = discover_arduino_port()
+            if port is None:
+                self._last_io_error = "Arduino USB device not found"
+                self._next_reconnect_at = now + 1.0
+                return
+            if not self._open_serial(port):
+                return
+            print(f"Arduino reconnected on {port}; motors held STOP during handshake")
+            self.send("STOP")
         if not self._supports_differential and now - self._last_caps_sent_at >= CAPS_RETRY_S:
             self.send("CAPS")
             self._last_caps_sent_at = now
@@ -438,18 +510,21 @@ class ArduinoLink:
 
     def close(self) -> None:
         self._running = False
-        try:
-            with self._write_lock:
-                if self._serial.is_open:
-                    self._serial.write(b"STOP\n")
-        except (serial.SerialException, OSError, TypeError):
-            pass
+        with self._write_lock:
+            connection, self._serial = self._serial, None
+            if connection is not None:
+                try:
+                    if connection.is_open:
+                        connection.write(b"STOP\n")
+                except (serial.SerialException, OSError, TypeError):
+                    pass
         self._reader.join(timeout=0.5)
         self._heartbeat.join(timeout=0.5)
-        try:
-            self._serial.close()
-        except (serial.SerialException, OSError, TypeError):
-            pass
+        if connection is not None:
+            try:
+                connection.close()
+            except (serial.SerialException, OSError, TypeError):
+                pass
 
 
 class LD19Link:

@@ -160,11 +160,14 @@ continuous forward differential motion. Recovery uses less-sensitive thresholds,
 prefers a bounded turn over reversing when safe, and ignores unconfirmed isolated
 LD19 returns. Camera neural inference was removed from robot mode; optical flow
 continues to refine non-IMU pose without spending CPU on person detection. In
-v1.9.2 the normal updater performs the one-time MCP2221 Linux setup and installs
+v1.9.3 the normal updater performs the one-time MCP2221 Linux setup and installs
 its Python transport. Robot startup probes LSM6DS3 addresses `0x6A` and `0x6B`,
-verifies the programmed registers, consumes only fresh complete samples, and
-retains GPIO/non-IMU fallbacks. Its calibrated gyro bias continues adapting
-only during confirmed stationary periods to reduce temperature-related yaw drift.
+accepts the LSM6DS3TR-C identity `0x6A`, verifies the programmed registers,
+consumes only fresh complete samples, and retains GPIO/non-IMU fallbacks. If
+the Uno USB serial node changes, the runtime holds STOP, rediscovers the exact
+Uno USB identity, and repeats the capability handshake instead of terminating.
+Its calibrated gyro bias continues adapting only during confirmed stationary
+periods to reduce temperature-related yaw drift.
 
 It is not vehicle autonomy and is not robust room-scale SLAM. Do not run it
 unsupervised, near stairs, pets, people, or property that can be damaged.
