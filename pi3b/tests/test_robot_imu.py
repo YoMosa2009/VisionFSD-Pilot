@@ -265,22 +265,37 @@ class MPU6050Tests(unittest.TestCase):
 
 
 class LSM6DS3Tests(unittest.TestCase):
-    def test_tighter_aggregate_bar_rejects_variance_the_mpu_would_accept(self) -> None:
-        self.assertLess(
+    def test_calibration_bar_matches_the_mpu6050_default(self) -> None:
+        """v1.9.10 briefly tightened this sensor's aggregate calibration bar
+        below the MPU-6050's based on datasheet noise specs alone. Physical
+        testing showed the real sensor could not reliably settle inside it,
+        so calibration_progress stalled short of 100% forever and the robot
+        never started driving. Guard against retightening this without
+        hardware-in-the-loop verification."""
+        self.assertEqual(
             LSM6DS3MCP2221Link.CALIBRATION_GYRO_STD_MAX_DPS,
             MPU6050Link.CALIBRATION_GYRO_STD_MAX_DPS,
         )
+        self.assertEqual(
+            LSM6DS3MCP2221Link.CALIBRATION_ACCEL_NORM_MIN,
+            MPU6050Link.CALIBRATION_ACCEL_NORM_MIN,
+        )
+        self.assertEqual(
+            LSM6DS3MCP2221Link.CALIBRATION_ACCEL_NORM_MAX,
+            MPU6050Link.CALIBRATION_ACCEL_NORM_MAX,
+        )
+
+    def test_moderate_gyro_variance_converges_within_the_shared_bar(self) -> None:
         bus = _FakeLSMBus()
         imu = LSM6DS3MCP2221Link(calibration_samples=20, bus_factory=lambda _number: bus)
         state = None
-        for index in range(100):
+        for index in range(20):
             # +/-2.1875 dps alternating, population std ~2.19 dps: inside the
-            # MPU-6050's 2.5 dps bar (see the MPU6050Tests counterpart of this
-            # test) but outside the LSM6DS3's tighter 1.5 dps bar, so this
-            # window should never converge no matter how long it runs.
+            # shared 2.5 dps bar (compare the reverted-away-from bar this
+            # exact window used to fail under, in test_robot_imu.py history).
             bus.sample = _lsm_sample(gz=250 if index % 2 else -250)
             state = imu.tick(1.0 + index * 0.03, stationary=True)
-        self.assertFalse(state.calibrated)
+        self.assertTrue(state.calibrated)
 
     def test_usb_imu_uses_short_startup_calibration_window(self) -> None:
         imu = LSM6DS3MCP2221Link(bus_factory=lambda _number: _FakeLSMBus())

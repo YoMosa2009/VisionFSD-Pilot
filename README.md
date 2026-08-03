@@ -206,12 +206,21 @@ any source reports real motion again, including a manual reposition. The
 escape state machine's turn-side scoring now uses the same body-width windowed
 minimum as forward path selection instead of the single farthest ray in a
 sweep, so a gap narrower than the chassis can no longer look like a viable
-escape direction. The USB LSM6DS3's stationary-calibration acceptance bar is
-moderately tighter than the GPIO MPU-6050's, reflecting its lower datasheet
-noise. The on-screen robot dashboard and window title now show the running
-version, not only the startup log line. This version's physical driving
-behavior has not yet been confirmed on the robot; software-only verification
-(compileall, pyflakes, targeted unit tests) is not a substitute for that.
+escape direction. This version also moderately tightened the USB LSM6DS3's
+stationary-calibration acceptance bar versus the GPIO MPU-6050's, reflecting
+its lower datasheet noise. The on-screen robot dashboard and window title now
+show the running version, not only the startup log line.
+
+In v1.9.11, the v1.9.10 LSM6DS3 calibration tightening was reverted: physical
+testing showed `IMU CALIBRATING` stalling indefinitely below 100% and the
+robot never gaining drive authority, because the real sensor's noise did not
+reliably fit inside the tighter bar. The USB LSM6DS3 now uses the same
+calibration acceptance bar as the GPIO MPU-6050 again -- the values the "Make
+USB IMU calibration converge reliably" fix was actually verified against.
+This version's physical driving behavior has not yet been confirmed on the
+robot beyond that the calibration stall is resolved; software-only
+verification (compileall, pyflakes, targeted unit tests) is not a substitute
+for a full floor test.
 The Pi launcher uses the available XWayland display and reapplies fullscreen
 after the first dashboard frames so the LiDAR UI fills the connected screen.
 

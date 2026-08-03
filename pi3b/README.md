@@ -385,12 +385,13 @@ bias. Calibration rejects samples with excessive motion and pauses rather than
 resetting valid progress. USB LSM6DS3 is
 preferred, GPIO MPU-6050 is second, and `LD19+COMMAND POSE ACTIVE` remains the
 automatic fallback if neither IMU is usable. Missing IMU hardware never creates
-a no-motion boot failure. The aggregate acceptance bar for a stationary
-calibration window (versus the noisier MPU-6050's) is tighter for the USB
-LSM6DS3, since its datasheet gyro/accel noise is meaningfully lower; this is a
-moderate tightening chosen to keep converging reliably, not the tightest bar
-that would pass on a bench sample, and its effect on real calibration retry
-rate still needs field verification on the robot.
+a no-motion boot failure. The USB LSM6DS3 uses the same aggregate acceptance
+bar for a stationary calibration window as the GPIO MPU-6050. A v1.9.10
+attempt to tighten that bar for the LSM6DS3 based on its lower datasheet
+noise was reverted in v1.9.11: physical testing showed `IMU CALIBRATING`
+stalling short of 100% indefinitely, because the real sensor's noise did not
+reliably fit inside the tighter bar. Do not retighten this without
+hardware-in-the-loop verification.
 
 The gyro improves short-term turn measurement and smooths excessive yaw. Its
 accelerometer is not integrated into position because chassis vibration,

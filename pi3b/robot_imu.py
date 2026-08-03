@@ -421,17 +421,14 @@ class LSM6DS3MCP2221Link(MPU6050Link):
     # LSM6DS3TR-C identifies as 0x6A. The older non-C LSM6DS3 uses 0x69.
     EXPECTED_IDS = (0x6A,)
     SENSOR_NAME = "LSM6DS3 USB"
-    # The LSM6DS3's datasheet gyro/accel noise is meaningfully lower than the
-    # MPU-6050's, so a stationary calibration window should settle well
-    # inside a tighter aggregate bar than the one tuned for the noisier
-    # part above. This is a moderate tightening, not the tightest bar that
-    # would pass a bench sample: the "Make USB IMU calibration converge
-    # reliably" fix depends on this step actually finishing, so pushing it
-    # too tight would trade a better bias fit for calibration that stalls.
-    # Field-verify the retry rate once this is running on the robot.
-    CALIBRATION_GYRO_STD_MAX_DPS = 1.5
-    CALIBRATION_ACCEL_NORM_MIN = 0.85
-    CALIBRATION_ACCEL_NORM_MAX = 1.15
+    # v1.9.10 tightened these for this sensor based on datasheet noise specs
+    # alone (CALIBRATION_GYRO_STD_MAX_DPS 2.5->1.5, accel norm 0.75..1.25 ->
+    # 0.85..1.15). Physical testing showed the real sensor + MCP2221 USB path
+    # cannot reliably settle inside that bar: calibration_progress stalled
+    # short of 100% indefinitely, so the robot never started driving. Reverted
+    # to the inherited MPU6050Link defaults, which are the values the "Make
+    # USB IMU calibration converge reliably" fix was actually verified
+    # against. Do not retighten these without hardware-in-the-loop testing.
 
     def __init__(
         self,
