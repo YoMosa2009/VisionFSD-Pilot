@@ -254,8 +254,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--baud", type=int, default=DEFAULT_BAUD)
     parser.add_argument("--max-range", type=float, default=12.0, help="Radar display radius in metres")
     parser.add_argument("--size", type=int, default=720, help="Square window size in pixels")
-    parser.add_argument("--persistence", type=float, default=0.30,
-                        help="Seconds a direction remains visible after its latest return")
+    parser.add_argument("--persistence", type=float, default=0.18,
+                        help="Maximum seconds a direction remains visible after its latest return")
     parser.add_argument("--min-confidence", type=int, default=8,
                         help="Drop very weak intensity returns below this 0-255 value")
     parser.add_argument("--min-range-mm", type=int, default=80,
@@ -289,9 +289,15 @@ def main() -> int:
             chunk = device.read(max(1, device.in_waiting))
             polar_map.update(parser.feed(chunk), args.min_confidence, args.min_range_mm, int(args.max_range * 1000.0))
             now = time.monotonic()
-            fresh = polar_map.fresh(now, args.persistence)
+            revolution_s = (
+                360.0 / parser.speed_dps if parser.speed_dps > 0 else args.persistence
+            )
+            persistence_s = min(
+                args.persistence, max(0.10, min(0.18, revolution_s * 1.25))
+            )
+            fresh = polar_map.fresh(now, persistence_s)
             clusters = obstacle_clusters(fresh, 360, args.cluster_min_points)
-            image = render(fresh, clusters, parser, args.max_range, args.persistence, args.size)
+            image = render(fresh, clusters, parser, args.max_range, persistence_s, args.size)
             cv2.imshow(WINDOW_TITLE, image)
             key = cv2.waitKey(1) & 0xFF
             if key in (27, ord("q"), ord("Q")):

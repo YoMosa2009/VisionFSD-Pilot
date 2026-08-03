@@ -918,6 +918,15 @@ class CorridorProfileTests(unittest.TestCase):
         straight = profile[int(np.argmin(np.abs(STEER_HEADINGS)))]
         self.assertLess(float(straight), 0.50)
 
+    def test_swept_trajectory_uses_clearance_through_the_turn_not_only_at_its_end(self) -> None:
+        policy = AutonomousPolicy(0.0, 118)
+        profile = np.full(STEER_HEADINGS.size, 2.5, dtype=np.float32)
+        profile[int(np.argmin(np.abs(STEER_HEADINGS)))] = 0.55
+
+        limit = policy._swept_trajectory_limit(profile, 35.0)
+
+        self.assertLessEqual(limit, 0.551)
+
 
 class SpeedGovernorTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -1163,16 +1172,30 @@ class StuckDetectionTests(unittest.TestCase):
             policy.decide(clear, self._status(tick_now), False, tick_now)
         self.assertEqual(policy.stuck_phase, "IDLE")
 
-    def test_camera_confirms_no_motion_triggers_recovery(self) -> None:
+    def test_single_camera_no_motion_vote_does_not_trigger_recovery(self) -> None:
         policy = AutonomousPolicy(0.0, 118)
         clear = SectorClearance(2.0, 2.0, 2.0, True, 2.0, 2.0)
         stalled_camera = CameraMotionState(fresh=True, confidence=0.9, motion_observed=False)
         now = time.monotonic()
-        command = "F"
         for index in range(60):
             tick_now = now + index * 0.05
-            command = policy.decide(
+            policy.decide(
                 clear, self._status(tick_now), False, tick_now, True, True, stalled_camera
+            )
+        self.assertEqual(policy.stuck_phase, "IDLE")
+
+    def test_camera_and_lidar_no_motion_trigger_recovery(self) -> None:
+        policy = AutonomousPolicy(0.0, 118)
+        stalled_camera = CameraMotionState(fresh=True, confidence=0.9, motion_observed=False)
+        now = time.monotonic()
+        command = "F"
+        for index in range(70):
+            tick_now = now + index * 0.05
+            nearby = SectorClearance(
+                0.50, 2.0, 2.0, True, 2.0, 2.0, scan_at=tick_now
+            )
+            command = policy.decide(
+                nearby, self._status(tick_now), False, tick_now, True, True, stalled_camera
             )
         self.assertEqual(policy.stuck_phase, "RECOVER")
         self.assertTrue(policy.reason.startswith("STUCK_RECOVER_"))
@@ -1180,17 +1203,22 @@ class StuckDetectionTests(unittest.TestCase):
 
     def test_moving_vote_resets_accumulating_suspicion(self) -> None:
         policy = AutonomousPolicy(0.0, 118)
-        clear = SectorClearance(2.0, 2.0, 2.0, True, 2.0, 2.0)
         stalled = CameraMotionState(fresh=True, confidence=0.9, motion_observed=False)
         moving = CameraMotionState(fresh=True, confidence=0.9, motion_observed=True)
         now = time.monotonic()
         for index in range(20):
             tick_now = now + index * 0.05
-            policy.decide(clear, self._status(tick_now), False, tick_now, True, True, stalled)
+            nearby = SectorClearance(
+                0.50, 2.0, 2.0, True, 2.0, 2.0, scan_at=tick_now
+            )
+            policy.decide(nearby, self._status(tick_now), False, tick_now, True, True, stalled)
         self.assertIsNotNone(policy._stuck_window_start)
 
         tick_now = now + 20 * 0.05
-        policy.decide(clear, self._status(tick_now), False, tick_now, True, True, moving)
+        nearby = SectorClearance(
+            0.50, 2.0, 2.0, True, 2.0, 2.0, scan_at=tick_now
+        )
+        policy.decide(nearby, self._status(tick_now), False, tick_now, True, True, moving)
 
         self.assertIsNone(policy._stuck_window_start)
         self.assertEqual(policy.stuck_phase, "IDLE")
@@ -1202,11 +1230,13 @@ class StuckDetectionTests(unittest.TestCase):
         blind driving, and a single stale LD19 scan would otherwise make
         every candidate maneuver look unsafe and latch STUCK permanently."""
         policy = AutonomousPolicy(0.0, 118)
-        clear = SectorClearance(2.0, 2.0, 2.0, True, 2.0, 2.0)
         stalled_camera = CameraMotionState(fresh=True, confidence=0.9, motion_observed=False)
         now = time.monotonic()
         for index in range(40):
             tick_now = now + index * 0.05
+            clear = SectorClearance(
+                0.50, 2.0, 2.0, True, 2.0, 2.0, scan_at=tick_now
+            )
             policy.decide(
                 clear, self._status(tick_now), False, tick_now, True, True, stalled_camera
             )
@@ -1230,18 +1260,22 @@ class StuckDetectionTests(unittest.TestCase):
 
     def test_recovery_exhausts_attempts_and_latches_with_a_clear_reason(self) -> None:
         policy = AutonomousPolicy(0.0, 118)
-        clear = SectorClearance(2.0, 2.0, 2.0, True, 2.0, 2.0)
         stalled_camera = CameraMotionState(fresh=True, confidence=0.9, motion_observed=False)
         now = time.monotonic()
         command = "F"
-        for index in range(140):
+        for index in range(100):
             tick_now = now + index * 0.05
+            clear = SectorClearance(
+                0.50, 2.0, 2.0, True, 2.0, 2.0, scan_at=tick_now
+            )
             command = policy.decide(
                 clear, self._status(tick_now), False, tick_now, True, True, stalled_camera
             )
+            if policy.stuck_phase == "LATCHED":
+                break
         self.assertEqual(policy.stuck_phase, "LATCHED")
         self.assertEqual(command, "STOP")
-        self.assertIn("NEEDS_RESET", policy.reason)
+        self.assertIn("RETRYING", policy.reason)
         self.assertEqual(policy.left_pwm, 0)
         self.assertEqual(policy.right_pwm, 0)
 
@@ -1253,13 +1287,13 @@ class StuckDetectionTests(unittest.TestCase):
 
         self.assertEqual(command, "STOP")
         self.assertEqual(policy.stuck_phase, "LATCHED")
-        self.assertIn("NEEDS_RESET", policy.reason)
+        self.assertIn("RETRYING", policy.reason)
 
     def test_latched_stuck_clears_on_external_motion_and_resumes(self) -> None:
         policy = AutonomousPolicy(0.0, 118)
         now = time.monotonic()
         policy._stuck_phase = "LATCHED"
-        policy._stuck_latched_reason = "STOP:STUCK_STALLED_NEEDS_RESET"
+        policy._stuck_latched_reason = "STOP:STUCK_STALLED_RETRYING"
         policy._stuck_latched_at = now
         policy.imu_yaw_rate_dps = 20.0  # well above STUCK_EXTERNAL_YAW_RATE_DPS
         clear = SectorClearance(2.0, 2.0, 2.0, True, 2.0, 2.0)
@@ -1273,7 +1307,7 @@ class StuckDetectionTests(unittest.TestCase):
         policy = AutonomousPolicy(0.0, 118)
         now = time.monotonic()
         policy._stuck_phase = "LATCHED"
-        policy._stuck_latched_reason = "STOP:STUCK_STALLED_NEEDS_RESET"
+        policy._stuck_latched_reason = "STOP:STUCK_STALLED_RETRYING"
         policy._stuck_latched_at = now
         clear = SectorClearance(2.0, 2.0, 2.0, True, 2.0, 2.0)
 
@@ -1283,43 +1317,41 @@ class StuckDetectionTests(unittest.TestCase):
         self.assertEqual(policy.stuck_phase, "LATCHED")
 
     def test_latched_stuck_re_arms_after_a_timeout_without_an_imu(self) -> None:
-        """Without a live IMU, _external_motion_detected() has nothing to
-        observe, so a periodic re-arm is the only way a latch clears on its
-        own; confirm it does, and that a still-genuinely-stuck chassis
-        re-latches after another bounded attempt burst rather than driving
-        forever."""
+        """A safe recovery burst restarts promptly after its short pause."""
         policy = AutonomousPolicy(0.0, 118)
         now = time.monotonic()
         policy._stuck_phase = "LATCHED"
-        policy._stuck_latched_reason = "STOP:STUCK_STALLED_NEEDS_RESET"
+        policy._stuck_latched_reason = "STOP:STUCK_STALLED_RETRYING"
         policy._stuck_latched_at = now
         clear = SectorClearance(2.0, 2.0, 2.0, True, 2.0, 2.0)
 
         re_armed_at = now + STUCK_RELATCH_RETRY_S + 0.01
         command = policy.decide(clear, self._status(re_armed_at), False, re_armed_at)
 
-        self.assertNotEqual(policy.stuck_phase, "LATCHED")
-        self.assertEqual(command, "F")
+        self.assertEqual(policy.stuck_phase, "RECOVER")
+        self.assertNotEqual(command, "STOP")
 
-    def test_still_stuck_after_re_arm_latches_again(self) -> None:
+    def test_still_stuck_after_re_arm_restarts_a_bounded_recovery_burst(self) -> None:
         policy = AutonomousPolicy(0.0, 118)
         now = time.monotonic()
         policy._stuck_phase = "LATCHED"
-        policy._stuck_latched_reason = "STOP:STUCK_STALLED_NEEDS_RESET"
+        policy._stuck_latched_reason = "STOP:STUCK_STALLED_RETRYING"
         policy._stuck_latched_at = now
-        clear = SectorClearance(2.0, 2.0, 2.0, True, 2.0, 2.0)
         stalled_camera = CameraMotionState(fresh=True, confidence=0.9, motion_observed=False)
 
         re_armed_at = now + STUCK_RELATCH_RETRY_S + 0.01
         command = "F"
         for index in range(140):
             tick_now = re_armed_at + index * 0.05
+            clear = SectorClearance(
+                0.50, 2.0, 2.0, True, 2.0, 2.0, scan_at=tick_now
+            )
             command = policy.decide(
                 clear, self._status(tick_now), False, tick_now, True, True, stalled_camera
             )
 
-        self.assertEqual(policy.stuck_phase, "LATCHED")
-        self.assertEqual(command, "STOP")
+        self.assertEqual(policy.stuck_phase, "RECOVER")
+        self.assertNotEqual(command, "STOP")
 
     def test_camera_evidence_requires_fresh_confident_translation(self) -> None:
         policy = AutonomousPolicy(0.0, 118)
@@ -1397,6 +1429,22 @@ class StuckDetectionTests(unittest.TestCase):
             tick_now = now + index * 0.05
             vote = policy._lidar_progress_evidence(stale_fixture, 118, 118, tick_now)
         self.assertEqual(vote, "UNKNOWN")
+
+    def test_lidar_progress_does_not_reuse_one_cached_scan_as_multiple_votes(self) -> None:
+        policy = AutonomousPolicy(0.0, 118)
+        now = time.monotonic()
+        scan = SectorClearance(0.50, 2.0, 2.0, True, 2.0, 2.0, scan_at=now)
+
+        self.assertEqual(
+            policy._lidar_progress_evidence(scan, 118, 118, now), "UNKNOWN"
+        )
+        for index in range(1, 40):
+            self.assertEqual(
+                policy._lidar_progress_evidence(
+                    scan, 118, 118, now + index * 0.05
+                ),
+                "UNKNOWN",
+            )
 
     def test_lidar_progress_evidence_detects_no_advance_with_a_real_scan(self) -> None:
         # Every window-close tick resets the reference for the next window,

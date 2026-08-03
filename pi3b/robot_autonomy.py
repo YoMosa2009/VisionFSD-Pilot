@@ -116,14 +116,13 @@ IMU_HARD_YAW_RATE_DPS = 55.0
 # UNKNOWN alone never accumulates into a stuck declaration.
 STUCK_CONFIRM_WINDOW_S = 1.20
 STUCK_MIN_NOT_MOVING_VOTES = 3
+STUCK_MIN_CORROBORATING_SOURCES = 2
 STUCK_RECOVERY_ATTEMPT_S = 0.80
 STUCK_MAX_RECOVERY_ATTEMPTS = 3
-# Without a live IMU, _external_motion_detected() has nothing to observe (its
-# only signals are gyro/accel), so a latched STOP could otherwise persist
-# until the process restarts even if the obstruction has since cleared on its
-# own. Re-arm periodically in every mode; a genuinely still-stuck chassis just
-# re-latches after another bounded attempt burst.
-STUCK_RELATCH_RETRY_S = 25.0
+# A recovery burst is bounded so a genuinely jammed drivetrain is not ground
+# continuously.  The next LiDAR-checked burst begins shortly afterwards rather
+# than leaving the robot apparently dead for 25 seconds at a time.
+STUCK_RELATCH_RETRY_S = 3.0
 STUCK_CAMERA_CONFIDENCE_MIN = 0.35
 STUCK_IMU_YAW_RATE_DPS = 5.0
 STUCK_TURN_COMMAND_MIN_SPLIT = 18
@@ -139,6 +138,9 @@ STUCK_VIBRATION_G = 0.12
 # the chassis, not sensor noise.
 STUCK_EXTERNAL_YAW_RATE_DPS = 12.0
 STUCK_EXTERNAL_ACCEL_G = 0.25
+LD19_MIN_SCAN_HISTORY_S = 0.10
+LD19_MAX_SCAN_HISTORY_S = 0.18
+LD19_PACKET_STALE_S = 0.25
 
 # Measured chassis, in metres.  The planner needs its own width because a
 # rectangle fits through a gap that a point always would: this is what lets it
@@ -602,6 +604,7 @@ class LD19Link:
         self._lock = threading.Lock()
         self._running = True
         self._last_packet_at = 0.0
+        self._scan_history_s = LD19_MAX_SCAN_HISTORY_S
         self._clearance_stamp = -1.0
         self._clearance_cache: SectorClearance | None = None
         self._thread = threading.Thread(target=self._read_loop, name="ld19-reader", daemon=True)
@@ -628,15 +631,25 @@ class LD19Link:
             with self._lock:
                 self._map.update(rotated, min_confidence=8, min_range_mm=80, max_range_mm=6000)
                 self._last_packet_at = now
+                if self._parser.speed_dps > 0:
+                    revolution_s = 360.0 / self._parser.speed_dps
+                    self._scan_history_s = float(np.clip(
+                        revolution_s * 1.25,
+                        LD19_MIN_SCAN_HISTORY_S,
+                        LD19_MAX_SCAN_HISTORY_S,
+                    ))
 
     def snapshot(self) -> tuple[list[tuple[int, object]], bool]:
         now = time.monotonic()
         with self._lock:
-            # Keep roughly two LD19 revolutions.  Longer point persistence made
-            # obstacles remain in a corridor after the chassis had already
-            # changed angle, causing repeated stop/reverse decisions.
-            points = self._map.fresh(now, 0.22)
-            fresh = now - self._last_packet_at <= 0.45
+            # Keep no more than a current, measured-speed scan history. Longer
+            # history makes the dashboard and controller react to where an
+            # obstacle was, rather than where it is now.
+            points = self._map.fresh(now, self._scan_history_s)
+            fresh = (
+                bool(points)
+                and now - self._last_packet_at <= LD19_PACKET_STALE_S
+            )
         return points, fresh
 
     def clearance(self) -> SectorClearance:
@@ -986,6 +999,7 @@ class AutonomousPolicy:
         self._progress_reference_m: float | None = None
         self._progress_reference_at = 0.0
         self._progress_direction: str | None = None
+        self._progress_last_scan_at: float | None = None
         self.stuck_phase = "IDLE"
         self.stuck_votes: dict[str, str] = {}
 
@@ -1550,6 +1564,29 @@ class AutonomousPolicy:
         self._heading_index = best
         return float(STEER_HEADINGS[best]), float(opening[best])
 
+    def _swept_trajectory_limit(
+        self, profile: np.ndarray, target_heading_deg: float
+    ) -> float:
+        """Conservatively limit a forward arc by every heading it must sweep.
+
+        The corridor profile protects a full robot body at each heading, but a
+        differential-drive chassis reaches a requested heading gradually. The
+        minimum opening between the present and target headings is therefore
+        the clearance available to the actual arc's leading portion, not just
+        to the straight path after the turn completes.
+        """
+        opening = windowed_min_profile(profile)
+        start = float(np.clip(
+            self._steering_deg, float(STEER_HEADINGS[0]), float(STEER_HEADINGS[-1])
+        ))
+        target = float(np.clip(
+            target_heading_deg, float(STEER_HEADINGS[0]), float(STEER_HEADINGS[-1])
+        ))
+        count = max(2, int(abs(target - start) / MAX_STEERING_STEP_DEG) + 1)
+        headings = np.linspace(start, target, count)
+        indices = np.abs(STEER_HEADINGS[:, None] - headings[None, :]).argmin(axis=0)
+        return float(np.min(opening[indices]))
+
     def _hold_stop(self, reason: str) -> str:
         """Stop without clearing the close-obstacle recovery latch."""
         self.reason = reason
@@ -1632,7 +1669,6 @@ class AutonomousPolicy:
             choice = self._heading_from_profile(lidar.profile, now)
             if choice is not None:
                 heading, limit = choice
-                speed = self._cruise_speed(limit)
                 # Corridor headings describe a straight swept pose, while the
                 # chassis reaches that pose along an arc.  Lead the requested
                 # yaw so the arc itself stays outside the inflated obstacle.
@@ -1641,6 +1677,11 @@ class AutonomousPolicy:
                     -MAX_GENTLE_HEADING_DEG,
                     MAX_GENTLE_HEADING_DEG,
                 ))
+                trajectory_limit = self._swept_trajectory_limit(
+                    lidar.profile, applied_heading
+                )
+                limit = min(limit, trajectory_limit)
+                speed = self._cruise_speed(limit)
                 self._arc_active = abs(applied_heading) > 6.0
                 self.drive_confidence = float(np.clip(limit / 2.0, 0.0, 1.0))
                 if self.exploration.active:
@@ -1652,7 +1693,7 @@ class AutonomousPolicy:
                 else:
                     self.reason = (
                         f"DRIVE:{applied_heading:+.0f}deg "
-                        f"{limit:.2f}m pwm{speed}"
+                        f"traj{limit:.2f}m pwm{speed}"
                     )
                 return self._differential(speed, applied_heading)
             return self._start_escape(lidar, now, "NO_CORRIDOR")
@@ -1716,7 +1757,17 @@ class AutonomousPolicy:
         """
         if lidar.scan_at is None:
             self._progress_reference_m = None
+            self._progress_last_scan_at = None
             return "UNKNOWN"
+        if (
+            self._progress_last_scan_at is not None
+            and lidar.scan_at <= self._progress_last_scan_at
+        ):
+            # The control loop is much faster than LD19 scans. Reusing one
+            # cached scan as several independent "not moving" votes was the
+            # main source of false stuck declarations.
+            return "UNKNOWN"
+        self._progress_last_scan_at = lidar.scan_at
         forward = left_pwm > 0 and right_pwm > 0
         reverse = left_pwm < 0 and right_pwm < 0
         if forward:
@@ -1731,15 +1782,15 @@ class AutonomousPolicy:
             return "UNKNOWN"
         if self._progress_direction != direction or self._progress_reference_m is None:
             self._progress_reference_m = reference_m
-            self._progress_reference_at = now
+            self._progress_reference_at = lidar.scan_at
             self._progress_direction = direction
             return "UNKNOWN"
-        elapsed = now - self._progress_reference_at
+        elapsed = lidar.scan_at - self._progress_reference_at
         if elapsed < STUCK_LIDAR_PROGRESS_MIN_WINDOW_S:
             return "UNKNOWN"
         advanced = abs(self._progress_reference_m - reference_m)
         self._progress_reference_m = reference_m
-        self._progress_reference_at = now
+        self._progress_reference_at = lidar.scan_at
         return "MOVING" if advanced >= STUCK_LIDAR_PROGRESS_MIN_ADVANCE_M else "NOT_MOVING"
 
     def _motion_evidence(
@@ -1851,7 +1902,9 @@ class AutonomousPolicy:
     def _latch_stuck(self, now: float) -> str:
         self._stuck_phase = "LATCHED"
         self._stuck_latched_at = now
-        self._stuck_latched_reason = f"STOP:STUCK_{self._stuck_reason_detail()}_NEEDS_RESET"
+        self._stuck_latched_reason = (
+            f"STOP:STUCK_{self._stuck_reason_detail()}_RETRYING"
+        )
         self.reason = self._stuck_latched_reason
         self.stuck_phase = self._stuck_phase
         return self._hold_stop(self._stuck_latched_reason)
@@ -1889,6 +1942,7 @@ class AutonomousPolicy:
         camera_motion: CameraMotionState | None,
         previous_output: tuple[int, int],
     ) -> str:
+        retry_recovery = False
         if self._stuck_phase == "LATCHED":
             re_armed = now - self._stuck_latched_at >= STUCK_RELATCH_RETRY_S
             if not self._external_motion_detected() and not re_armed:
@@ -1896,6 +1950,7 @@ class AutonomousPolicy:
                 return self._hold_stop(self._stuck_latched_reason)
             self._stuck_phase = "IDLE"
             self._stuck_recovery_attempts = 0
+            retry_recovery = re_armed
 
         votes = self._motion_evidence(lidar, arduino, now, camera_motion)
         self.stuck_votes = votes
@@ -1928,6 +1983,12 @@ class AutonomousPolicy:
             self.stuck_phase = self._stuck_phase
             return command
 
+        if retry_recovery:
+            # The pause was deliberate, short, and LiDAR-gated. Resume with a
+            # recovery maneuver instead of briefly driving the same command
+            # that the previous burst proved ineffective.
+            return self._advance_stuck_recovery(lidar, now)
+
         if self._stuck_phase == "RECOVER":
             self.left_pwm, self.right_pwm = previous_output
             if now < self._stuck_phase_until:
@@ -1948,12 +2009,23 @@ class AutonomousPolicy:
             self.stuck_phase = self._stuck_phase
             return command
 
-        if verdict == "NOT_MOVING":
+        not_moving_sources = sum(
+            vote == "NOT_MOVING" for vote in votes.values()
+        )
+        corroborated_stall = (
+            verdict == "NOT_MOVING"
+            and not_moving_sources >= STUCK_MIN_CORROBORATING_SOURCES
+        )
+        if corroborated_stall:
             if self._stuck_window_start is None:
                 self._stuck_window_start = now
                 self._stuck_not_moving_ticks = 0
             self._stuck_not_moving_ticks += 1
         elif self._stuck_window_start is None:
+            # A single weak sensor cannot begin a stuck declaration. Once two
+            # sources have opened a window, keep it alive until a MOVING vote
+            # arrives so the slower LD19 can corroborate the camera again on
+            # its next real scan.
             self.stuck_phase = self._stuck_phase
             return command
 

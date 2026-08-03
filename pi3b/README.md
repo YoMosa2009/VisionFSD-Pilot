@@ -115,7 +115,21 @@ while iterating on local edits without wanting them silently left alone every
 boot) to disable auto-update every run; set `VISIONFSD_AUTO_UPDATE_TIMEOUT_S`
 to change the fetch timeout.
 
-## OSOYOO robot mode: Pi + LD19 + camera + Uno
+## OSOYOO Model 3 robot mode
+
+The supported physical robot configuration is intentionally specific:
+
+| Part | Connected role |
+|---|---|
+| OSOYOO Model 3 kit | Differential-drive chassis, front static ultrasonic sensor, motor shield, and motors |
+| Raspberry Pi 3B | Runs the Pi planner, mapper, visualizer, and USB device discovery |
+| LD19 | 360-degree horizontal range sensing through its USB-UART adapter |
+| LSM6DS3 | Gyro/accelerometer, connected only through the MCP2221A USB-I2C adapter |
+| Arduino Uno | Runs `robot/firmware/visionfsd_pi_autonomy/visionfsd_pi_autonomy.ino` and applies bounded differential motor commands |
+
+The Pi deployment is a sparse checkout containing only `pi3b/` and
+`robot/firmware/visionfsd_pi_autonomy/`. The desktop runtime, CAD, and manual
+drive files are not deployed to the robot.
 
 The optional indoor robot runtime connects all four sensor/control parts:
 
@@ -201,6 +215,15 @@ arc-lead compensation because a differential-drive chassis cannot instantly
 assume a new straight heading. Avoidance uses a forward arc with both wheels
 powered, never a fast counter-rotating pivot. The outer wheel receives bounded
 steering headroom while the inside wheel remains at or above its loaded floor.
+Before applying that arc, the planner also limits speed by the tightest
+body-width opening through every heading it must sweep from its present steering
+angle to the requested one. That guards the moving turn itself, not only the
+straight course after the turn completes.
+
+The control path uses at most one current LD19 revolution of point history,
+scaled from the scanner's reported speed and capped at 180 ms. Older points
+are excluded from both the dashboard and drive decisions; a scan stream older
+than 250 ms is a safety stop, not valid perception.
 
 The runtime writes one `NAV` telemetry line per second to
 `pi3b/logs/robot.log`. If commanded and Uno-reported PWM drop to zero during a
@@ -285,19 +308,17 @@ move during that interval. Afterwards its authority order is fixed:
    yaw rate while pivoting, and the Uno's own `blocked` flag. Each source only
    ever votes that the chassis is or is not moving when it has a genuinely
    fresh, currently-applicable signal; otherwise it abstains, and abstention
-   alone never counts as evidence of being stuck. If a commanded drive keeps
-   running for over a second with at least one source voting "not moving" and
-   none voting "moving" -- a wheel spinning uselessly on a rug, a caster
-   snagged on a threshold, a corner wedge mid-pivot -- it stops trusting that
-   command and tries a different, LiDAR-checked maneuver (the opposite turn
-   side, a reverse, or a center pivot) instead of repeating the one that
-   is not working. After three maneuvers still produce no evidence of motion,
-   it stops cleanly and reports `STOP:STUCK_SLIPPING_NEEDS_RESET` or
-   `STOP:STUCK_STALLED_NEEDS_RESET` (IMU vibration distinguishes the two only
-   for the operator; it never gates detection or recovery) rather than
-   grinding the motors indefinitely. It resumes on its own as soon as any
-   source reports real motion again, including a person picking the chassis
-   up and setting it back down, without needing a restart.
+   alone never counts as evidence of being stuck. A declaration requires two
+   independent `NOT_MOVING` sources with no `MOVING` vote. In particular, an
+   LD19 result is counted only once per newly captured scan, never once per
+   fast control-loop iteration. If a commanded drive keeps failing this test,
+   it tries a different LiDAR-checked maneuver (the opposite turn side, a
+   reverse, or a center pivot) instead of repeating the command that is not
+   working. After three maneuvers it pauses as `STOP:STUCK_*_RETRYING` for
+   three seconds, then starts another bounded, LiDAR-checked recovery burst.
+   This avoids both continuous grinding and the previous unexplained
+   25-second no-action latch. IMU vibration still distinguishes slipping from
+   stalled only for the operator; it never gates detection or recovery.
 
 This keeps roles separate: LD19 geometry chooses an open direction, the camera
 supplies only bounded optical-flow pose cues, and the Uno enforces the final
@@ -318,8 +339,8 @@ ultrasonic `blocked` flag, `IMU LSM6DS3 USB CALIBRATING/LIVE/STALE`, frontier/pa
 mode, target bearing/range, frontier count, observed-map coverage, and latest
 planner time. It also reports IMU motion/vibration magnitude and camera-flow
 confidence. The `POLICY` line reports `STUCK_RECOVER_<maneuver>:<attempt>` while
-the stuck detector is trying an alternate maneuver, and `STOP:STUCK_*_NEEDS_RESET`
-once it has given up after three attempts; the log's `NAV`/`NAV_EVENT` lines carry
+the stuck detector is trying an alternate maneuver, and `STOP:STUCK_*_RETRYING`
+during its three-second safe pause; the log's `NAV`/`NAV_EVENT` lines carry
 the same information plus a per-source `M`/`N`/`U` (moving/not-moving/unknown)
 breakdown for diagnosing which evidence source triggered it. The occupancy grid uses
 about 2.1 cm cells, up to 240 current-scan free-space rays, and useful LD19
@@ -399,13 +420,18 @@ or `UNSTABLE`), acceleration magnitude, and peak gyro rate once per second.
 This is diagnostics only; it does not change calibration thresholds or motor
 authority.
 
+v1.9.14 improves live safety behavior without relaxing any safety gate: it
+expires LD19 points on a bounded current-scan history, evaluates clearance
+through the headings a moving arc actually sweeps, and requires corroborated
+fresh evidence before declaring the chassis stuck. A failed recovery now uses
+a short visible retry pause instead of a long, unexplained latch.
+
 ### USB LSM6DS3 mounting
 
-v1.9.12 removed GPIO MPU-6050 support entirely; the USB LSM6DS3 (through the
-MCP2221A USB-I2C adapter) is the only supported IMU. There is no GPIO I2C
-wiring and no fallback IMU class -- a missing or disconnected LSM6DS3 goes
-straight to the existing, fully supported `LD19+COMMAND POSE ACTIVE` non-IMU
-mode after the probe interval.
+The USB LSM6DS3 through the MCP2221A USB-I2C adapter is the only supported
+IMU configuration. A missing or disconnected LSM6DS3 goes straight to the
+existing, fully supported `LD19+COMMAND POSE ACTIVE` non-IMU mode after the
+probe interval.
 
 The installed board is flat with components up and rotated 180 degrees from
 the robot frame: its pin-header edge faces forward and its `LSM6DS3` text

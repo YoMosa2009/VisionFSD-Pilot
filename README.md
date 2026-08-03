@@ -160,7 +160,8 @@ continues to refine non-IMU pose without spending CPU on person detection. The
 normal updater performs the one-time MCP2221 Linux setup and installs
 its Python transport. Robot startup probes LSM6DS3 addresses `0x6A` and `0x6B`,
 accepts the LSM6DS3TR-C identity `0x6A`, verifies the programmed registers,
-consumes only fresh complete samples, and retains GPIO/non-IMU fallbacks. If
+consumes only fresh complete samples, and retains its supported non-IMU mode if
+the LSM6DS3 is unavailable. If
 the Uno USB serial node changes, the runtime holds STOP, rediscovers the exact
 Uno USB identity, and repeats the capability handshake instead of terminating.
 Its calibrated gyro bias continues adapting only during confirmed stationary
@@ -206,17 +207,14 @@ any source reports real motion again, including a manual reposition. The
 escape state machine's turn-side scoring now uses the same body-width windowed
 minimum as forward path selection instead of the single farthest ray in a
 sweep, so a gap narrower than the chassis can no longer look like a viable
-escape direction. This version also moderately tightened the USB LSM6DS3's
-stationary-calibration acceptance bar versus the GPIO MPU-6050's, reflecting
-its lower datasheet noise. The on-screen robot dashboard and window title now
-show the running version, not only the startup log line.
+escape direction. The on-screen robot dashboard and window title now show the
+running version, not only the startup log line.
 
 In v1.9.11, the v1.9.10 LSM6DS3 calibration tightening was reverted: physical
 testing showed `IMU CALIBRATING` stalling indefinitely below 100% and the
 robot never gaining drive authority, because the real sensor's noise did not
-reliably fit inside the tighter bar. The USB LSM6DS3 now uses the same
-calibration acceptance bar as the GPIO MPU-6050 again -- the values the "Make
-USB IMU calibration converge reliably" fix was actually verified against.
+reliably fit inside the tighter bar. The USB LSM6DS3 therefore uses the
+hardware-tested calibration acceptance values.
 This version's physical driving behavior has not yet been confirmed on the
 robot beyond that the calibration stall is resolved; software-only
 verification (compileall, pyflakes, targeted unit tests) is not a substitute
@@ -228,11 +226,16 @@ the dashboard and `pi3b/logs/robot.log`: both report the active gate
 magnitude and peak gyro rate. This is diagnostics only; no calibration gate or
 motor-control behavior changed. Physical verification is still needed.
 
-In v1.9.12, GPIO MPU-6050 support was removed entirely: the USB LSM6DS3 is
-now the only supported IMU class, with no GPIO I2C fallback, no `--imu-bus`
-flag, and no `smbus2` dependency or Pi I2C-bus enable step. A missing or
-disconnected LSM6DS3 still falls back to the existing, fully supported
-`LD19+COMMAND POSE ACTIVE` non-IMU mode -- that path was never MPU-specific.
+In v1.9.14, the Pi runtime expires LD19 points after a bounded current-scan
+history rather than using delayed perception, limits forward-arc speed by the
+full steering sweep, and makes a stuck declaration require corroborating fresh
+sources. Three failed recovery maneuvers now pause visibly for three seconds
+before another LiDAR-checked burst, replacing the old 25-second latch. This is
+software-verified only pending a supervised hardware test.
+
+In v1.9.12, the USB LSM6DS3 through the MCP2221A adapter became the single
+supported IMU configuration. A missing or disconnected LSM6DS3 still falls
+back to the existing, fully supported `LD19+COMMAND POSE ACTIVE` non-IMU mode.
 The Pi launcher also gained a bounded, fail-safe auto-update step
 (`pi3b/auto_update.sh`) that runs once before the robot autostarts: a quick
 `git fetch` with a timeout, skipped entirely if local edits are present or
@@ -245,17 +248,16 @@ still needs one manual `bash pi3b/update.sh codex/pi3b-runtime` (it dropped
 `smbus2` from requirements.txt, and auto-update should not do that
 PyPI round-trip during boot); every release after this one can rely on
 auto-update alone. Both changes are software-only pending a physical test
-that (1) confirms the LSM6DS3 still calibrates and drives normally with no
-MPU-6050 code path left to fall back to, and (2) confirms the robot boots and
-autostarts correctly through the new auto-update step, including with no
-network present.
+that (1) confirms the LSM6DS3 still calibrates and drives normally, and (2)
+confirms the robot boots and autostarts correctly through the new auto-update
+step, including with no network present.
 The Pi launcher uses the available XWayland display and reapplies fullscreen
 after the first dashboard frames so the LiDAR UI fills the connected screen.
 
 It is not vehicle autonomy and is not robust room-scale SLAM. Do not run it
 unsupervised, near stairs, pets, people, or property that can be damaged.
 Details, firmware location, boot behaviour, and the one-command Pi update are
-in [`pi3b/README.md`](pi3b/README.md#osoyoo-robot-mode-pi--ld19--camera--uno).
+in [`pi3b/README.md`](pi3b/README.md#osoyoo-model-3-robot-mode).
 
 ### LD19 LiDAR visualizer
 
