@@ -222,6 +222,12 @@ robot beyond that the calibration stall is resolved; software-only
 verification (compileall, pyflakes, targeted unit tests) is not a substitute
 for a full floor test.
 
+In v1.9.13, a temporary USB LSM6DS3 calibration pause is now attributable from
+the dashboard and `pi3b/logs/robot.log`: both report the active gate
+(`MOTION`, `SAMPLE`, `WAIT DATA`, or `UNSTABLE`) along with acceleration
+magnitude and peak gyro rate. This is diagnostics only; no calibration gate or
+motor-control behavior changed. Physical verification is still needed.
+
 In v1.9.12, GPIO MPU-6050 support was removed entirely: the USB LSM6DS3 is
 now the only supported IMU class, with no GPIO I2C fallback, no `--imu-bus`
 flag, and no `smbus2` dependency or Pi I2C-bus enable step. A missing or

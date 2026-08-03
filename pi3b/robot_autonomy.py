@@ -45,6 +45,7 @@ RUNTIME_VERSION = (
 WINDOW_TITLE = f"VisionFSD Pi Robot v{RUNTIME_VERSION} - standby"
 UNO_BAUD = 115200
 UNO_HEARTBEAT_S = 0.09
+IMU_CALIBRATION_DIAGNOSTIC_PERIOD_S = 1.0
 # Keep the last safe command across bounded USB-I2C/camera/planner stalls. The
 # heartbeat thread still expires it quickly if the main control loop actually
 # dies, and the Uno retains its independent 350 ms serial and ultrasonic stops.
@@ -1982,6 +1983,28 @@ class AutonomousPolicy:
             self.last_command, self._last_output, self.last_sent_at = command, output, now
 
 
+def format_imu_calibration_diagnostic(imu: IMUState) -> str:
+    """Compact, actionable state for a paused IMU calibration.
+
+    Progress alone cannot distinguish commanded movement, rejected sensor
+    samples, and intermittent USB data. Keep the exact gate and its latest
+    measurements visible both on the dashboard and in the Pi log.
+    """
+    accel_norm = math.sqrt(
+        imu.accel_x_g * imu.accel_x_g
+        + imu.accel_y_g * imu.accel_y_g
+        + imu.accel_z_g * imu.accel_z_g
+    )
+    gyro_peak = max(
+        abs(imu.gyro_x_dps), abs(imu.gyro_y_dps), abs(imu.gyro_z_dps)
+    )
+    hold = imu.calibration_hold or "ACCEPTING"
+    return (
+        f"CALIBRATING {imu.calibration_progress * 100:.0f}% HOLD {hold} "
+        f"A{accel_norm:.2f}g G{gyro_peak:.1f}dps"
+    )
+
+
 def draw_dashboard(local_map: np.ndarray, policy: AutonomousPolicy,
                    clearance: SectorClearance, status: ArduinoStatus, _person: bool,
                    camera_ready: bool, differential_ready: bool,
@@ -2015,8 +2038,7 @@ def draw_dashboard(local_map: np.ndarray, policy: AutonomousPolicy,
         imu_state = "MISSING - LD19+COMMAND POSE ACTIVE"
         imu_color = (80, 190, 245)
     elif not imu.calibrated:
-        hold = f"  HOLD {imu.calibration_hold}" if imu.calibration_hold else ""
-        imu_state = f"CALIBRATING {imu.calibration_progress * 100:.0f}%{hold}"
+        imu_state = format_imu_calibration_diagnostic(imu)
         imu_color = (80, 190, 245)
     elif not imu.fresh:
         imu_state = "STALE - LD19+COMMAND POSE ACTIVE"
@@ -2148,6 +2170,7 @@ def main() -> int:
     imu_probe_until = policy.started_at + IMU_PROBE_GRACE_S
     imu_detected = False
     imu_calibration_complete = False
+    next_imu_calibration_diagnostic_at = 0.0
     keep_running = True
 
     def stop(_signum: int, _frame: object) -> None:
@@ -2179,6 +2202,19 @@ def main() -> int:
                 imu_calibration_complete = (
                     imu_calibration_complete or imu_state.calibrated
                 )
+                if (
+                    imu_state.connected
+                    and not imu_state.calibrated
+                    and now >= next_imu_calibration_diagnostic_at
+                ):
+                    print(
+                        "IMU calibration diagnostic: "
+                        + format_imu_calibration_diagnostic(imu_state)
+                        + f" fresh={int(imu_state.fresh)}"
+                    )
+                    next_imu_calibration_diagnostic_at = (
+                        now + IMU_CALIBRATION_DIAGNOSTIC_PERIOD_S
+                    )
             policy.observe_imu(imu_state)
             imu_start_ready = (
                 imu is None

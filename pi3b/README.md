@@ -393,6 +393,12 @@ rejected samples, missing fresh data, or an unstable window. No manual
 25-second stationary standby, the dashboard should change from
 `IMU LSM6DS3 USB CALIBRATING` to `IMU LSM6DS3 USB LIVE`.
 
+v1.9.13 makes a temporary calibration pause diagnosable: the dashboard and
+`pi3b/logs/robot.log` now show the active gate (`MOTION`, `SAMPLE`, `WAIT DATA`,
+or `UNSTABLE`), acceleration magnitude, and peak gyro rate once per second.
+This is diagnostics only; it does not change calibration thresholds or motor
+authority.
+
 ### USB LSM6DS3 mounting
 
 v1.9.12 removed GPIO MPU-6050 support entirely; the USB LSM6DS3 (through the

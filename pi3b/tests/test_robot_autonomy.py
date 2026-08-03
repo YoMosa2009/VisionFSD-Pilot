@@ -33,6 +33,7 @@ from robot_autonomy import (
     corridor_profile,
     discover_arduino_port,
     discover_ld19_port,
+    format_imu_calibration_diagnostic,
     maximize_dashboard_window,
     open_dashboard_window,
 )
@@ -1098,6 +1099,23 @@ class DashboardVersionTests(unittest.TestCase):
         version_file = pathlib.Path(__file__).resolve().parents[1] / "VERSION"
         self.assertEqual(RUNTIME_VERSION, version_file.read_text(encoding="utf-8").strip())
         self.assertIn(RUNTIME_VERSION, WINDOW_TITLE)
+
+    def test_calibration_diagnostic_reports_the_specific_gate_and_measurements(self) -> None:
+        diagnostic = format_imu_calibration_diagnostic(
+            IMUState(
+                connected=True,
+                calibration_progress=0.225,
+                accel_x_g=0.80,
+                accel_y_g=0.60,
+                gyro_z_dps=-36.4,
+                calibration_hold="SAMPLE",
+            )
+        )
+
+        self.assertEqual(
+            diagnostic,
+            "CALIBRATING 22% HOLD SAMPLE A1.00g G36.4dps",
+        )
 
 
 class TurnSideScoreTests(unittest.TestCase):
