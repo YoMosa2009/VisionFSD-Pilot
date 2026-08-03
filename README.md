@@ -138,9 +138,9 @@ commands/status over the Uno's normal USB cable. It starts with a 25-second
 no-motion standby, uses hysteresis and direction locking for stable LiDAR-guided
 arcs, and uses a bounded reverse-turn-commit recovery sequence when a close
 obstacle blocks forward progress. It then resumes live corridor planning instead
-of latching a terminal stop. A USB LSM6DS3 through an MCP2221A, or the existing
-GPIO MPU-6050 fallback, bounds recovery turns by measured short-term yaw and
-supplies yaw to an 8 m occupancy map. The runtime
+of latching a terminal stop. A USB LSM6DS3 through an MCP2221A bounds recovery
+turns by measured short-term yaw and supplies yaw to an 8 m occupancy map. The
+runtime
 marks observed free space, selects reachable unexplored frontiers, plans a
 collision-inflated grid route, and uses its next waypoint as long-horizon
 guidance. Current LD19 geometry still authorizes every motor direction. LD19
@@ -148,7 +148,7 @@ scan matching supplies cautious yaw and translation correction, but this remains
 estimated navigation rather than true metric SLAM because the kit has no wheel
 encoders, loop closure, or absolute position reference.
 
-If both IMUs are missing or stale, the same occupancy, frontier, A*, waypoint,
+If the IMU is missing or stale, the same occupancy, frontier, A*, waypoint,
 patrol, and live-corridor stack remains active. Turn prediction uses differential
 motor commands and is corrected by successive LD19 scans; recovery turns use
 that corrected map heading instead of relying only on elapsed time. A fail-safe
@@ -221,6 +221,28 @@ This version's physical driving behavior has not yet been confirmed on the
 robot beyond that the calibration stall is resolved; software-only
 verification (compileall, pyflakes, targeted unit tests) is not a substitute
 for a full floor test.
+
+In v1.9.12, GPIO MPU-6050 support was removed entirely: the USB LSM6DS3 is
+now the only supported IMU class, with no GPIO I2C fallback, no `--imu-bus`
+flag, and no `smbus2` dependency or Pi I2C-bus enable step. A missing or
+disconnected LSM6DS3 still falls back to the existing, fully supported
+`LD19+COMMAND POSE ACTIVE` non-IMU mode -- that path was never MPU-specific.
+The Pi launcher also gained a bounded, fail-safe auto-update step
+(`pi3b/auto_update.sh`) that runs once before the robot autostarts: a quick
+`git fetch` with a timeout, skipped entirely if local edits are present or
+the network is unreachable, applying `update.sh` and rolling back to the
+previous commit if it fails partway. This replaces having to run `update.sh`
+by hand before every test session; set `VISIONFSD_AUTO_UPDATE=0` to disable
+it. Auto-update also refuses to guess a target ref if `pi3b/.install-ref` is
+missing, and skips the first-run pip install: this v1.9.12 release itself
+still needs one manual `bash pi3b/update.sh codex/pi3b-runtime` (it dropped
+`smbus2` from requirements.txt, and auto-update should not do that
+PyPI round-trip during boot); every release after this one can rely on
+auto-update alone. Both changes are software-only pending a physical test
+that (1) confirms the LSM6DS3 still calibrates and drives normally with no
+MPU-6050 code path left to fall back to, and (2) confirms the robot boots and
+autostarts correctly through the new auto-update step, including with no
+network present.
 The Pi launcher uses the available XWayland display and reapplies fullscreen
 after the first dashboard frames so the LiDAR UI fills the connected screen.
 

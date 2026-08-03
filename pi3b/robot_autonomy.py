@@ -31,7 +31,7 @@ from serial.tools import list_ports
 
 from lidar_visualizer import LD19Parser, LivePolarMap
 from robot_explorer import ExplorationState, FrontierExplorer
-from robot_imu import AsyncIMULink, AutoIMULink, IMUState
+from robot_imu import AsyncIMULink, IMUState, LSM6DS3MCP2221Link
 from robot_slam_lite import LidarSlamLite, SlamLiteState
 from visionfsd_pi import (
     LatestCamera,
@@ -2087,12 +2087,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fov", type=float, default=70.0)
     parser.add_argument("--lidar-front-offset-deg", type=float, default=0.0,
                         help="Physical LD19 zero-angle correction; positive rotates readings right")
-    parser.add_argument("--imu-bus", type=int, default=1)
-    parser.add_argument("--imu-address", type=lambda value: int(value, 0), default=0x68)
+    parser.add_argument("--imu-address", type=lambda value: int(value, 0), default=None,
+                        help="Override the USB LSM6DS3 I2C address; normally auto-probed "
+                             "at 0x6A then 0x6B")
     parser.add_argument("--imu-mount-yaw-deg", type=float, default=180.0,
                         help="IMU board yaw relative to robot frame; this chassis uses 180")
     parser.add_argument("--no-imu", action="store_true",
-                        help="Disable USB/GPIO IMUs and use camera+LD19 pose prediction")
+                        help="Disable the USB IMU and use camera+LD19 pose prediction")
     parser.add_argument("--no-display", action="store_true")
     return parser.parse_args()
 
@@ -2119,11 +2120,13 @@ def main() -> int:
     # motor authority is granted.
     camera = CameraSafety(args.camera, args.fov, auto_start=False)
     imu = None if args.no_imu else AsyncIMULink(
-        AutoIMULink(args.imu_bus, args.imu_address, args.imu_mount_yaw_deg)
+        LSM6DS3MCP2221Link(
+            address=args.imu_address, mount_yaw_deg=args.imu_mount_yaw_deg
+        )
     )
     print(
         f"VisionFSD Robot: Uno={arduino_port}, LD19={lidar_port}, "
-        f"camera request={args.camera}, IMU={'disabled' if imu is None else 'auto USB/GPIO'}"
+        f"camera request={args.camera}, IMU={'disabled' if imu is None else 'USB LSM6DS3'}"
     )
     policy = AutonomousPolicy(args.standby_seconds, args.speed, args.min_move_pwm)
     # The map supplies a long-horizon exploration heading.  Current LD19

@@ -1,13 +1,14 @@
-"""Optional USB LSM6DS3 and GPIO MPU-6050 sampling for the Pi runtime.
+"""USB LSM6DS3 sampling for the Pi runtime, via an MCP2221A USB-I2C adapter.
 
 The IMU improves short-term yaw prediction and turn-rate limiting.  It does
-not provide absolute heading or position because neither configured IMU has a
-magnetometer and the chassis has no wheel encoders.
+not provide absolute heading or position because the LSM6DS3 has no
+magnetometer and the chassis has no wheel encoders.  Non-IMU navigation
+(camera + LD19 pose prediction) remains supported when no IMU is connected.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 import math
 import os
 import statistics
@@ -21,17 +22,6 @@ class _SMBusLike(Protocol):
     def write_byte_data(self, address: int, register: int, value: int) -> None: ...
     def read_i2c_block_data(self, address: int, register: int, length: int) -> list[int]: ...
     def close(self) -> None: ...
-
-
-def _default_bus_factory(bus_number: int) -> _SMBusLike:
-    # smbus2 is installed by the Pi requirements.  Keep compatibility with
-    # Raspberry Pi OS's python3-smbus package because existing installations
-    # may already provide that implementation through system-site-packages.
-    try:
-        from smbus2 import SMBus
-    except ImportError:
-        from smbus import SMBus
-    return SMBus(bus_number)
 
 
 @dataclass(frozen=True)
@@ -97,17 +87,17 @@ def _mcp2221_bus_factory(_bus_number: int) -> _SMBusLike:
     return _MCP2221Bus()
 
 
-class MPU6050Link:
-    """Poll an MPU-6050 and expose robot-frame, bias-corrected measurements."""
+class LSM6DS3MCP2221Link:
+    """Poll a USB LSM6DS3 (via MCP2221A) and expose robot-frame measurements."""
 
-    WHO_AM_I = 0x75
-    PWR_MGMT_1 = 0x6B
-    CONFIG = 0x1A
-    SMPLRT_DIV = 0x19
-    GYRO_CONFIG = 0x1B
-    ACCEL_CONFIG = 0x1C
-    DATA_START = 0x3B
-    EXPECTED_IDS = (0x68, 0x69)
+    WHO_AM_I = 0x0F
+    CTRL1_XL = 0x10
+    CTRL2_G = 0x11
+    CTRL3_C = 0x12
+    STATUS_REG = 0x1E
+    DATA_START = 0x20
+    # LSM6DS3TR-C identifies as 0x6A. The older non-C LSM6DS3 uses 0x69.
+    EXPECTED_IDS = (0x6A,)
     RETRY_SECONDS = 1.0
     MAX_SAMPLE_AGE_S = 0.25
     DATA_READY_TIMEOUT_S = 0.75
@@ -119,26 +109,31 @@ class MPU6050Link:
     CALIBRATION_MAX_GYRO_DPS = 35.0
     # Aggregate acceptance bar for the whole trimmed calibration window (see
     # _finish_calibration), distinct from the CALIBRATION_MAX_GYRO_DPS/ACCEL_*
-    # per-sample stillness filter above. Overridable per sensor: a lower-noise
-    # part can demand a tighter bias fit without risking spurious retries.
+    # per-sample stillness filter above. v1.9.10 briefly tightened these
+    # below the values here based on datasheet noise specs alone; physical
+    # testing showed the real sensor + MCP2221 USB path could not reliably
+    # settle inside that tighter bar, so calibration_progress stalled short
+    # of 100% forever and the robot never gained drive authority. Do not
+    # retighten these without hardware-in-the-loop verification.
     CALIBRATION_GYRO_STD_MAX_DPS = 2.5
     CALIBRATION_ACCEL_NORM_MIN = 0.75
     CALIBRATION_ACCEL_NORM_MAX = 1.25
-    SENSOR_NAME = "MPU-6050"
+    SENSOR_NAME = "LSM6DS3 USB"
 
     def __init__(
         self,
-        bus_number: int = 1,
-        address: int = 0x68,
+        address: int | None = None,
         mount_yaw_deg: float = 180.0,
-        calibration_samples: int = 80,
+        calibration_samples: int = 40,
         bus_factory: Callable[[int], _SMBusLike] | None = None,
     ) -> None:
-        self.bus_number = bus_number
-        self.address = address
+        self.address = 0x6A if address is None else address
+        self._candidate_addresses = (
+            (0x6A, 0x6B) if address is None else (address,)
+        )
         self.mount_yaw_deg = mount_yaw_deg
         self.calibration_samples = max(20, calibration_samples)
-        self._bus_factory = bus_factory or _default_bus_factory
+        self._bus_factory = bus_factory or _mcp2221_bus_factory
         self._bus: _SMBusLike | None = None
         self._next_connect_at = 0.0
         self._error: str | None = None
@@ -158,27 +153,28 @@ class MPU6050Link:
         self._temperature_c = 0.0
         self._yaw_deg = 0.0
 
-    @staticmethod
-    def _signed16(high: int, low: int) -> int:
-        value = (high << 8) | low
-        return value - 65536 if value >= 32768 else value
-
     @classmethod
     def _decode_block(
         cls, data: list[int]
     ) -> tuple[float, float, float, float, float, float, float]:
         if len(data) != 14:
-            raise OSError(f"MPU-6050 returned {len(data)} bytes, expected 14")
-        values = [cls._signed16(data[index], data[index + 1]) for index in range(0, 14, 2)]
-        ax, ay, az, temperature, gx, gy, gz = values
+            raise OSError(f"LSM6DS3 returned {len(data)} bytes, expected 14")
+
+        def signed16_le(offset: int) -> int:
+            value = data[offset] | (data[offset + 1] << 8)
+            return value - 65536 if value >= 32768 else value
+
+        temperature = signed16_le(0)
+        gx, gy, gz = (signed16_le(offset) for offset in (2, 4, 6))
+        ax, ay, az = (signed16_le(offset) for offset in (8, 10, 12))
         return (
-            ax / 16384.0,
-            ay / 16384.0,
-            az / 16384.0,
-            temperature / 340.0 + 36.53,
-            gx / 131.0,
-            gy / 131.0,
-            gz / 131.0,
+            ax * 0.000061,
+            ay * 0.000061,
+            az * 0.000061,
+            25.0 + temperature / 256.0,
+            gx * 0.00875,
+            gy * 0.00875,
+            gz * 0.00875,
         )
 
     def _robot_frame(self, x: float, y: float, z: float) -> tuple[float, float, float]:
@@ -190,18 +186,36 @@ class MPU6050Link:
     def _connect(self, now: float) -> bool:
         bus: _SMBusLike | None = None
         try:
-            bus = self._bus_factory(self.bus_number)
-            identity = bus.read_byte_data(self.address, self.WHO_AM_I)
-            if identity not in self.EXPECTED_IDS:
-                bus.close()
-                raise OSError(f"unexpected WHO_AM_I 0x{identity:02X}")
-            # PLL clock, 44 Hz digital low-pass, 100 Hz internal sampling,
-            # +/-250 deg/s gyro and +/-2 g accelerometer.
-            bus.write_byte_data(self.address, self.PWR_MGMT_1, 0x01)
-            bus.write_byte_data(self.address, self.CONFIG, 0x03)
-            bus.write_byte_data(self.address, self.SMPLRT_DIV, 0x09)
-            bus.write_byte_data(self.address, self.GYRO_CONFIG, 0x00)
-            bus.write_byte_data(self.address, self.ACCEL_CONFIG, 0x00)
+            bus = self._bus_factory(0)
+            errors: list[str] = []
+            for address in self._candidate_addresses:
+                try:
+                    identity = bus.read_byte_data(address, self.WHO_AM_I)
+                except Exception as exc:
+                    errors.append(f"0x{address:02X}: {exc}")
+                    continue
+                if identity in self.EXPECTED_IDS:
+                    self.address = address
+                    break
+                errors.append(f"0x{address:02X}: WHO_AM_I 0x{identity:02X}")
+            else:
+                raise OSError("LSM6DS3 not found (" + "; ".join(errors) + ")")
+            # 104 Hz, +/-2 g accelerometer; 104 Hz, +/-245 dps gyro;
+            # block-data update and automatic register increment enabled.
+            configuration = (
+                (self.CTRL1_XL, 0x40),
+                (self.CTRL2_G, 0x40),
+                (self.CTRL3_C, 0x44),
+            )
+            for register, value in configuration:
+                bus.write_byte_data(self.address, register, value)
+            for register, expected in configuration:
+                actual = bus.read_byte_data(self.address, register)
+                if actual != expected:
+                    raise OSError(
+                        f"LSM6DS3 config verify failed at 0x{register:02X}: "
+                        f"wrote 0x{expected:02X}, read 0x{actual:02X}"
+                    )
             self._bus = bus
             self._connected_at = now
             self._error = None
@@ -230,7 +244,10 @@ class MPU6050Link:
         self._connected_at = 0.0
 
     def _sample_ready(self, bus: _SMBusLike) -> bool:
-        return True
+        # Only count and integrate complete new gyro+accelerometer samples.
+        # This prevents a fast control loop from repeatedly integrating the
+        # same 104 Hz hardware output.
+        return bus.read_byte_data(self.address, self.STATUS_REG) & 0x03 == 0x03
 
     def _finish_calibration(self) -> bool:
         gyro_axes = list(zip(*(sample[:3] for sample in self._calibration)))
@@ -409,189 +426,10 @@ class MPU6050Link:
                 pass
 
 
-class LSM6DS3MCP2221Link(MPU6050Link):
-    """LSM6DS3 sampled through the MCP2221A USB-I2C adapter."""
-
-    WHO_AM_I = 0x0F
-    CTRL1_XL = 0x10
-    CTRL2_G = 0x11
-    CTRL3_C = 0x12
-    STATUS_REG = 0x1E
-    DATA_START = 0x20
-    # LSM6DS3TR-C identifies as 0x6A. The older non-C LSM6DS3 uses 0x69.
-    EXPECTED_IDS = (0x6A,)
-    SENSOR_NAME = "LSM6DS3 USB"
-    # v1.9.10 tightened these for this sensor based on datasheet noise specs
-    # alone (CALIBRATION_GYRO_STD_MAX_DPS 2.5->1.5, accel norm 0.75..1.25 ->
-    # 0.85..1.15). Physical testing showed the real sensor + MCP2221 USB path
-    # cannot reliably settle inside that bar: calibration_progress stalled
-    # short of 100% indefinitely, so the robot never started driving. Reverted
-    # to the inherited MPU6050Link defaults, which are the values the "Make
-    # USB IMU calibration converge reliably" fix was actually verified
-    # against. Do not retighten these without hardware-in-the-loop testing.
-
-    def __init__(
-        self,
-        address: int | None = None,
-        mount_yaw_deg: float = 180.0,
-        calibration_samples: int = 40,
-        bus_factory: Callable[[int], _SMBusLike] | None = None,
-    ) -> None:
-        super().__init__(
-            bus_number=0,
-            address=0x6A if address is None else address,
-            mount_yaw_deg=mount_yaw_deg,
-            calibration_samples=calibration_samples,
-            bus_factory=bus_factory or _mcp2221_bus_factory,
-        )
-        self._candidate_addresses = (
-            (0x6A, 0x6B) if address is None else (address,)
-        )
-
-    @classmethod
-    def _decode_block(
-        cls, data: list[int]
-    ) -> tuple[float, float, float, float, float, float, float]:
-        if len(data) != 14:
-            raise OSError(f"LSM6DS3 returned {len(data)} bytes, expected 14")
-
-        def signed16_le(offset: int) -> int:
-            value = data[offset] | (data[offset + 1] << 8)
-            return value - 65536 if value >= 32768 else value
-
-        temperature = signed16_le(0)
-        gx, gy, gz = (signed16_le(offset) for offset in (2, 4, 6))
-        ax, ay, az = (signed16_le(offset) for offset in (8, 10, 12))
-        return (
-            ax * 0.000061,
-            ay * 0.000061,
-            az * 0.000061,
-            25.0 + temperature / 256.0,
-            gx * 0.00875,
-            gy * 0.00875,
-            gz * 0.00875,
-        )
-
-    def _connect(self, now: float) -> bool:
-        bus: _SMBusLike | None = None
-        try:
-            bus = self._bus_factory(self.bus_number)
-            errors: list[str] = []
-            for address in self._candidate_addresses:
-                try:
-                    identity = bus.read_byte_data(address, self.WHO_AM_I)
-                except Exception as exc:
-                    errors.append(f"0x{address:02X}: {exc}")
-                    continue
-                if identity in self.EXPECTED_IDS:
-                    self.address = address
-                    break
-                errors.append(f"0x{address:02X}: WHO_AM_I 0x{identity:02X}")
-            else:
-                raise OSError("LSM6DS3 not found (" + "; ".join(errors) + ")")
-            # 104 Hz, +/-2 g accelerometer; 104 Hz, +/-245 dps gyro;
-            # block-data update and automatic register increment enabled.
-            configuration = (
-                (self.CTRL1_XL, 0x40),
-                (self.CTRL2_G, 0x40),
-                (self.CTRL3_C, 0x44),
-            )
-            for register, value in configuration:
-                bus.write_byte_data(self.address, register, value)
-            for register, expected in configuration:
-                actual = bus.read_byte_data(self.address, register)
-                if actual != expected:
-                    raise OSError(
-                        f"LSM6DS3 config verify failed at 0x{register:02X}: "
-                        f"wrote 0x{expected:02X}, read 0x{actual:02X}"
-                    )
-            self._bus = bus
-            self._connected_at = now
-            self._error = None
-            return True
-        except Exception as exc:
-            if bus is not None:
-                try:
-                    bus.close()
-                except Exception:
-                    pass
-            self._bus = None
-            self._error = str(exc)
-            self._next_connect_at = now + self.RETRY_SECONDS
-            return False
-
-    def _sample_ready(self, bus: _SMBusLike) -> bool:
-        # Only count and integrate complete new gyro+accelerometer samples.
-        # This prevents a fast control loop from repeatedly integrating the
-        # same 104 Hz hardware output.
-        return bus.read_byte_data(self.address, self.STATUS_REG) & 0x03 == 0x03
-
-
-class AutoIMULink:
-    """Prefer USB LSM6DS3, falling back to the existing GPIO MPU-6050."""
-
-    def __init__(
-        self,
-        mpu_bus: int = 1,
-        mpu_address: int = 0x68,
-        mount_yaw_deg: float = 180.0,
-        lsm_address: int | None = None,
-        lsm_link: LSM6DS3MCP2221Link | None = None,
-        mpu_link: MPU6050Link | None = None,
-    ) -> None:
-        self._lsm = lsm_link or LSM6DS3MCP2221Link(
-            address=lsm_address, mount_yaw_deg=mount_yaw_deg
-        )
-        self._mpu = mpu_link or MPU6050Link(
-            bus_number=mpu_bus,
-            address=mpu_address,
-            mount_yaw_deg=mount_yaw_deg,
-        )
-        self._using_lsm = False
-        self._lsm_calibration_started = False
-
-    def tick(self, now: float | None = None, stationary: bool = True) -> IMUState:
-        now = time.monotonic() if now is None else now
-        lsm_state = self._lsm.tick(now, stationary)
-        if lsm_state.connected:
-            self._using_lsm = True
-            self._lsm_calibration_started = (
-                self._lsm_calibration_started
-                or (not lsm_state.calibrated and lsm_state.calibration_progress > 0.0)
-            )
-            return lsm_state
-        if self._lsm_calibration_started and not lsm_state.calibrated:
-            # A USB hub reset can briefly remove the MCP2221 when another device
-            # is inserted. Keep reporting the LSM calibration state so its
-            # retained samples do not appear to reset to the unused GPIO
-            # fallback's zero-percent state.
-            self._using_lsm = True
-            return lsm_state
-        self._using_lsm = False
-        mpu_state = self._mpu.tick(now, stationary)
-        if mpu_state.connected:
-            return mpu_state
-        return replace(
-            mpu_state,
-            error=(
-                f"LSM6DS3 USB: {lsm_state.error or 'not found'}; "
-                f"MPU-6050 GPIO: {mpu_state.error or 'not found'}"
-            ),
-            source="AUTO",
-        )
-
-    def state(self, now: float | None = None) -> IMUState:
-        return (self._lsm if self._using_lsm else self._mpu).state(now)
-
-    def close(self) -> None:
-        self._lsm.close()
-        self._mpu.close()
-
-
 class AsyncIMULink:
     """Sample an IMU independently of camera, display, and planner latency."""
 
-    def __init__(self, link: AutoIMULink, sample_period_s: float = 0.02) -> None:
+    def __init__(self, link: LSM6DS3MCP2221Link, sample_period_s: float = 0.02) -> None:
         self._link = link
         self._sample_period_s = max(0.005, sample_period_s)
         self._lock = threading.Lock()
@@ -613,7 +451,7 @@ class AsyncIMULink:
             try:
                 state = self._link.tick(now, stationary)
             except Exception as exc:
-                state = IMUState(error=f"IMU sampler error: {exc}", source="AUTO")
+                state = IMUState(error=f"IMU sampler error: {exc}", source=LSM6DS3MCP2221Link.SENSOR_NAME)
             with self._lock:
                 self._state = state
             self._stop.wait(self._sample_period_s)

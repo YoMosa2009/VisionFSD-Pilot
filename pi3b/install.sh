@@ -65,9 +65,6 @@ preserve_and_reclone() {
 sudo apt-get update
 sudo apt-get install -y --no-install-recommends \
   git python3 python3-venv python3-pip python3-opencv curl
-if command -v raspi-config >/dev/null 2>&1; then
-  sudo raspi-config nonint do_i2c 0
-fi
 
 if [[ -e "$INSTALL_ROOT/.git" ]]; then
   if ! git -C "$INSTALL_ROOT" fetch --depth 1 origin "$REF" \
@@ -110,6 +107,7 @@ chmod +x \
   "$PI_ROOT/sync_primary_model.sh" \
   "$PI_ROOT/run_lidar.sh" \
   "$PI_ROOT/run_robot.sh" \
+  "$PI_ROOT/auto_update.sh" \
   "$PI_ROOT/setup_mcp2221.sh"
 bash "$PI_ROOT/sync_primary_model.sh" "$PI_ROOT"
 

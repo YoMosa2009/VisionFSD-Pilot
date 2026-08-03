@@ -1,7 +1,8 @@
 """Low-cost LiDAR mapping with cautious yaw correction for VisionFSD Pi.
 
-The MPU-6050 supplies short-term yaw rate when live, and the LD19 corrects that
-prediction only when successive scans have clear, low-residual agreement.
+The USB LSM6DS3 IMU supplies short-term yaw rate when live, and the LD19
+corrects that prediction only when successive scans have clear, low-residual
+agreement.
 Translation starts from commanded-motion prediction and receives only bounded,
 unique scan-to-map corrections because the chassis has no wheel encoders.  The
 map supplies exploration guidance but never overrides current-scan motor safety.

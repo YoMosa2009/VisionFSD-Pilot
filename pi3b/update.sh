@@ -48,6 +48,7 @@ chmod +x \
   "$PI_ROOT/sync_primary_model.sh" \
   "$PI_ROOT/run_lidar.sh" \
   "$PI_ROOT/run_robot.sh" \
+  "$PI_ROOT/auto_update.sh" \
   "$PI_ROOT/setup_mcp2221.sh"
 
 if [[ ! -x "$PI_ROOT/.venv/bin/python" ]]; then
@@ -57,7 +58,7 @@ fi
 
 new_requirements="$(sha256sum "$PI_ROOT/requirements.txt" | awk '{print $1}')"
 dependencies_ok=true
-if ! "$PI_ROOT/.venv/bin/python" -c 'import board, cv2, hid, numpy, serial, smbus2; from ai_edge_litert.interpreter import Interpreter' >/dev/null 2>&1; then
+if ! "$PI_ROOT/.venv/bin/python" -c 'import board, cv2, hid, numpy, serial; from ai_edge_litert.interpreter import Interpreter' >/dev/null 2>&1; then
   dependencies_ok=false
 fi
 "$PI_ROOT/setup_mcp2221.sh"

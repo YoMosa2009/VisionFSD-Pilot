@@ -79,6 +79,42 @@ It saves tracked local edits in a named Git stash, installs the current Pi
 release, and leaves the model and virtual environment in place. Normal future
 updates can then use `bash ~/visionfsd-pi/pi3b/update.sh`.
 
+### Automatic updates on boot
+
+`run_robot.sh` runs `auto_update.sh` once before the robot autostarts, so a
+manual `update.sh` run is no longer required before every test session. It is
+deliberately conservative and bounded:
+
+- A `git fetch` with a (default 12 s) timeout; if it fails or times out, the
+  robot launches on whatever is already installed.
+- Skipped entirely if `pi3b/.install-ref` is missing (a fresh checkout that
+  has never run `update.sh`) -- it never guesses a ref to deploy.
+- Skipped entirely if the checked-out `pi3b`/Uno-firmware files have local
+  edits -- it never stashes changes on your behalf. Run `update.sh` manually
+  in that case.
+- If a new commit is fetched, it calls the same `update.sh` used for manual
+  updates; if that fails partway (no network for a pip/model download, for
+  example), it rolls back to the previously installed commit rather than
+  leaving the robot on a broken checkout.
+- If an update was applied, `run_robot.sh` re-execs itself once so a fresh
+  process picks up the new code, then continues its normal startup sequence
+  (device wait, dashboard, launch).
+
+Both the auto-update step and the eventual robot launch are logged to
+`pi3b/logs/robot.log`, prefixed `=== VisionFSD auto-update: ... ===`.
+
+If the robot won't start and you suspect the newest commit, the escape hatch
+is to boot once with auto-update disabled and fix or roll back by hand:
+
+```bash
+VISIONFSD_AUTO_UPDATE=0 bash ~/visionfsd-pi/pi3b/run_robot.sh
+```
+
+Set `VISIONFSD_AUTO_UPDATE=0` in the environment permanently (for example
+while iterating on local edits without wanting them silently left alone every
+boot) to disable auto-update every run; set `VISIONFSD_AUTO_UPDATE_TIMEOUT_S`
+to change the fetch timeout.
+
 ## OSOYOO robot mode: Pi + LD19 + camera + Uno
 
 The optional indoor robot runtime connects all four sensor/control parts:
@@ -218,7 +254,7 @@ move during that interval. Afterwards its authority order is fixed:
    scored with the same windowed body-width minimum used for forward path
    selection rather than the single farthest ray in the sweep, so one lucky
    LiDAR return narrower than the chassis can no longer look like a viable
-   escape direction. A calibrated USB LSM6DS3 or GPIO MPU-6050 releases the turn after
+   escape direction. A calibrated USB LSM6DS3 releases the turn after
    measured yaw reaches the clear corridor and hard-limits each turn to
    88 degrees; a 2.4-second bound applies if IMU yaw is unavailable. It may try
    the opposite side once. It stops as `STOP:BOXED_IN` when neither bounded
@@ -235,7 +271,7 @@ move during that interval. Afterwards its authority order is fixed:
    available during recovery.
 6. Uno ultrasonic hard-stop (under 18 cm) always wins and blocks forward
    motor commands even if the Pi fails.
-7. A live, calibrated USB LSM6DS3 or GPIO MPU-6050 supplies measured yaw rate
+7. A live, calibrated USB LSM6DS3 supplies measured yaw rate
    and integrated yaw change to the local mapper
    and recovery controller, and progressively removes steering split above
    38 deg/s, reaching zero additional split at 55 deg/s. If the IMU is absent
@@ -357,21 +393,16 @@ rejected samples, missing fresh data, or an unstable window. No manual
 25-second stationary standby, the dashboard should change from
 `IMU LSM6DS3 USB CALIBRATING` to `IMU LSM6DS3 USB LIVE`.
 
-### GPIO MPU-6050 fallback
+### USB LSM6DS3 mounting
 
-The previous MPU-6050 remains supported as an automatic fallback on Pi I2C bus
-1 at address `0x68`:
-
-| MPU-6050 | Pi physical pin |
-| --- | --- |
-| VCC | 1 (3.3 V) |
-| SDA | 3 (GPIO2/SDA1) |
-| SCL | 5 (GPIO3/SCL1) |
-| GND | 6 |
-| AD0 | 9 (GND, selects `0x68`) |
+v1.9.12 removed GPIO MPU-6050 support entirely; the USB LSM6DS3 (through the
+MCP2221A USB-I2C adapter) is the only supported IMU. There is no GPIO I2C
+wiring and no fallback IMU class -- a missing or disconnected LSM6DS3 goes
+straight to the existing, fully supported `LD19+COMMAND POSE ACTIVE` non-IMU
+mode after the probe interval.
 
 The installed board is flat with components up and rotated 180 degrees from
-the robot frame: its pin-header edge faces forward and its `MPU-6050` text
+the robot frame: its pin-header edge faces forward and its `LSM6DS3` text
 edge faces rearward. The runtime therefore defaults to
 `--imu-mount-yaw-deg 180`, which reverses sensor X/Y while retaining Z. Override
 only if the physical mount changes:
@@ -382,21 +413,17 @@ export VISIONFSD_IMU_MOUNT_YAW_DEG=180
 
 The first stationary seconds of the existing 25-second standby calibrate gyro
 bias. Calibration rejects samples with excessive motion and pauses rather than
-resetting valid progress. USB LSM6DS3 is
-preferred, GPIO MPU-6050 is second, and `LD19+COMMAND POSE ACTIVE` remains the
-automatic fallback if neither IMU is usable. Missing IMU hardware never creates
-a no-motion boot failure. The USB LSM6DS3 uses the same aggregate acceptance
-bar for a stationary calibration window as the GPIO MPU-6050. A v1.9.10
-attempt to tighten that bar for the LSM6DS3 based on its lower datasheet
-noise was reverted in v1.9.11: physical testing showed `IMU CALIBRATING`
-stalling short of 100% indefinitely, because the real sensor's noise did not
-reliably fit inside the tighter bar. Do not retighten this without
-hardware-in-the-loop verification.
+resetting valid progress. Missing IMU hardware never creates a no-motion boot
+failure. A v1.9.10 attempt to tighten the aggregate stationary-calibration
+acceptance bar based on the LSM6DS3's datasheet noise specs was reverted in
+v1.9.11: physical testing showed `IMU CALIBRATING` stalling short of 100%
+indefinitely, because the real sensor's noise did not reliably fit inside the
+tighter bar. Do not retighten this without hardware-in-the-loop verification.
 
 The gyro improves short-term turn measurement and smooths excessive yaw. Its
 accelerometer is not integrated into position because chassis vibration,
 gravity error, and the front/side mounting offset would create rapid drift.
-Neither supported IMU has a magnetometer, so neither provides absolute heading.
+The LSM6DS3 has no magnetometer, so it does not provide absolute heading.
 
 ### LiDAR + IMU exploration map
 
@@ -449,7 +476,7 @@ costs. Reference material:
 - [ST MotionGC gyroscope calibration](https://www.st.com/resource/en/user_manual/dm00372763-getting-started-with-motiongc-gyroscope-calibration-library-in-xcubemems1-expansion-for-stm32cube-stmicroelectronics.pdf)
 
 A heading correction is applied only when successive 360-bin LD19 scans have
-enough non-ambiguous support. Between accepted matches, a live USB LSM6DS3 or GPIO MPU-6050 supplies
+enough non-ambiguous support. Between accepted matches, a live USB LSM6DS3 supplies
 measured yaw rate and its asynchronously integrated yaw change; if it is
 unavailable, the mapper uses conservative
 commanded-motion prediction. Bounded scan-to-map correlation also corrects
@@ -494,9 +521,12 @@ The default installer creates this Pi Desktop autostart file:
 
 With Raspberry Pi OS **Desktop** configured to auto-login, connecting power
 starts the visual robot runtime after the graphical desktop appears; it still
-holds STOP for 25 seconds. Use `--no-robot-autostart` with `install.sh` if you
-do not want that. Raspberry Pi OS Lite has no graphical autostart session, so
-it needs a separate headless service and does not show the visualizer.
+holds STOP for 25 seconds. Before that, `run_robot.sh` runs a bounded
+auto-update check (see "Automatic updates on boot" above) so a fresh boot
+picks up the latest installed release without a manual `update.sh` run. Use
+`--no-robot-autostart` with `install.sh` if you do not want autostart at all.
+Raspberry Pi OS Lite has no graphical autostart session, so it needs a
+separate headless service and does not show the visualizer.
 
 On the standard Pi Desktop Wayland session, the launcher selects Qt's XWayland
 backend and reapplies fullscreen during the first rendered frames. This avoids

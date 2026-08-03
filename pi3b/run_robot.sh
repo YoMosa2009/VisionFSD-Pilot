@@ -27,7 +27,32 @@ if ! flock -n 9; then
   exit 0
 fi
 LOG="$LOG_DIR/robot.log"
-if [[ -f "$LOG" ]]; then mv -f "$LOG" "$LOG_DIR/robot.previous.log"; fi
+# Skipped on the re-exec below (see auto-update block just after) so this
+# rotation reflects the previous boot's run, not the few auto-update log
+# lines the pre-re-exec process just wrote.
+if [[ "${VISIONFSD_POST_UPDATE_REEXEC:-0}" != "1" && -f "$LOG" ]]; then
+  mv -f "$LOG" "$LOG_DIR/robot.previous.log"
+fi
+
+# Check for a newer installed version before autostarting, so the robot stays
+# current without a manual update.sh run. Bounded and fail-safe: see
+# auto_update.sh for what "fail-safe" covers (offline, dirty tree, a failed
+# update). Skipped on the re-exec below so this can only run once per boot.
+if [[ "${VISIONFSD_POST_UPDATE_REEXEC:-0}" != "1" ]]; then
+  {
+    echo "=== VisionFSD auto-update: $(date -Is) ==="
+    set +e
+    bash "$ROOT/auto_update.sh"
+    auto_update_status=$?
+    set -e
+    echo "auto-update exit status: $auto_update_status"
+  } >>"$LOG" 2>&1
+  if [[ "${auto_update_status:-0}" -eq 2 ]]; then
+    echo "auto-update applied a new version; restarting run_robot.sh" >>"$LOG"
+    export VISIONFSD_POST_UPDATE_REEXEC=1
+    exec "$ROOT/run_robot.sh" "$@"
+  fi
+fi
 
 # USB devices are not always enumerated by the time the desktop session starts,
 # and the runtime exits when it cannot find the Uno.  Waiting turns a boot race
@@ -75,6 +100,7 @@ if [[ -n "${VISIONFSD_LIDAR_PORT:-}" ]]; then
   ARGS+=(--lidar-port "$VISIONFSD_LIDAR_PORT")
 fi
 ARGS+=("$@")
+unset VISIONFSD_POST_UPDATE_REEXEC
 
 # With a terminal attached, print straight to it so errors are visible now.
 if [[ -t 1 ]]; then
