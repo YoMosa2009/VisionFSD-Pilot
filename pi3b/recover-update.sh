@@ -52,7 +52,11 @@ chmod +x \
   "$PI_ROOT/run.sh" \
   "$PI_ROOT/update.sh" \
   "$PI_ROOT/recover-update.sh" \
-  "$PI_ROOT/sync_primary_model.sh"
+  "$PI_ROOT/sync_primary_model.sh" \
+  "$PI_ROOT/run_lidar.sh" \
+  "$PI_ROOT/run_robot.sh" \
+  "$PI_ROOT/auto_update.sh" \
+  "$PI_ROOT/setup_mcp2221.sh"
 
 if [[ ! -x "$PI_ROOT/.venv/bin/python" ]]; then
   echo "Pi virtual environment is missing. Re-run pi3b/install.sh." >&2
@@ -62,10 +66,12 @@ fi
 new_requirements="$(sha256sum "$PI_ROOT/requirements.txt" | awk '{print $1}')"
 dependencies_ok=true
 if ! "$PI_ROOT/.venv/bin/python" -c \
-  'import cv2, numpy; from ai_edge_litert.interpreter import Interpreter' \
+  'import board, cv2, hid, numpy, serial; from ai_edge_litert.interpreter import Interpreter' \
   >/dev/null 2>&1; then
   dependencies_ok=false
 fi
+
+"$PI_ROOT/setup_mcp2221.sh"
 
 if [[ "$old_requirements" != "$new_requirements" || "$dependencies_ok" != true ]]; then
   "$PI_ROOT/.venv/bin/python" -m pip install --upgrade pip

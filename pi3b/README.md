@@ -1,7 +1,7 @@
 # VisionFSD Pi 3B runtime
 
-This is a **separate, read-only** Raspberry Pi 3B runtime derived from the
-design of the desktop VisionFSD Pilot. It is deliberately not a direct port.
+This is a **separate** Raspberry Pi 3B runtime derived from the design of the
+desktop VisionFSD Pilot. It is deliberately not a direct port.
 
 It preserves newest-frame capture, bounded asynchronous inference, a sticky
 lane-aware lead target, and a target shown in both camera and world panels.
@@ -56,6 +56,11 @@ are explicitly changed.
 It intentionally does not require the optional `libatlas-base-dev` package,
 which is unavailable on some current Raspberry Pi OS package sources.
 
+The installer uses Git sparse checkout: it keeps only `pi3b/` and the exact
+Uno firmware sketch needed by the robot runtime. Desktop OpenVINO models,
+Windows scripts, CAD assets, and unrelated source files are removed from an
+existing Pi checkout during installation/update.
+
 To update an existing installation, preserving the release branch it was
 installed from:
 
@@ -73,6 +78,511 @@ curl -fsSL https://raw.githubusercontent.com/YoMosa2009/VisionFSD-Pilot/codex/pi
 It saves tracked local edits in a named Git stash, installs the current Pi
 release, and leaves the model and virtual environment in place. Normal future
 updates can then use `bash ~/visionfsd-pi/pi3b/update.sh`.
+
+### Automatic updates on boot
+
+`run_robot.sh` runs `auto_update.sh` once before the robot autostarts, so a
+manual `update.sh` run is no longer required before every test session. It is
+deliberately conservative and bounded:
+
+- A `git fetch` with a (default 12 s) timeout; if it fails or times out, the
+  robot launches on whatever is already installed.
+- Skipped entirely if `pi3b/.install-ref` is missing (a fresh checkout that
+  has never run `update.sh`) -- it never guesses a ref to deploy.
+- Skipped entirely if the checked-out `pi3b`/Uno-firmware files have local
+  edits -- it never stashes changes on your behalf. Run `update.sh` manually
+  in that case.
+- If a new commit is fetched, it calls the same `update.sh` used for manual
+  updates; if that fails partway (no network for a pip/model download, for
+  example), it rolls back to the previously installed commit rather than
+  leaving the robot on a broken checkout.
+- If an update was applied, `run_robot.sh` re-execs itself once so a fresh
+  process picks up the new code, then continues its normal startup sequence
+  (device wait, dashboard, launch).
+
+Both the auto-update step and the eventual robot launch are logged to
+`pi3b/logs/robot.log`, prefixed `=== VisionFSD auto-update: ... ===`.
+
+If the robot won't start and you suspect the newest commit, the escape hatch
+is to boot once with auto-update disabled and fix or roll back by hand:
+
+```bash
+VISIONFSD_AUTO_UPDATE=0 bash ~/visionfsd-pi/pi3b/run_robot.sh
+```
+
+Set `VISIONFSD_AUTO_UPDATE=0` in the environment permanently (for example
+while iterating on local edits without wanting them silently left alone every
+boot) to disable auto-update every run; set `VISIONFSD_AUTO_UPDATE_TIMEOUT_S`
+to change the fetch timeout.
+
+## OSOYOO Model 3 robot mode
+
+The supported physical robot configuration is intentionally specific:
+
+| Part | Connected role |
+|---|---|
+| OSOYOO Model 3 kit | Differential-drive chassis, front static ultrasonic sensor, motor shield, and motors |
+| Raspberry Pi 3B | Runs the Pi planner, mapper, visualizer, and USB device discovery |
+| LD19 | 360-degree horizontal range sensing through its USB-UART adapter |
+| LSM6DS3 | Gyro/accelerometer, connected only through the MCP2221A USB-I2C adapter |
+| Arduino Uno | Runs `robot/firmware/visionfsd_pi_autonomy/visionfsd_pi_autonomy.ino` and applies bounded differential motor commands |
+
+The Pi deployment is a sparse checkout containing only `pi3b/` and
+`robot/firmware/visionfsd_pi_autonomy/`. The desktop runtime, CAD, and manual
+drive files are not deployed to the robot.
+
+The optional indoor robot runtime connects all four sensor/control parts:
+
+```text
+Pi USB webcam ──────────────> Pi (optical-flow pose cue + live health gate)
+LD19 USB-UART ──────────────> Pi (360-degree range obstacles/local map)
+Arduino Uno USB ────────────> Pi (serial commands/status)
+front static ultrasonic ────> Uno (independent final forward-stop guard)
+Uno motor shield ───────────> motors
+```
+
+**Yes:** connect the Uno's normal USB port directly to a Pi USB port. It
+provides the serial link and, when the Pi is powered adequately, can power the
+Uno's logic. The motors must remain on their own correctly rated battery pack;
+do not try to power the motors from the Pi or its USB power bank.
+
+Flash this separate sketch to the Uno first:
+
+```text
+~/visionfsd-pi/robot/firmware/visionfsd_pi_autonomy/visionfsd_pi_autonomy.ino
+```
+
+It is intentionally different from the earlier manual-drive sketch: the
+ultrasonic sensor is static and front-facing, the servo is unused/detached to
+avoid its continuous battery draw, and every motion command expires after
+350 ms. The Pi sends bounded differential motor commands, allowing gentle
+forward arcs instead of only straight/pivot motion. The Uno blocks forward
+travel below 18 cm even if the Pi crashes or sends a bad command.
+**Re-flash this sketch after each robot-firmware update.**
+
+### Motor power and why PWM is not capped low
+
+The shield's L298N bridge drops roughly 2 V, so a 7.9 V pack puts at most about
+5.6 V across a motor at full duty. An earlier 105/255 cap therefore delivered
+around 2.3 V. That is enough to spin a free wheel with the robot on blocks and
+**not** enough to move the loaded chassis on a floor: the motor sits energised
+and buzzing, the robot creeps, pauses and stutters, and the battery sags for no
+useful work. Full 8-bit range is available, but the Pi uses a cautious direct
+PWM ceiling of **118** in clear space and slows from there.
+
+For the same reason the practical deadband is measured loaded, not in the air.
+`MIN_MOVE_PWM` is 105: any commanded wheel value is either zero or above it,
+because in between the motor only buzzes. A wheel deliberately dropped to zero
+is how a tight arc is made.
+
+The Uno applies a direct 20 ms PWM ramp from that floor to the commanded value.
+It does not use a high-power kickstart or an on/off pulse train, because either
+would make a small robot lurch or audibly stop-start.
+
+### Speed is governed by measured clearance
+
+`--speed` (default 118) is the ceiling used in **clear space only**. The planner
+scales down from it in proportion to how far the robot's own body can actually
+travel along the heading it has chosen, so it slows approaching an obstacle
+rather than running flat out until a last-moment stop.
+
+The usable band is narrow in PWM terms but wide in speed terms, because only
+the voltage *above* the stall threshold does any work: roughly 105 PWM is a
+slow crawl and 118 is a cautious cruise. Below about 105 the loaded chassis
+stops moving entirely, so that is the floor.
+
+Tune with two knobs. `--speed` sets the ceiling. `--min-move-pwm` (default 105)
+is the lowest PWM that turns a loaded wheel; raise it if the robot buzzes
+without moving, lower it if even the crawl is too quick. `MIN_MOVE_PWM` is an
+estimate for this drivetrain, not a measurement of yours.
+
+### Corridor profile: how it steers around things
+
+Rather than five fixed sectors, the LD19 returns are swept into a **body-inflated
+corridor profile**: for each of 73 candidate headings the planner computes how
+far a rectangle of the robot's own width can travel before anything enters its
+path. That is what lets it say "there is a 0.5 m gap 20 degrees to the right,
+3 m deep" — something a five-sector summary structurally cannot express, and
+the reason it can now curve around an object instead of treating a whole side
+as blocked.
+
+The chosen heading comes from that profile. Each candidate is scored by the
+minimum clearance across an 11-degree opening, so one long ray between nearby
+objects cannot masquerade as a usable route. It prefers straight ahead when
+that broad opening has at least 1.25 m of clear travel, with a switch margin so
+scan noise cannot make it weave between two near-tied options. The selected corridor receives
+arc-lead compensation because a differential-drive chassis cannot instantly
+assume a new straight heading. Avoidance uses a forward arc with both wheels
+powered, never a fast counter-rotating pivot. The outer wheel receives bounded
+steering headroom while the inside wheel remains at or above its loaded floor.
+Before applying that arc, the planner also limits speed by the tightest
+body-width opening through every heading it must sweep from its present steering
+angle to the requested one. That guards the moving turn itself, not only the
+straight course after the turn completes.
+
+The control path uses at most one current LD19 revolution of point history,
+scaled from the scanner's reported speed and capped at 180 ms. Older points
+are excluded from both the dashboard and drive decisions; a scan stream older
+than 250 ms is a safety stop, not valid perception.
+
+The runtime writes one `NAV` telemetry line per second to
+`pi3b/logs/robot.log`. If commanded and Uno-reported PWM drop to zero during a
+hiccup, the same line identifies the safety gate that stopped it. If both stay
+nonzero while the wheels cut out, the fault is in motor power or wiring. A 9 V
+PP3-style battery is not a usable sustained motor supply here; its voltage can
+look normal at idle and collapse under motor current.
+
+Run a supervised first test on blocks, wheels free, then on an empty floor:
+
+```bash
+cd ~/visionfsd-pi && bash ./pi3b/run_robot.sh
+```
+
+At boot the robot runtime starts in a **25-second STOP standby**. It will not
+move during that interval. Afterwards its authority order is fixed:
+
+1. A stale Uno, LD19, or webcam stops the robot; it will not drive blind. After
+   the webcam has produced a live frame, a USB reset receives at most one second
+   of last-frame grace so one device event does not create a motor pulse. The
+   robot still requires a real webcam frame before initially driving. If an IMU
+   is detected during startup, `IMU CALIBRATING` also holds STOP until calibration
+   reaches `IMU LIVE`. An absent IMU still selects the supported non-IMU mode.
+2. Robot mode does not run object or person detection. Low-resolution webcam
+   optical flow provides a bounded non-IMU yaw cue during turns and reduces
+   false commanded map translation when a high-confidence textured view shows
+   no movement. It is not odometry. Camera frames are not rendered, keeping
+   camera/display work small on Pi 3B.
+3. During standby, the mapper distinguishes observed free space from unknown
+   space and persistent obstacle returns. A frontier planner selects a reachable
+   unexplored boundary, rewards wider approaches, plans around inflated obstacles,
+   adds a graded cost near those obstacles, and supplies a
+   persistent look-ahead route. The cached route advances its waypoint every
+   control cycle instead of waiting for the next full replan. When all current
+   frontiers are exhausted, it patrols the least-visited reachable mapped space.
+4. The LD19 begins a direction-locked forward arc when the straight inflated
+   corridor drops below 1.25 m. Steering can use up to a 28-PWM wheel split,
+   both motors stay above the loaded-wheel stall region, and steering changes
+   are slew-limited. A very-high-confidence close return is retained even when
+   a thin obstacle occupies only one angular bin; weaker isolated speckle is ignored.
+   The frontier heading only biases among currently safe full-body corridors.
+5. While the straight path is safely clear, the controller follows open
+   corridors as continuous differential arcs. If the straight body corridor
+   reaches 40 cm, it pivots toward the best broad opening instead of continuing
+   closer. If every candidate corridor is below 38 cm, or the Pi ultrasonic
+   reading is below 26 cm, it runs a finite recovery sequence:
+   a short LiDAR-cleared reverse curve with
+   both wheels driven, a slow one-wheel reverse turn toward the best full
+   body-width LiDAR corridor, then a short forward commit and immediate return
+   to live corridor planning. Which side counts as "open" for that turn is
+   scored with the same windowed body-width minimum used for forward path
+   selection rather than the single farthest ray in the sweep, so one lucky
+   LiDAR return narrower than the chassis can no longer look like a viable
+   escape direction. A calibrated USB LSM6DS3 releases the turn after
+   measured yaw reaches the clear corridor and hard-limits each turn to
+   88 degrees; a 2.4-second bound applies if IMU yaw is unavailable. It may try
+   the opposite side once. It stops as `STOP:BOXED_IN` when neither bounded
+   attempt has a safe side/rear path, and automatically rechecks materially
+   changed geometry. Rear safety is a robot-width swept corridor rather than
+   the closest point in a broad rear sector. When that corridor is clear but
+   both sides are ambiguous, one short straight reverse search obtains a new
+   view before declaring itself boxed in. If reversing is blocked but one
+   complete turn sweep has at least 34 cm clearance, it begins the same bounded
+   low-PWM centre pivot directly instead of giving up despite that opening.
+   The 38/40 cm
+   thresholds initiate manoeuvring; they do not mark every surrounding return
+   as boxed-in, and the narrower 30 cm escape-corridor threshold remains
+   available during recovery.
+6. Uno ultrasonic hard-stop (under 18 cm) always wins and blocks forward
+   motor commands even if the Pi fails.
+7. A live, calibrated USB LSM6DS3 supplies measured yaw rate
+   and integrated yaw change to the local mapper
+   and recovery controller, and progressively removes steering split above
+   38 deg/s, reaching zero additional split at 55 deg/s. If the IMU is absent
+   or stale, navigation continues with command-predicted yaw corrected by
+   successive LD19 scans. Recovery turns use that corrected pose heading when
+   available, retaining the same 2.4-second hard timeout as the final bound.
+8. A stuck detector runs alongside the corridor/escape logic above. It has no
+   way to see the floor, so it infers "is the chassis actually responding" from
+   independent evidence instead: LD19 scan-to-obstacle progress against a
+   nearby tracked return, camera optical flow while translating, measured IMU
+   yaw rate while pivoting, and the Uno's own `blocked` flag. Each source only
+   ever votes that the chassis is or is not moving when it has a genuinely
+   fresh, currently-applicable signal; otherwise it abstains, and abstention
+   alone never counts as evidence of being stuck. A declaration requires two
+   independent `NOT_MOVING` sources with no `MOVING` vote. In particular, an
+   LD19 result is counted only once per newly captured scan, never once per
+   fast control-loop iteration. If a commanded drive keeps failing this test,
+   it tries a different LiDAR-checked maneuver (the opposite turn side, a
+   reverse, or a center pivot) instead of repeating the command that is not
+   working. After three maneuvers it pauses as `STOP:STUCK_*_RETRYING` for
+   three seconds, then starts another bounded, LiDAR-checked recovery burst.
+   This avoids both continuous grinding and the previous unexplained
+   25-second no-action latch. IMU vibration still distinguishes slipping from
+   stalled only for the operator; it never gates detection or recovery.
+
+This keeps roles separate: LD19 geometry chooses an open direction, the camera
+supplies only bounded optical-flow pose cues, and the Uno enforces the final
+close-range stop. Camera output never overrides measured LiDAR or ultrasonic
+safety.
+
+The motor battery in the described 9 V-style holder is not adequate for
+autonomous testing: voltage sag can still cause buzzing, stuttering, or a
+controller reset regardless of this software. Replace it with the kit's rated
+7.4 V 2x18650 pack or a 6xAA NiMH pack before testing this runtime on the floor.
+
+The runtime no longer translates steering into legacy `L`/`R` commands while
+waiting for `CAPS DRIVE`; those commands are fast counter-rotating pivots. It
+holds STOP unless the dashboard reports `UNO DIFFERENTIAL`. The Pi retries the
+capability request every 0.5 seconds until it receives that exact response.
+The full-screen LiDAR-only dashboard shows commanded PWM, Uno-reported actual PWM, the Uno
+ultrasonic `blocked` flag, `IMU LSM6DS3 USB CALIBRATING/LIVE/STALE`, frontier/patrol
+mode, target bearing/range, frontier count, observed-map coverage, and latest
+planner time. It also reports IMU motion/vibration magnitude and camera-flow
+confidence. The `POLICY` line reports `STUCK_RECOVER_<maneuver>:<attempt>` while
+the stuck detector is trying an alternate maneuver, and `STOP:STUCK_*_RETRYING`
+during its three-second safe pause; the log's `NAV`/`NAV_EVENT` lines carry
+the same information plus a per-source `M`/`N`/`U` (moving/not-moving/unknown)
+breakdown for diagnosing which evidence source triggered it. The occupancy grid uses
+about 2.1 cm cells, up to 240 current-scan free-space rays, and useful LD19
+returns up to 5.8 m where map bounds permit. These software changes do not
+increase the LD19's physical range or create true odometry.
+
+Camera startup defaults to `auto`. The runtime tries stable V4L by-id paths and
+camera indexes 0 through 7. When a USB IMU is connected, webcam capture is
+deferred until IMU calibration completes. The runtime allows five seconds to
+confirm that no IMU is present before starting the webcam in non-IMU mode. A
+detected but unfinished IMU does not use that fallback. This keeps webcam
+streaming and optical flow from competing with MCP2221 calibration on the Pi 3B.
+Optical flow is skipped while both motors are stopped. If no
+webcam currently delivers frames, the LiDAR
+dashboard remains open in `CAMERA STALE` safe-STOP mode and retries instead of
+terminating the complete robot runtime. A reopened camera gets a fresh two-second
+startup window; an old frame timestamp cannot force it back into a permanent
+reconnect loop. Optical-flow pose assistance assumes the
+webcam is rigidly mounted and faces forward; low-confidence flow is ignored.
+
+`run_robot.sh` holds a process lock before opening USB devices. This prevents
+XDG and compositor autostart entries from launching two robot processes that
+compete for the same webcam and serial ports. Linux V4L device paths are opened
+directly through the V4L2 backend rather than GStreamer. Robot-mode capture is
+320x240 at 15 FPS. Optical flow uses a 160x120 grayscale copy and the camera
+image is not displayed; this limits Pi 3B USB, display, and CPU pressure.
+
+### Automatic USB LSM6DS3 yaw sensing
+
+The preferred IMU path is:
+
+```text
+LSM6DS3 STEMMA QT -> MCP2221A I2C -> MCP2221A USB-C -> Pi USB-A
+```
+
+The installed orientation is specifically: component side up, with the left
+STEMMA connector and `SCX`/`SDX` end shown in the supplied photo facing the
+robot's front. In that position the breakout's printed `+X` points rearward and
+its printed `+Y` points toward the robot's right. The runtime's existing 180
+degree yaw transform converts those into robot `+X` forward and `+Y` left while
+leaving `+Z` upward. The board must remain rigid and flat.
+
+The normal updater installs
+the Linux prerequisites and Python USB transport, writes persistent MCP2221A
+USB permissions, and prevents the optional kernel MCP2221 driver from competing
+with the userspace transport. That system setup is recorded once and skipped on
+later updates. Every robot boot still opens and validates the sensor because an
+IMU cannot remain open across a power cycle.
+
+At startup the runtime automatically checks both normal LSM6DS3 I2C addresses,
+`0x6A` and `0x6B`, accepts the sensor only when its identity register returns
+`0x6A` for the installed LSM6DS3TR-C, and verifies every critical configuration
+register after writing it.
+The sampler ignores cycles without both new gyro and accelerometer data, uses
+the datasheet's 256 LSB/degree C temperature conversion, performs trimmed-mean
+stationary calibration, and slowly tracks gyro bias only during confirmed
+stationary periods. Handling jolts and commanded motion pause unfinished
+calibration without deleting already collected still samples. IMU reads run on
+a dedicated 50 Hz sampler thread, independent of camera, display, and planner
+latency. The USB LSM6DS3 needs 40 accepted samples, approximately 0.8 seconds
+at that sampler rate. Acceptance uses total acceleration magnitude and a broad
+handling-rate bound; it does not require the board to be perfectly level or
+reject a stable zero-rate bias merely because that is the bias being measured.
+Final validation uses trimmed gyro variance so isolated edge samples cannot
+poison the whole window. A rejected aggregate window advances as a rolling
+still-sample window rather than clearing to zero. If webcam insertion briefly resets the MCP2221,
+the USB LSM6DS3 remains the selected calibration source and retains its partial
+progress while reconnecting. A dashboard `HOLD` suffix identifies motion,
+rejected samples, missing fresh data, or an unstable window. No manual
+`modprobe`, I2C scan, or launch command is required. During the
+25-second stationary standby, the dashboard should change from
+`IMU LSM6DS3 USB CALIBRATING` to `IMU LSM6DS3 USB LIVE`.
+
+v1.9.13 makes a temporary calibration pause diagnosable: the dashboard and
+`pi3b/logs/robot.log` now show the active gate (`MOTION`, `SAMPLE`, `WAIT DATA`,
+or `UNSTABLE`), acceleration magnitude, and peak gyro rate once per second.
+This is diagnostics only; it does not change calibration thresholds or motor
+authority.
+
+v1.9.14 improves live safety behavior without relaxing any safety gate: it
+expires LD19 points on a bounded current-scan history, evaluates clearance
+through the headings a moving arc actually sweeps, and requires corroborated
+fresh evidence before declaring the chassis stuck. A failed recovery now uses
+a short visible retry pause instead of a long, unexplained latch.
+
+### USB LSM6DS3 mounting
+
+The USB LSM6DS3 through the MCP2221A USB-I2C adapter is the only supported
+IMU configuration. A missing or disconnected LSM6DS3 goes straight to the
+existing, fully supported `LD19+COMMAND POSE ACTIVE` non-IMU mode after the
+probe interval.
+
+The installed board is flat with components up and rotated 180 degrees from
+the robot frame: its pin-header edge faces forward and its `LSM6DS3` text
+edge faces rearward. The runtime therefore defaults to
+`--imu-mount-yaw-deg 180`, which reverses sensor X/Y while retaining Z. Override
+only if the physical mount changes:
+
+```bash
+export VISIONFSD_IMU_MOUNT_YAW_DEG=180
+```
+
+The first stationary seconds of the existing 25-second standby calibrate gyro
+bias. Calibration rejects samples with excessive motion and pauses rather than
+resetting valid progress. Missing IMU hardware never creates a no-motion boot
+failure. A v1.9.10 attempt to tighten the aggregate stationary-calibration
+acceptance bar based on the LSM6DS3's datasheet noise specs was reverted in
+v1.9.11: physical testing showed `IMU CALIBRATING` stalling short of 100%
+indefinitely, because the real sensor's noise did not reliably fit inside the
+tighter bar. Do not retighten this without hardware-in-the-loop verification.
+
+The gyro improves short-term turn measurement and smooths excessive yaw. Its
+accelerometer is not integrated into position because chassis vibration,
+gravity error, and the front/side mounting offset would create rapid drift.
+The LSM6DS3 has no magnetometer, so it does not provide absolute heading.
+
+### LiDAR + IMU exploration map
+
+The LD19-only panel keeps an 8 m occupancy map at about 2.1 cm per cell. Its
+6 m display viewport follows the estimated chassis position and keeps the robot
+marker centred. The underlying grid is a fixed-size sliding window, not a
+buffer anchored at the start position: once the estimated pose approaches
+the edge of the 8 m buffer, the grid recenters around the robot (shifting its
+contents and blanking the band that scrolled in from the far side) rather than
+pinning the pose at the boundary. Earlier versions clamped position at that
+boundary instead, which froze the dead-reckoned pose while the robot kept
+moving physically -- every new scan then projected onto that stale position,
+so the map stopped updating and the display showed a growing region that was
+never drawn. The trade-off of the sliding window is that ground the robot
+already covered can scroll out of the buffer on a long one-direction traverse,
+so `coverage_ratio` and the least-visited patrol mode are relative to the
+current window, not a persistent record of the whole session. Every valid
+scan marks both obstacle endpoints and the observed free ray leading to each
+endpoint. Repeated free observations clear stale hit evidence; persistent hits
+remain obstacles. Bright current-scan points remain distinct from mapped
+history, while dark known-free cells are distinguishable from unknown space.
+Metre range rings make nearby geometry easier to read.
+
+The frontier explorer inflates obstacles by the robot body plus a 7.5 cm lateral
+safety margin, finds the free-space component connected to the robot, clusters
+reachable free/unknown boundaries, and runs bounded A* to the selected target.
+Frontier utility rewards obstacle clearance, while a graded A* traversal cost
+prefers the middle of available space without converting narrow free passages
+into blocked cells. Target scoring also penalizes total path length and excess
+detour length so a slightly larger distant frontier does not override a clear,
+efficient nearby opening. It guides
+the local planner along a cached look-ahead route whose waypoint advances every
+control cycle. If map inflation temporarily places the estimated pose just
+outside free space, planning reconnects to nearby known free space while live
+LiDAR remains authoritative. If no reachable frontier remains, it patrols
+low-visit mapped cells to expose missed openings. Full replans run every 0.6
+seconds with a 45 ms A* budget. The current motor decision is sent before that
+advisory search, and a timed-out replan retains the last safe route rather than
+pausing the robot or dropping the Uno's 350 ms watchdog.
+
+The navigation design follows established local-navigation principles: broad
+polar openings rather than single range rays, dynamically safe progress and
+clearance objectives, reachable free/unknown frontiers, and graded obstacle
+costs. Reference material:
+
+- [Vector Field Histogram](https://public.websites.umich.edu/~ykoren/uploads/The_Vector_Field_HistogramuFast_Obstacle_Avoidance.pdf)
+- [Dynamic Window Approach](https://rse-lab.cs.washington.edu/abstracts/colli-ieee.abstract.html)
+- [Frontier-Based Exploration](https://www.cs.cmu.edu/~motionplanning/papers/sbp_papers/integrated2/yamauchi_frontier_explor.pdf)
+- [Nav2 cost-aware planning](https://docs.ros.org/en/ros2_packages/humble/api/nav2_theta_star_planner/)
+- [ST MotionGC gyroscope calibration](https://www.st.com/resource/en/user_manual/dm00372763-getting-started-with-motiongc-gyroscope-calibration-library-in-xcubemems1-expansion-for-stm32cube-stmicroelectronics.pdf)
+
+A heading correction is applied only when successive 360-bin LD19 scans have
+enough non-ambiguous support. Between accepted matches, a live USB LSM6DS3 supplies
+measured yaw rate and its asynchronously integrated yaw change; if it is
+unavailable, the mapper uses conservative
+commanded-motion prediction. Bounded scan-to-map correlation also corrects
+small translation errors when a moving scan uniquely agrees with established
+obstacle geometry.
+
+The dashboard's IMU `MOTION` value is filtered deviation from one-g total
+acceleration. It exposes handling, vibration, or wheel-slip symptoms but is not
+integrated into position. Without encoders or an external position reference,
+accelerometer integration would drift too rapidly to improve this chassis map.
+
+The estimated map supplies exploration intent, not safety permission. Current
+LD19 body-width corridors remain the range authority for steering, and the Uno
+ultrasonic remains the final forward hard stop. Without wheel encoders, loop
+closure, or an absolute position reference, this is not true metric SLAM and
+cannot guarantee complete coverage or recovery from accumulated pose drift.
+
+All mapping and exploration features remain enabled without either IMU:
+free/occupied/unknown mapping, translation correlation, frontier detection,
+inflated-grid A*, persistent waypoints, patrol, live-corridor overrides, and
+reverse/turn/replan recovery. The degraded yaw source is shown as
+`COMMAND+LD19`; it is less accurate during feature-poor or rapidly changing
+scenes than live IMU yaw, but it does not disable autonomous movement.
+
+The LD19's 0-degree direction must physically point forward. If your mount is
+rotated, set its correction before launching, for example:
+
+```bash
+export VISIONFSD_LIDAR_FRONT_OFFSET_DEG=90
+```
+
+Use `-90`, `90`, or `180` only when that matches the actual mounting rotation;
+the dashboard's `F`, `FL`, and `FR` readings make a wrong orientation visible.
+
+### Boot automatically
+
+The default installer creates this Pi Desktop autostart file:
+
+```text
+~/.config/autostart/visionfsd-robot.desktop
+```
+
+With Raspberry Pi OS **Desktop** configured to auto-login, connecting power
+starts the visual robot runtime after the graphical desktop appears; it still
+holds STOP for 25 seconds. Before that, `run_robot.sh` runs a bounded
+auto-update check (see "Automatic updates on boot" above) so a fresh boot
+picks up the latest installed release without a manual `update.sh` run. Use
+`--no-robot-autostart` with `install.sh` if you do not want autostart at all.
+Raspberry Pi OS Lite has no graphical autostart session, so it needs a
+separate headless service and does not show the visualizer.
+
+On the standard Pi Desktop Wayland session, the launcher selects Qt's XWayland
+backend and reapplies fullscreen during the first rendered frames. This avoids
+the small 640-pixel OpenCV window and makes the LiDAR dashboard occupy the
+connected display. Set `QT_QPA_PLATFORM` manually only when using a different
+custom desktop backend.
+
+The launcher discovers the Uno by its exact `2341:0043` USB identity and the
+LD19 adapter by its exact CP210x `10C4:EA60` identity. It does not hardcode
+`/dev/ttyACM0`, because Linux may assign a different ACM number after a USB
+reset. If an active Uno port returns a serial I/O error, the runtime keeps the
+motors stopped, rediscovers the current node, waits for the Uno reset, and
+repeats `CAPS` before differential motion can resume. The dashboard remains
+running during this recovery. `VISIONFSD_ARDUINO_PORT` and
+`VISIONFSD_LIDAR_PORT` remain optional manual overrides for other hardware.
+
+The short normal update command is:
+
+```bash
+bash ~/visionfsd-pi/pi3b/update.sh codex/pi3b-runtime
+```
+
+It preserves the Pi release branch, updates only the sparse Pi checkout, and
+does not download Windows/CAD files.
 
 ## Run from this checkout
 
