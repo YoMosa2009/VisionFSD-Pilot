@@ -100,7 +100,15 @@ class FrontierExplorer:
         length = max(abs(goal[0] - start[0]), abs(goal[1] - start[1])) + 1
         rows = np.rint(np.linspace(start[0], goal[0], length)).astype(np.int32)
         cols = np.rint(np.linspace(start[1], goal[1], length)).astype(np.int32)
-        return bool(np.all(free[rows, cols]))
+        if not np.all(free[rows, cols]):
+            return False
+        # Match A*'s no-corner-cut rule when smoothing the route. A diagonal
+        # shortcut touches both neighbouring cells, not just its centre line.
+        diagonal = (rows[1:] != rows[:-1]) & (cols[1:] != cols[:-1])
+        return bool(
+            np.all(free[rows[:-1][diagonal], cols[1:][diagonal]])
+            and np.all(free[rows[1:][diagonal], cols[:-1][diagonal]])
+        )
 
     @classmethod
     def _astar(
@@ -335,6 +343,15 @@ class FrontierExplorer:
     ) -> tuple[int, int] | None:
         if not path:
             return None
+        if not free[robot]:
+            # Preserve bounded reconnection for an approximate pose inside
+            # map inflation. Live LD19 remains the physical motion authority.
+            anchor = cls._nearest_free_cell(
+                free, robot, max(1, int(math.ceil(cls.ROBOT_RECONNECT_M * scale)))
+            )
+            if anchor is None:
+                return None
+            robot = anchor
         distances_sq = np.fromiter(
             (
                 (cell[0] - robot[0]) ** 2 + (cell[1] - robot[1]) ** 2
@@ -353,8 +370,10 @@ class FrontierExplorer:
             if cls._line_is_clear(free, robot, cell):
                 waypoint = cell
         if waypoint == path[closest] and closest + 1 < len(path):
-            waypoint = path[closest + 1]
-        return waypoint
+            candidate = path[closest + 1]
+            if cls._line_is_clear(free, robot, candidate):
+                waypoint = candidate
+        return waypoint if cls._line_is_clear(free, robot, waypoint) else None
 
     def _state(
         self,

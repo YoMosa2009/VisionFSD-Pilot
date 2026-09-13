@@ -8,7 +8,7 @@ magnetometer and the chassis has no wheel encoders.  Non-IMU navigation
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 import os
 import statistics
@@ -43,6 +43,8 @@ class IMUState:
     error: str | None = None
     source: str = "NONE"
     calibration_hold: str = ""
+    sample_interval_s: float = 0.0
+    sample_gaps: int = 0
 
 
 class _MCP2221Bus:
@@ -152,6 +154,8 @@ class LSM6DS3MCP2221Link:
         self._filtered_gyro = (0.0, 0.0, 0.0)
         self._temperature_c = 0.0
         self._yaw_deg = 0.0
+        self._sample_interval_s = 0.0
+        self._sample_gaps = 0
 
     @classmethod
     def _decode_block(
@@ -372,7 +376,14 @@ class LSM6DS3MCP2221Link:
             self._stationary_bias_samples = 0
 
         previous_filtered = self._filtered_gyro
-        elapsed = min(0.10, max(0.0, now - previous_at)) if previous_at > 0.0 else 0.0
+        elapsed = max(0.0, now - previous_at) if previous_at > 0.0 else 0.0
+        self._sample_interval_s = elapsed
+        if elapsed > self.MAX_SAMPLE_AGE_S:
+            # There is no measured yaw history inside a USB outage. Resume
+            # from the new rate without extrapolating across the missing time.
+            self._sample_gaps += 1
+            elapsed = 0.0
+            previous_filtered = bias_delta
         alpha = (
             min(0.85, max(0.10, 1.0 - math.exp(-2.0 * math.pi * self.FILTER_CUTOFF_HZ * elapsed)))
             if elapsed > 0.0
@@ -415,6 +426,8 @@ class LSM6DS3MCP2221Link:
             error=self._error,
             source=self.SENSOR_NAME,
             calibration_hold=self._calibration_hold,
+            sample_interval_s=self._sample_interval_s,
+            sample_gaps=self._sample_gaps,
         )
 
     def close(self) -> None:
@@ -454,16 +467,23 @@ class AsyncIMULink:
                 state = IMUState(error=f"IMU sampler error: {exc}", source=LSM6DS3MCP2221Link.SENSOR_NAME)
             with self._lock:
                 self._state = state
-            self._stop.wait(self._sample_period_s)
+            self._stop.wait(max(0.0, self._sample_period_s - (time.monotonic() - now)))
 
     def tick(self, _now: float | None = None, stationary: bool = True) -> IMUState:
         with self._lock:
             self._stationary = stationary
-            return self._state
+        return self.state(_now)
 
     def state(self, _now: float | None = None) -> IMUState:
+        now = time.monotonic() if _now is None else _now
         with self._lock:
-            return self._state
+            state = self._state
+        # Age completed measurements even when a USB read blocks the sampler.
+        return replace(
+            state,
+            fresh=(state.fresh and state.connected
+                   and now - state.updated_at <= LSM6DS3MCP2221Link.MAX_SAMPLE_AGE_S),
+        )
 
     def close(self) -> None:
         self._stop.set()

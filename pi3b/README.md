@@ -304,7 +304,7 @@ move during that interval. Afterwards its authority order is fixed:
 8. A stuck detector runs alongside the corridor/escape logic above. It has no
    way to see the floor, so it infers "is the chassis actually responding" from
    independent evidence instead: LD19 scan-to-obstacle progress against a
-   nearby tracked return, camera optical flow while translating, measured IMU
+   nearby tracked return, camera optical flow while translating or pivoting, measured IMU
    yaw rate while pivoting, and the Uno's own `blocked` flag. Each source only
    ever votes that the chassis is or is not moving when it has a genuinely
    fresh, currently-applicable signal; otherwise it abstains, and abstention
@@ -425,6 +425,41 @@ expires LD19 points on a bounded current-scan history, evaluates clearance
 through the headings a moving arc actually sweeps, and requires corroborated
 fresh evidence before declaring the chassis stuck. A failed recovery now uses
 a short visible retry pause instead of a long, unexplained latch.
+
+v1.9.15 fixes a serial race that could transmit an expired STOP after a newer
+DRIVE. Command selection and transmission now share one ordering lock; the
+0.50-second Pi lease and 350 ms Uno watchdog remain unchanged. NAV logs include
+`control_gap_ms`, `lease_stops`, and `uno_timeouts` to separate planner latency
+from Uno watchdog stops. Unconsumed serial lines no longer accumulate in an
+unbounded queue.
+
+Stuck evidence now refers to the previously applied output, rejects camera flow
+older than 450 ms, and lets a stationary camera corroborate a stalled IMU pivot.
+A failed reverse selects another available maneuver; each recovery burst avoids
+repeating already tried maneuvers. Observed motion lets a bounded maneuver finish
+rather than immediately switching back to the failed route. Every cycle retains
+live safety checks, including side clearance during reverse arcs. A robot with
+insufficient trustworthy motion evidence can still fail to detect a stall.
+
+Map guidance toward marginal corridors is reduced in favor of broad live LD19
+openings. Waypoint shortcuts follow A*'s no-corner-cut rule, and a waypoint fallback
+cannot cross a blocked route. Bounded reconnection from an approximate pose inside
+map inflation remains advisory and subject to live LD19 clearance.
+
+The USB IMU wrapper expires cached measurements independently of the sampling
+thread. Integration uses actual sample intervals while fresh and skips missing
+yaw history across gaps longer than 250 ms. Sampling accounts for USB read time
+instead of adding a fixed sleep after every read. `imu_age_ms`, `imu_dt_ms`, and
+`imu_gaps` expose freshness and timing in NAV logs. Mount correction, calibration
+acceptance thresholds, non-IMU fallback, and the camera startup gate are preserved.
+These changes do not provide position from acceleration or absolute heading.
+
+Software regression tests cover these changes; physical Pi driving, collision
+avoidance, carpet recovery, USB timing and motor-battery performance remain
+unverified. Software cannot compensate for a motor battery that sags under load.
+For the next supervised boot test, confirm dashboard v1.9.15 and live sensors,
+then compare uninterrupted driving, a blocked reverse with a clear side, a stalled
+pivot, and route choice around offset obstacles. Keep the resulting NAV log.
 
 ### USB LSM6DS3 mounting
 

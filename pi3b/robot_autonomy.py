@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import argparse
 import math
-import queue
 import signal
 import sys
 import threading
@@ -382,7 +381,8 @@ class ArduinoLink:
     def __init__(self, port: str) -> None:
         self._port = port
         self._serial = None
-        self._lines: queue.Queue[str] = queue.Queue()
+        self.drive_lease_expirations = 0
+        self.uno_watchdog_stops = 0
         self._running = True
         self._write_lock = threading.Lock()
         self._drive_lock = threading.Lock()
@@ -492,7 +492,8 @@ class ArduinoLink:
                 self._status = self._parse_status(line, time.monotonic())
             elif line == "CAPS DRIVE":
                 self._supports_differential = True
-            self._lines.put(line)
+            elif line == "STOP:COMMAND_TIMEOUT":
+                self.uno_watchdog_stops += 1
 
     def _write(self, command: str) -> bool:
         with self._write_lock:
@@ -516,9 +517,9 @@ class ArduinoLink:
         hangs.  While the loop remains healthy, this thread prevents display,
         camera, or route-planning jitter from tripping the Uno dead-man timer.
         """
-        now = time.monotonic()
         command = f"DRIVE {left_pwm} {right_pwm}"
         with self._drive_lock:
+            now = time.monotonic()
             changed = command != self._drive_command
             self._drive_command = command
             self._drive_lease_until = now + UNO_CONTROL_LEASE_S
@@ -526,27 +527,31 @@ class ArduinoLink:
             due = changed or now - self._drive_last_write >= UNO_HEARTBEAT_S
             if due:
                 self._drive_last_write = now
-        if due:
-            self._write(command)
+                self._write(command)
 
     def _heartbeat_loop(self) -> None:
         while self._running:
-            command = self._heartbeat_command(time.monotonic())
-            if command is not None:
-                self._write(command)
+            self._heartbeat_command(time.monotonic(), transmit=True)
             time.sleep(UNO_HEARTBEAT_S / 3.0)
 
-    def _heartbeat_command(self, now: float) -> str | None:
+    def _heartbeat_command(self, now: float, transmit: bool = False) -> str | None:
         command: str | None = None
         with self._drive_lock:
+            if transmit:
+                now = time.monotonic()
             if now <= self._drive_lease_until:
                 if now - self._drive_last_write >= UNO_HEARTBEAT_S:
                     command = self._drive_command
                     self._drive_last_write = now
             elif not self._drive_expired:
                 command = "STOP"
+                self.drive_lease_expirations = getattr(self, "drive_lease_expirations", 0) + 1
                 self._drive_expired = True
                 self._drive_last_write = now
+            # Selection and serial transmission must stay ordered with publish:
+            # an expired STOP must not arrive after a newer valid DRIVE.
+            if transmit and command is not None:
+                self._write(command)
         return command
 
     def status(self) -> ArduinoStatus:
@@ -992,6 +997,8 @@ class AutonomousPolicy:
         self._stuck_phase_until = 0.0
         self._stuck_maneuver: str | None = None
         self._stuck_recovery_attempts = 0
+        self._stuck_tried_maneuvers: set[str] = set()
+        self._stuck_recovery_moved = False
         self._stuck_window_start: float | None = None
         self._stuck_not_moving_ticks = 0
         self._stuck_latched_reason = "STOP:STUCK_NEEDS_RESET"
@@ -1528,7 +1535,12 @@ class AutonomousPolicy:
                 float(STEER_HEADINGS[-1]),
             ))
             goal_error = np.abs(STEER_HEADINGS - exploration_heading)
-            score += np.clip(1.0 - goal_error / 90.0, 0.0, 1.0) * 0.82
+            guidance_clearance = np.clip(
+                (opening - MIN_DRIVE_CORRIDOR_M)
+                / (FORWARD_PREFERENCE_CLEARANCE_M - MIN_DRIVE_CORRIDOR_M), 0.0, 1.0
+            )
+            score += (np.clip(1.0 - goal_error / 90.0, 0.0, 1.0)
+                      * 0.82 * guidance_clearance)
         usable = opening >= MIN_DRIVE_CORRIDOR_M
         if not np.any(usable):
             return None
@@ -1799,6 +1811,7 @@ class AutonomousPolicy:
         arduino: ArduinoStatus,
         now: float,
         camera_motion: CameraMotionState | None,
+        applied_output: tuple[int, int] | None = None,
     ) -> dict[str, str]:
         """Vote MOVING/NOT_MOVING/UNKNOWN per independent evidence source.
 
@@ -1806,23 +1819,26 @@ class AutonomousPolicy:
         currently-applicable signal; UNKNOWN never counts as evidence of
         being stuck, only silence.
         """
-        left_pwm, right_pwm = self.left_pwm, self.right_pwm
+        left_pwm, right_pwm = (
+            (self.left_pwm, self.right_pwm) if applied_output is None else applied_output
+        )
         votes: dict[str, str] = {}
 
         translating = (
             (left_pwm > 0 and right_pwm > 0) or (left_pwm < 0 and right_pwm < 0)
         )
+        turning = abs(left_pwm - right_pwm) >= STUCK_TURN_COMMAND_MIN_SPLIT
         if (
-            translating
+            (translating or turning)
             and camera_motion is not None
             and camera_motion.fresh
+            and 0.0 <= now - camera_motion.captured_at <= 0.45
             and camera_motion.confidence >= STUCK_CAMERA_CONFIDENCE_MIN
         ):
             votes["camera"] = "MOVING" if camera_motion.motion_observed else "NOT_MOVING"
         else:
             votes["camera"] = "UNKNOWN"
 
-        turning = abs(left_pwm - right_pwm) >= STUCK_TURN_COMMAND_MIN_SPLIT
         if turning and self.imu_yaw_rate_dps is not None:
             votes["imu"] = (
                 "MOVING"
@@ -1894,7 +1910,8 @@ class AutonomousPolicy:
             return self._pivot_crawl(direction)
         if maneuver in ("REVERSE_ARC_L", "REVERSE_ARC_R"):
             direction = "L" if maneuver == "REVERSE_ARC_L" else "R"
-            if lidar.rear_m is None or lidar.rear_m < ESCAPE_REAR_CLEARANCE_M:
+            if (lidar.rear_m is None or lidar.rear_m < ESCAPE_REAR_CLEARANCE_M
+                    or not self._can_turn_without_reverse(lidar, direction)):
                 return None
             return self._reverse_arc(direction)
         return None
@@ -1915,11 +1932,19 @@ class AutonomousPolicy:
         # false; let stuck-recovery own the drive output instead of leaving
         # stale escape timers to fight it once cleared.
         self._reset_escape()
+        if self._stuck_recovery_attempts == 0:
+            self._stuck_tried_maneuvers.clear()
+            # Do not retry the same reverse that the sensors just disproved.
+            if self.left_pwm < 0 and self.right_pwm < 0:
+                self._stuck_tried_maneuvers.add("REVERSE")
         self._stuck_recovery_attempts += 1
-        candidates = self._stuck_candidate_maneuvers(lidar)
+        candidates = [maneuver for maneuver in self._stuck_candidate_maneuvers(lidar)
+                      if maneuver not in self._stuck_tried_maneuvers]
         if self._stuck_recovery_attempts > STUCK_MAX_RECOVERY_ATTEMPTS or not candidates:
             return self._latch_stuck(now)
-        maneuver = candidates[(self._stuck_recovery_attempts - 1) % len(candidates)]
+        maneuver = candidates[0]
+        self._stuck_tried_maneuvers.add(maneuver)
+        self._stuck_recovery_moved = False
         command = self._drive_stuck_maneuver(maneuver, lidar)
         if command is None:
             return self._latch_stuck(now)
@@ -1952,7 +1977,7 @@ class AutonomousPolicy:
             self._stuck_recovery_attempts = 0
             retry_recovery = re_armed
 
-        votes = self._motion_evidence(lidar, arduino, now, camera_motion)
+        votes = self._motion_evidence(lidar, arduino, now, camera_motion, previous_output)
         self.stuck_votes = votes
         if "MOVING" in votes.values():
             verdict = "MOVING"
@@ -1961,7 +1986,11 @@ class AutonomousPolicy:
         else:
             verdict = "UNKNOWN"
 
-        if verdict == "MOVING":
+        if verdict == "MOVING" and self._stuck_phase == "RECOVER":
+            # A single successful reverse/pivot tick is not enough clearance
+            # to restart the failed forward route. Finish the bounded action.
+            self._stuck_recovery_moved = True
+        if verdict == "MOVING" and self._stuck_phase != "RECOVER":
             self._stuck_window_start = None
             self._stuck_not_moving_ticks = 0
             self._stuck_phase = "IDLE"
@@ -1990,6 +2019,7 @@ class AutonomousPolicy:
             return self._advance_stuck_recovery(lidar, now)
 
         if self._stuck_phase == "RECOVER":
+            planned_output = (self.left_pwm, self.right_pwm)
             self.left_pwm, self.right_pwm = previous_output
             if now < self._stuck_phase_until:
                 maneuver_command = self._drive_stuck_maneuver(self._stuck_maneuver, lidar)
@@ -2000,6 +2030,14 @@ class AutonomousPolicy:
                     self.reason = f"STUCK_RECOVER_{self._stuck_maneuver}:{self._stuck_recovery_attempts}"
                     self.stuck_phase = self._stuck_phase
                     return maneuver_command
+            if self._stuck_recovery_moved:
+                self._stuck_phase = "IDLE"
+                self._stuck_recovery_attempts = 0
+                self.stuck_phase = "IDLE"
+                # Restore this tick's planner output, not the last recovery
+                # output restored above for ramp continuity.
+                self.left_pwm, self.right_pwm = planned_output
+                return command
             return self._advance_stuck_recovery(lidar, now)
 
         commanding = self.left_pwm != 0 or self.right_pwm != 0
@@ -2235,6 +2273,7 @@ def main() -> int:
     # first rendered frames so the request is not lost before the window maps.
     fullscreen_refreshes = 12
     next_telemetry_at = 0.0
+    last_control_at = 0.0
     last_policy_state: tuple[str, str, str] | None = None
     last_recenter_count = slam_lite.recenter_count
     last_imu_error: str | None = None
@@ -2343,6 +2382,8 @@ def main() -> int:
             # advisory global planner runs.  A bounded but non-trivial A* search
             # must never turn route computation into periodic motor dropouts.
             control_now = time.monotonic()
+            control_gap_ms = 0.0 if last_control_at == 0.0 else (control_now - last_control_at) * 1000.0
+            last_control_at = control_now
             command = policy.decide(
                 clearance,
                 status,
@@ -2398,12 +2439,18 @@ def main() -> int:
                     f"drive_caps={int(arduino.differential_ready)} "
                     f"imu={int(imu_state.fresh)} imu_cal={int(imu_state.calibrated)} "
                     f"gyro_z={imu_state.gyro_z_dps:+.1f} "
+                    f"imu_age_ms={max(0.0, control_now - imu_state.updated_at) * 1000.0:.0f} "
+                    f"imu_dt_ms={imu_state.sample_interval_s * 1000.0:.0f} "
+                    f"imu_gaps={imu_state.sample_gaps} "
                     f"pose_yaw={slam_lite.yaw_source} "
                     f"cam_flow={camera_motion.confidence:.2f} "
                     f"explore={exploration.mode} "
                     f"target_m={exploration.target_distance_m:.2f} "
                     f"bearing={exploration.heading_error_deg:+.0f} "
                     f"plan_ms={exploration.planning_ms:.1f} "
+                    f"control_gap_ms={control_gap_ms:.0f} "
+                    f"lease_stops={arduino.drive_lease_expirations} "
+                    f"uno_timeouts={arduino.uno_watchdog_stops} "
                     f"stuck={policy.stuck_phase}[{stuck_votes}] "
                     f"recenter={slam_lite.recenter_count}"
                 )

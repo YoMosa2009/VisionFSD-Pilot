@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 import pathlib
 import sys
 import threading
@@ -1180,7 +1181,7 @@ class StuckDetectionTests(unittest.TestCase):
         for index in range(60):
             tick_now = now + index * 0.05
             policy.decide(
-                clear, self._status(tick_now), False, tick_now, True, True, stalled_camera
+                clear, self._status(tick_now), False, tick_now, True, True, replace(stalled_camera, captured_at=tick_now)
             )
         self.assertEqual(policy.stuck_phase, "IDLE")
 
@@ -1195,7 +1196,7 @@ class StuckDetectionTests(unittest.TestCase):
                 0.50, 2.0, 2.0, True, 2.0, 2.0, scan_at=tick_now
             )
             command = policy.decide(
-                nearby, self._status(tick_now), False, tick_now, True, True, stalled_camera
+                nearby, self._status(tick_now), False, tick_now, True, True, replace(stalled_camera, captured_at=tick_now)
             )
         self.assertEqual(policy.stuck_phase, "RECOVER")
         self.assertTrue(policy.reason.startswith("STUCK_RECOVER_"))
@@ -1211,14 +1212,14 @@ class StuckDetectionTests(unittest.TestCase):
             nearby = SectorClearance(
                 0.50, 2.0, 2.0, True, 2.0, 2.0, scan_at=tick_now
             )
-            policy.decide(nearby, self._status(tick_now), False, tick_now, True, True, stalled)
+            policy.decide(nearby, self._status(tick_now), False, tick_now, True, True, replace(stalled, captured_at=tick_now))
         self.assertIsNotNone(policy._stuck_window_start)
 
         tick_now = now + 20 * 0.05
         nearby = SectorClearance(
             0.50, 2.0, 2.0, True, 2.0, 2.0, scan_at=tick_now
         )
-        policy.decide(nearby, self._status(tick_now), False, tick_now, True, True, moving)
+        policy.decide(nearby, self._status(tick_now), False, tick_now, True, True, replace(moving, captured_at=tick_now))
 
         self.assertIsNone(policy._stuck_window_start)
         self.assertEqual(policy.stuck_phase, "IDLE")
@@ -1238,7 +1239,7 @@ class StuckDetectionTests(unittest.TestCase):
                 0.50, 2.0, 2.0, True, 2.0, 2.0, scan_at=tick_now
             )
             policy.decide(
-                clear, self._status(tick_now), False, tick_now, True, True, stalled_camera
+                clear, self._status(tick_now), False, tick_now, True, True, replace(stalled_camera, captured_at=tick_now)
             )
         self.assertEqual(policy.stuck_phase, "RECOVER")
 
@@ -1269,7 +1270,7 @@ class StuckDetectionTests(unittest.TestCase):
                 0.50, 2.0, 2.0, True, 2.0, 2.0, scan_at=tick_now
             )
             command = policy.decide(
-                clear, self._status(tick_now), False, tick_now, True, True, stalled_camera
+                clear, self._status(tick_now), False, tick_now, True, True, replace(stalled_camera, captured_at=tick_now)
             )
             if policy.stuck_phase == "LATCHED":
                 break
@@ -1341,17 +1342,24 @@ class StuckDetectionTests(unittest.TestCase):
 
         re_armed_at = now + STUCK_RELATCH_RETRY_S + 0.01
         command = "F"
+        phases = []
         for index in range(140):
             tick_now = re_armed_at + index * 0.05
             clear = SectorClearance(
                 0.50, 2.0, 2.0, True, 2.0, 2.0, scan_at=tick_now
             )
             command = policy.decide(
-                clear, self._status(tick_now), False, tick_now, True, True, stalled_camera
+                clear, self._status(tick_now), False, tick_now, True, True, replace(stalled_camera, captured_at=tick_now)
             )
+            if not phases or phases[-1] != policy.stuck_phase:
+                phases.append(policy.stuck_phase)
 
-        self.assertEqual(policy.stuck_phase, "RECOVER")
-        self.assertNotEqual(command, "STOP")
+        self.assertGreaterEqual(phases.count("RECOVER"), 2)
+        self.assertIn("LATCHED", phases)
+        if policy.stuck_phase == "LATCHED":
+            self.assertEqual(command, "STOP")
+        else:
+            self.assertNotEqual(command, "STOP")
 
     def test_camera_evidence_requires_fresh_confident_translation(self) -> None:
         policy = AutonomousPolicy(0.0, 118)
@@ -1368,19 +1376,19 @@ class StuckDetectionTests(unittest.TestCase):
             policy._motion_evidence(lidar, arduino, now, low_confidence)["camera"], "UNKNOWN"
         )
 
-        confident_still = CameraMotionState(fresh=True, confidence=0.9, motion_observed=False)
+        confident_still = CameraMotionState(captured_at=now, fresh=True, confidence=0.9, motion_observed=False)
         self.assertEqual(
             policy._motion_evidence(lidar, arduino, now, confident_still)["camera"], "NOT_MOVING"
         )
 
-        confident_moving = CameraMotionState(fresh=True, confidence=0.9, motion_observed=True)
+        confident_moving = CameraMotionState(captured_at=now, fresh=True, confidence=0.9, motion_observed=True)
         self.assertEqual(
             policy._motion_evidence(lidar, arduino, now, confident_moving)["camera"], "MOVING"
         )
 
         policy.left_pwm, policy.right_pwm = -118, 0  # pivot, not a translation
         self.assertEqual(
-            policy._motion_evidence(lidar, arduino, now, confident_moving)["camera"], "UNKNOWN"
+            policy._motion_evidence(lidar, arduino, time.monotonic(), confident_moving)["camera"], "MOVING"
         )
 
     def test_imu_evidence_requires_a_meaningful_commanded_turn(self) -> None:
