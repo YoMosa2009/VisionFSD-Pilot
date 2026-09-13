@@ -17,6 +17,8 @@ from typing import Iterable
 import cv2
 import numpy as np
 
+from lidar_visualizer import LidarPoint
+
 
 @dataclass(frozen=True)
 class SlamLiteState:
@@ -39,7 +41,7 @@ class LidarSlamLite:
     """A Pi 3B-friendly LiDAR/IMU exploration mapper.
 
     The angular matcher uses 360 one-degree bins and tests nearby shifts.
-    Vectorized scan integration keeps this inexpensive beside camera inference, while
+    Vectorized scan integration keeps this inexpensive beside camera motion analysis, while
     preserving more useful LD19 geometry and rejecting ambiguous matches
     instead of inventing a pose.
     """
@@ -334,7 +336,7 @@ class LidarSlamLite:
         angles = angles[valid]
         if distances.size < 35:
             return 0.0, 0.0, 0.0, False
-        stride = max(1, distances.size // 180)
+        stride = max(1, math.ceil(distances.size / 180))
         distances = distances[::stride]
         angles = angles[::stride]
         scale = self.cells / self.metres
@@ -434,7 +436,7 @@ class LidarSlamLite:
             robot_col = int(np.clip(round(self.x * scale), 0, self.cells - 1))
             robot_row = int(np.clip(round(self.y * scale), 0, self.cells - 1))
             ray_count = hit_rows.size
-            ray_stride = max(1, ray_count // 240)
+            ray_stride = max(1, math.ceil(ray_count / 240))
             for hit_row, hit_col in zip(
                 hit_rows[::ray_stride], hit_cols[::ray_stride]
             ):
@@ -450,11 +452,14 @@ class LidarSlamLite:
 
             endpoint_mask = np.zeros_like(self.observed)
             endpoint_mask[hit_rows, hit_cols] = 255
+            self.observed[endpoint_mask > 0] = 255
             free_mask = (visible > 0) & (endpoint_mask == 0)
             accumulator[free_mask] = np.maximum(
                 accumulator[free_mask].astype(np.int16) - 4, 0
             ).astype(np.uint16)
-            np.add.at(accumulator, (hit_rows, hit_cols), 12)
+            # Multiple high-resolution rays can land in one occupancy cell.
+            # More samples preserve shape, not multiple independent confirmations.
+            accumulator[endpoint_mask > 0] += 12
 
             visit_mask = np.zeros_like(self.observed)
             cv2.circle(
@@ -473,6 +478,28 @@ class LidarSlamLite:
             self._latest_hits = np.empty((0, 2), dtype=np.int32)
         self.grid = np.minimum(accumulator, 255).astype(np.uint8)
         self._map_updates += 1
+
+    @classmethod
+    def deskew_points(cls, points: list[tuple[int, object]], now: float,
+                      imu_yaw_rate_dps: float | None) -> list[tuple[int, object]]:
+        """Approximate rotational compensation for map input only.
+
+        Receipt timestamps and a constant recent gyro rate are imperfect; cap
+        the correction and retain raw ranges for the independent safety path.
+        Positive IMU Z is counter-clockwise, opposite the map heading convention.
+        """
+        if imu_yaw_rate_dps is None or not math.isfinite(imu_yaw_rate_dps) or abs(imu_yaw_rate_dps) > 80.:
+            return points
+        corrected = []
+        for index, point in points:
+            age = now - point.captured_at
+            correction = (max(-10., min(10., imu_yaw_rate_dps * age))
+                          if 0.0 <= age <= cls.MAX_SCAN_AGE_S else 0.0)
+            corrected.append((index, LidarPoint(
+                (point.angle_deg + correction) % 360., point.distance_mm,
+                getattr(point, "confidence", 0), point.captured_at,
+            )))
+        return corrected
 
     def update(
         self,
@@ -494,6 +521,7 @@ class LidarSlamLite:
             camera_translation_scale,
             imu_yaw_deg,
         )
+        points = self.deskew_points(points, now, imu_yaw_rate_dps)
         bins, scan_stamp = self.bins_from_points(points)
         self._matched = False
         self._translation_matched = False

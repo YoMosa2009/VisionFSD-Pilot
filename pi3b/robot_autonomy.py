@@ -20,7 +20,7 @@ import signal
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import cv2
@@ -29,6 +29,7 @@ import serial
 from serial.tools import list_ports
 
 from lidar_visualizer import LD19Parser, LivePolarMap
+from robot_camera_motion import CameraMotionState, estimate_motion
 from robot_explorer import ExplorationState, FrontierExplorer
 from robot_imu import AsyncIMULink, IMUState, LSM6DS3MCP2221Link
 from robot_slam_lite import LidarSlamLite, SlamLiteState
@@ -193,17 +194,6 @@ class SectorClearance:
         return float(self.profile[index])
 
 
-@dataclass(frozen=True)
-class CameraMotionState:
-    fresh: bool = False
-    confidence: float = 0.0
-    tracked_features: int = 0
-    yaw_rate_dps: float | None = None
-    translation_scale: float = 1.0
-    motion_observed: bool = False
-    captured_at: float = 0.0
-
-
 def _signed_angle(angle: float) -> float:
     return (angle + 180.0) % 360.0 - 180.0
 
@@ -228,20 +218,19 @@ def _sector_clearance(points: list[tuple[int, object]], centre_deg: float, half_
         # open room look like an unseen path and caused unnecessary stops.
         and 0.08 <= point.distance_mm / 1000.0 <= 5.8
     )
-    clustered: list[float] = []
-    for angle, distance, confidence in samples:
-        neighbours = [
-            other_distance
-            for other_angle, other_distance, _other_confidence in samples
-            if abs(_signed_angle(other_angle - angle)) <= 3.0
-            and abs(other_distance - distance) <= max(0.14, distance * 0.22)
-        ]
-        # A thin chair leg can occupy one angular bin.  Preserve a strong close
-        # return even without a neighbour; farther isolated returns remain
-        # rejected so a distant speckle cannot steer the chassis.
-        if len(neighbours) >= 2 or (distance <= 0.75 and confidence >= 180):
-            clustered.append(float(np.median(neighbours)))
-    return min(clustered) if clustered else None
+    if not samples:
+        return None
+    angles, ranges, confidence = np.asarray(samples, dtype=np.float64).T
+    angular_delta = np.abs((angles[:, None] - angles[None, :] + 180.) % 360. - 180.)
+    neighbours = ((angular_delta <= 3.)
+                  & (np.abs(ranges[:, None] - ranges[None, :])
+                     <= np.maximum(0.14, ranges * 0.22)[:, None]))
+    supported = ((np.count_nonzero(neighbours, axis=1) >= 2)
+                 | ((ranges <= 0.75) & (confidence >= 180)))
+    if not np.any(supported):
+        return None
+    medians = np.nanmedian(np.where(neighbours[supported], ranges[None, :], np.nan), axis=1)
+    return float(np.min(medians))
 
 
 def corridor_profile(
@@ -296,21 +285,26 @@ def corridor_profile(
     if np.any(close_confirmed):
         close_bins = np.rint(raw_angles[close_confirmed]).astype(np.int16) % 360
         supported[close_bins] = True
-    usable_indices = np.flatnonzero(supported)
-    if usable_indices.size == 0:
+    # Bin only for noise support; retain the actual sub-degree measured angles
+    # and ranges for footprint geometry. Rounding endpoints loses thin details.
+    raw_bins = np.rint(raw_angles).astype(np.int16) % 360
+    usable = valid & (supported[raw_bins] | close_confirmed)
+    if not np.any(usable):
         return np.full(candidate_headings.size, PLANNING_HORIZON_M, dtype=np.float32)
-    angles = usable_indices.astype(np.float32)
-    ranges = binned[usable_indices]
+    angles = raw_angles[usable]
+    ranges = raw_ranges[usable]
 
-    delta = np.radians(
-        ((angles[None, :] - candidate_headings[:, None]) + 180.0) % 360.0 - 180.0
-    )
-    cos, sin = np.cos(delta), np.sin(delta)
-    lateral = sin * ranges[None, :]
-    along = cos * ranges[None, :]
-    # cos > 0 keeps only returns actually ahead of the candidate heading;
-    # without it, obstacles behind the robot produce negative travel limits.
-    inside = (cos > 0.02) & (np.abs(lateral) <= CORRIDOR_HALF_WIDTH_M)
+    # Rotate Cartesian returns into each corridor instead of evaluating trig
+    # for every ray/heading pair. This bounds the cost of retaining finer rays.
+    radians = np.radians(angles)
+    x = np.sin(radians) * ranges
+    y = np.cos(radians) * ranges
+    heading_radians = np.radians(candidate_headings)[:, None]
+    sin, cos = np.sin(heading_radians), np.cos(heading_radians)
+    lateral = cos * x[None, :] - sin * y[None, :]
+    along = sin * x[None, :] + cos * y[None, :]
+    # Retain only returns ahead of the heading, with the same angular cutoff.
+    inside = (along > 0.02 * ranges[None, :]) & (np.abs(lateral) <= CORRIDOR_HALF_WIDTH_M)
     limits = np.where(inside, along, np.inf).min(axis=1) - FRONT_OVERHANG_M
     return np.clip(limits, 0.0, PLANNING_HORIZON_M).astype(np.float32)
 
@@ -604,7 +598,7 @@ class LD19Link:
     def __init__(self, port: str, front_offset_deg: float) -> None:
         self._serial = serial.Serial(port, LD19_BAUD, timeout=0.02)
         self._parser = LD19Parser()
-        self._map = LivePolarMap()
+        self._map = LivePolarMap(bin_count=720)
         self._offset = front_offset_deg
         self._lock = threading.Lock()
         self._running = True
@@ -853,59 +847,14 @@ class CameraSafety:
         if previous is None or not 0.035 <= elapsed <= 0.35:
             self.motion = CameraMotionState(captured_at=captured)
             return
-        features = cv2.goodFeaturesToTrack(
-            previous, maxCorners=80, qualityLevel=0.025, minDistance=7, blockSize=7
-        )
-        if features is None or len(features) < 10:
-            self.motion = CameraMotionState(captured_at=captured)
-            return
-        next_points, status, errors = cv2.calcOpticalFlowPyrLK(
-            previous,
-            gray,
-            features,
-            None,
-            winSize=(15, 15),
-            maxLevel=2,
-            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 12, 0.03),
-        )
-        if next_points is None or status is None:
-            self.motion = CameraMotionState(captured_at=captured)
-            return
-        valid = status.reshape(-1) == 1
-        if errors is not None:
-            valid &= errors.reshape(-1) < 24.0
-        old = features.reshape(-1, 2)[valid]
-        new = next_points.reshape(-1, 2)[valid]
-        if old.shape[0] < 8:
-            self.motion = CameraMotionState(captured_at=captured)
-            return
-        flow = new - old
-        median = np.median(flow, axis=0)
-        deviation = np.median(np.linalg.norm(flow - median, axis=1))
-        confidence = float(np.clip((old.shape[0] / 55.0) * (1.0 - deviation / 5.0), 0.0, 1.0))
-        flow_magnitude = float(np.median(np.linalg.norm(flow, axis=1)))
-        commanded_turn = abs(left_pwm - right_pwm) >= 18
-        yaw_rate = (
-            float(-median[0] / 160.0 * self._fov / elapsed)
-            if commanded_turn and confidence >= 0.25
-            else None
-        )
-        commanded_forward = left_pwm > 0 and right_pwm > 0
-        motion_observed = flow_magnitude >= 0.35
-        translation_scale = (
-            (1.0 if motion_observed else 0.20)
-            if commanded_forward and confidence >= 0.35
-            else 1.0
-        )
-        self.motion = CameraMotionState(
-            fresh=True,
-            confidence=confidence,
-            tracked_features=int(old.shape[0]),
-            yaw_rate_dps=yaw_rate,
-            translation_scale=translation_scale,
-            motion_observed=motion_observed,
-            captured_at=captured,
-        )
+        flow_started = time.perf_counter()
+        try:
+            self.motion = estimate_motion(
+                previous, gray, elapsed, self._fov, left_pwm, right_pwm, captured
+            )
+        except cv2.error:
+            self.motion = CameraMotionState(captured_at=captured, quality="TRACK_ERROR")
+        self.motion = replace(self.motion, processing_ms=(time.perf_counter() - flow_started) * 1000.0)
 
     def tick(self, left_pwm: int = 0, right_pwm: int = 0) -> None:
         now = time.monotonic()
@@ -999,6 +948,10 @@ class AutonomousPolicy:
         self._stuck_recovery_attempts = 0
         self._stuck_tried_maneuvers: set[str] = set()
         self._stuck_recovery_moved = False
+        self.visual_caution = False
+        self._visual_since: float | None = None
+        self._visual_last_at = 0.0
+        self._visual_until = 0.0
         self._stuck_window_start: float | None = None
         self._stuck_not_moving_ticks = 0
         self._stuck_latched_reason = "STOP:STUCK_NEEDS_RESET"
@@ -1478,7 +1431,8 @@ class AutonomousPolicy:
         if limit_m is None:
             return floor
         span = float(np.clip((limit_m - 0.45) / 1.45, 0.0, 1.0))
-        return int(round(floor + span * max(0, self.speed - floor)))
+        speed = int(round(floor + span * max(0, self.speed - floor)))
+        return floor if self.visual_caution else speed
 
     def _differential(self, speed: int, heading_deg: float) -> str:
         """Apply a smooth but useful forward arc with both wheels powered."""
@@ -1619,14 +1573,40 @@ class AutonomousPolicy:
         self._reset_escape()
         return self._set_output("STOP", 0, 0)
 
+    def _observe_visual_approach(self, motion: CameraMotionState | None, now: float) -> None:
+        """Sustained image expansion can lower cruise, never authorize motion."""
+        if (motion is None or not motion.fresh
+                or not 0.0 <= now - motion.captured_at <= 0.45):
+            self._visual_since = None
+            self._visual_until = 0.0
+            self.visual_caution = False
+            return
+        if motion.captured_at > self._visual_last_at:
+            approaching = (motion.confidence >= 0.55 and motion.expansion_rate_s >= 0.5
+                           and self.left_pwm > 0 and self.right_pwm > 0
+                           and (self.imu_yaw_rate_dps is None or abs(self.imu_yaw_rate_dps) < 8.0))
+            if not approaching:
+                self._visual_since = None
+            else:
+                if self._visual_since is None or motion.captured_at - self._visual_last_at > 0.20:
+                    self._visual_since = motion.captured_at
+                if motion.captured_at - self._visual_since >= 0.15:
+                    self._visual_until = now + 0.25
+            self._visual_last_at = motion.captured_at
+        self.visual_caution = now < self._visual_until
+
     def decide(self, lidar: SectorClearance, arduino: ArduinoStatus, _person: bool, now: float,
                camera_ready: bool = True, imu_ready: bool = True,
                camera_motion: CameraMotionState | None = None) -> str:
         previous_output = (self.left_pwm, self.right_pwm)
+        self._observe_visual_approach(camera_motion, now)
         command = self._plan(lidar, arduino, _person, now, camera_ready, imu_ready)
-        return self._apply_stuck_check(
+        command = self._apply_stuck_check(
             lidar, arduino, now, command, camera_motion, previous_output
         )
+        if self.visual_caution and command == "F":
+            self.reason += ":VISION_APPROACH"
+        return command
 
     def _plan(self, lidar: SectorClearance, arduino: ArduinoStatus, _person: bool, now: float,
               camera_ready: bool = True, imu_ready: bool = True) -> str:
@@ -2129,7 +2109,9 @@ def draw_dashboard(local_map: np.ndarray, policy: AutonomousPolicy,
     lidar_state = "LIVE" if clearance.fresh else "STALE"
     camera_state = "LIVE" if camera_ready else "STALE"
     if camera_motion is not None and camera_motion.fresh:
-        camera_state += f" FLOW {camera_motion.confidence:.2f}/{camera_motion.tracked_features}"
+        camera_state += f" {camera_motion.quality} {camera_motion.confidence:.2f}"
+    elif camera_motion is not None:
+        camera_state += f" {camera_motion.quality}"
     cv2.putText(panel, f"VisionFSD Robot v{RUNTIME_VERSION} - LiDAR navigation", (12, 24),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, (238, 244, 250), 1, cv2.LINE_AA)
     cv2.putText(panel, f"POLICY {policy.reason}", (12, 49), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
@@ -2444,6 +2426,10 @@ def main() -> int:
                     f"imu_gaps={imu_state.sample_gaps} "
                     f"pose_yaw={slam_lite.yaw_source} "
                     f"cam_flow={camera_motion.confidence:.2f} "
+                    f"cam_quality={camera_motion.quality} cam_tracks={camera_motion.tracked_features} "
+                    f"cam_coverage={camera_motion.coverage:.2f} cam_expand={camera_motion.expansion_rate_s:.2f} "
+                    f"cam_ms={camera_motion.processing_ms:.1f} visual_slow={int(policy.visual_caution)} "
+                    f"lidar_points={len(points)} "
                     f"explore={exploration.mode} "
                     f"target_m={exploration.target_distance_m:.2f} "
                     f"bearing={exploration.heading_error_deg:+.0f} "

@@ -47,7 +47,7 @@ class ObstacleCluster:
 
 
 class LivePolarMap:
-    """Newest measurement per one-degree direction, with no slow history trail."""
+    """Newest measurement per angular bin, with no slow history trail."""
 
     def __init__(self, bin_count: int = 360) -> None:
         self._bin_count = bin_count
@@ -61,7 +61,11 @@ class LivePolarMap:
                 continue
             index = int(round(point.angle_deg * self._bin_count / 360.0)) % self._bin_count
             previous = self._points[index]
-            if previous is None or point.captured_at > previous.captured_at or point.confidence >= previous.confidence:
+            if (previous is None or point.captured_at > previous.captured_at
+                    or (point.captured_at == previous.captured_at
+                        and (point.distance_mm < previous.distance_mm
+                             or (point.distance_mm == previous.distance_mm
+                                 and point.confidence >= previous.confidence)))):
                 self._points[index] = point
             accepted += 1
         return accepted

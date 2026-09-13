@@ -461,6 +461,62 @@ For the next supervised boot test, confirm dashboard v1.9.15 and live sensors,
 then compare uninterrupted driving, a blocked reverse with a clear side, a stalled
 pivot, and route choice around offset obstacles. Keep the resulting NAV log.
 
+### v1.9.16: purposeful camera cues and finer LD19 geometry
+
+The forward-facing USB webcam now supplies quality-checked image-motion cues at
+160x120 with at most 80 features. Forward/backward optical-flow consistency and
+a robust similarity fit reject bad tracks; features must span at least half of
+a 4x3 image grid. A small moving patch, insufficient texture, or lost tracks
+abstain from motion evidence. High-confidence stationary views reduce false
+commanded translation in both forward and reverse map prediction. Camera yaw
+remains a bounded non-IMU cue, calculated from approximate image bearings.
+
+Sustained, confident scene expansion during forward travel lowers base cruise
+speed within the existing moving PWM band. It needs distinct frames spanning
+at least 150 ms and expires automatically; turning, reverse and weak evidence
+abstain. `VISION_APPROACH` in POLICY identifies this advisory slowdown. Camera
+cues cannot authorize a path or bypass LD19/ultrasonic/camera-liveness stops.
+Image expansion is not calibrated distance or a dependable collision detector;
+autofocus, camera pitch, changing illumination and moving objects can affect it.
+Floor visibility is useful texture, but no calibrated floor-plane model or
+rug/object recognition is claimed. No neural/person detector was added.
+
+The robot now retains 720 half-degree angular bins and projects accepted raw
+angles/ranges into body-width corridors. This preserves more of the LD19's
+returned detail; sensor scan rate, range and physical resolution are unchanged.
+Older high-confidence returns cannot replace newer geometry, and equal-time
+returns in one bin retain the nearest accepted surface. Sector filtering is
+vectorized, and Cartesian rotations replace per-ray/per-heading trigonometry.
+
+The 8 m, 384-cell map retains its approximately 2.1 cm cells. Every accepted
+endpoint is marked observed, even when free-space rays are subsampled. Multiple
+returns in one cell contribute only once per map update. Free-space carving is
+capped at 240 rays and translation matching at 180 samples. With fresh IMU data,
+map input receives bounded rotational compensation using return receipt ages
+and recent yaw rate (at most 10 degrees; stale points/rates abstain). This is
+approximate scan-smear reduction, not full motion compensation or metric SLAM.
+Immediate safety continues to use raw live LiDAR geometry. Geometry remains a
+2D slice at sensor height; obstacles above/below that plane can be missed.
+
+NAV logs add `cam_quality`, `cam_tracks`, `cam_coverage`, `cam_expand`, `cam_ms`,
+`visual_slow`, and `lidar_points`. `LOW_TEXTURE`, `LOCAL_FEATURES`, `TRACK_LOST`,
+or `INCONSISTENT` mean visual navigation evidence is unavailable, even while
+the camera is successfully delivering live frames. The dashboard shows camera
+tracking quality without rendering video. Capture remains 320x240 at 15 fps,
+with calibration deferral and automatic retry preserved.
+
+Verification: 210 software tests, including synthetic image expansion, localized
+motion rejection, reverse no-motion evidence, a frame-to-policy slowdown test,
+thin body-edge returns, bounded ray integration and map yaw-compensation tests.
+Desktop processing checks do not establish Pi timing or physical driving behavior.
+For the next supervised boot test, confirm v1.9.16, inspect tracking quality in a
+textured scene, and compare map detail and turn smearing around chair legs and
+offset obstacles. Retain the NAV log, especially `cam_ms`, `control_gap_ms`,
+`lease_stops`, and `uno_timeouts`. Motor-battery limitations still apply.
+
+Implementation references: [OpenCV sparse optical flow](https://docs.opencv.org/4.12.0/dc/d6b/group__video__track.html)
+and [LDROBOT SDK data processing](https://github.com/ldrobotSensorTeam/ldlidar_sdk/blob/master/src/ldlidar_dataprocess.cpp).
+
 ### USB LSM6DS3 mounting
 
 The USB LSM6DS3 through the MCP2221A USB-I2C adapter is the only supported
