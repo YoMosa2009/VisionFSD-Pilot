@@ -97,7 +97,17 @@ ARGS=(
   --speed "${VISIONFSD_ROBOT_SPEED:-118}"
   --lidar-front-offset-deg "${VISIONFSD_LIDAR_FRONT_OFFSET_DEG:-0}"
   --imu-mount-yaw-deg "${VISIONFSD_IMU_MOUNT_YAW_DEG:-180}"
+  --web-port "${VISIONFSD_WEB_PORT:-8080}"
+  --web-fps "${VISIONFSD_WEB_FPS:-5}"
 )
+
+# The dashboard also streams to a view-only web page so the robot can be
+# watched from a phone without an HDMI monitor. Set VISIONFSD_NO_WEB=1 to
+# turn it off; a port that cannot be bound degrades to "no remote view" on
+# its own and never blocks the runtime.
+if [[ "${VISIONFSD_NO_WEB:-0}" == "1" ]]; then
+  ARGS+=(--no-web)
+fi
 
 # Automatic USB identity discovery is the stable default because Linux ttyACM
 # numbers can change after a USB reset. Explicit overrides remain available for

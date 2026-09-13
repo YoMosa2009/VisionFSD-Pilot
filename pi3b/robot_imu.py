@@ -8,6 +8,7 @@ magnetometer and the chassis has no wheel encoders.  Non-IMU navigation
 
 from __future__ import annotations
 
+import collections
 from dataclasses import dataclass, replace
 import math
 import multiprocessing
@@ -47,6 +48,29 @@ class IMUState:
     sample_interval_s: float = 0.0
     sample_gaps: int = 0
     detected: bool = False
+    # Gravity-referenced chassis attitude. The angle between measured gravity
+    # and the board's own Z axis is independent of which horizontal axis
+    # happens to point forward, so it stays correct regardless of the mount
+    # yaw correction. Useful for driving onto a rug lip or a threshold, and
+    # for noticing the chassis being picked up.
+    tilt_deg: float = 0.0
+    tilt_rate_dps: float = 0.0
+    # Magnitude of the acceleration left after removing the estimated gravity
+    # vector, split into the component in the horizontal plane and the total.
+    # These are motion *cues*, never integrated into a position.
+    planar_accel_g: float = 0.0
+    motion_energy_g: float = 0.0
+    # Accelerometer energy measured while stationary during calibration. It
+    # is the reference that makes motion_energy_g interpretable on this
+    # particular chassis, floor and mounting instead of an absolute guess.
+    still_energy_g: float = 0.0
+    # True while the accelerometer sees sustained energy or an attitude change
+    # that the robot never commanded: the signature of being lifted, shoved or
+    # otherwise repositioned by hand.
+    handled: bool = False
+    # Integrated yaw change over roughly the last second. This is a bounded
+    # short-term record of what the chassis just did, not absolute heading.
+    yaw_delta_1s_deg: float = 0.0
 
 
 class _BlinkaMCP2221Bus:
@@ -216,6 +240,22 @@ class LSM6DS3MCP2221Link:
     CALIBRATION_ACCEL_NORM_MIN = 0.75
     CALIBRATION_ACCEL_NORM_MAX = 1.25
     SENSOR_NAME = "LSM6DS3 USB"
+    # Gravity tracks slowly so real chassis acceleration is not absorbed into
+    # the gravity estimate; motion energy tracks quickly so a stall or a jolt
+    # is visible within a few samples.
+    GRAVITY_ALPHA = 0.02
+    ENERGY_ALPHA = 0.18
+    TILT_RATE_ALPHA = 0.20
+    # Lower bound on the learned stationary noise floor. Without it, an
+    # unusually quiet calibration would make ordinary sensor noise look like
+    # motion for the rest of the run.
+    MIN_STILL_ENERGY_G = 0.004
+    # Being handled: sustained energy well above the stationary floor, or a
+    # clear attitude change, while nothing is being commanded.
+    HANDLED_ENERGY_G = 0.09
+    HANDLED_TILT_DEG = 12.0
+    HANDLED_CONFIRM_S = 0.25
+    YAW_HISTORY_S = 1.0
 
     def __init__(
         self,
@@ -252,6 +292,20 @@ class LSM6DS3MCP2221Link:
         self._yaw_deg = 0.0
         self._sample_interval_s = 0.0
         self._sample_gaps = 0
+        self._gravity: tuple[float, float, float] | None = None
+        self._tilt_deg = 0.0
+        self._tilt_rate_dps = 0.0
+        self._planar_accel_g = 0.0
+        self._motion_energy_g = 0.0
+        self._still_energy_g = self.MIN_STILL_ENERGY_G
+        self._calibration_tilt_deg: float | None = None
+        self._calibration_energy: list[float] = []
+        self._handled = False
+        self._handled_since: float | None = None
+        self._yaw_history: collections.deque[tuple[float, float, float]] = (
+            collections.deque(maxlen=256)
+        )
+        self._yaw_delta_1s_deg = 0.0
 
     @classmethod
     def _decode_block(
@@ -346,6 +400,103 @@ class LSM6DS3MCP2221Link:
         self._last_sample_at = 0.0
         self._connected_at = 0.0
 
+    def _update_attitude(
+        self,
+        ax: float,
+        ay: float,
+        az: float,
+        now: float,
+        previous_at: float,
+        stationary: bool,
+    ) -> None:
+        """Derive attitude and motion-energy cues from the accelerometer.
+
+        Splitting the measurement into a slowly-tracked gravity vector and the
+        residual gives two genuinely useful signals that the raw
+        accel_deviation_g scalar cannot express:
+
+        * the angle between gravity and the board's Z axis (chassis tilt), and
+        * the size of the acceleration that is *not* gravity (motion energy).
+
+        Neither is integrated into a velocity or a position. Without wheel
+        encoders or an absolute reference, integrating this sensor would drift
+        within seconds; these stay first-order observations of the present
+        moment.
+        """
+        if self._gravity is None:
+            self._gravity = (ax, ay, az)
+        else:
+            alpha = self.GRAVITY_ALPHA
+            self._gravity = tuple(
+                previous * (1.0 - alpha) + current * alpha
+                for previous, current in zip(self._gravity, (ax, ay, az))
+            )
+        gravity_norm = math.sqrt(sum(value * value for value in self._gravity))
+        if gravity_norm < 0.30:
+            # Free fall or a disconnected sensor: no usable attitude.
+            return
+        unit = tuple(value / gravity_norm for value in self._gravity)
+        tilt_deg = math.degrees(math.acos(max(-1.0, min(1.0, abs(unit[2])))))
+        elapsed = now - previous_at if previous_at > 0.0 else 0.0
+        if 0.0 < elapsed <= self.MAX_SAMPLE_AGE_S:
+            rate = (tilt_deg - self._tilt_deg) / elapsed
+            beta = self.TILT_RATE_ALPHA
+            self._tilt_rate_dps = self._tilt_rate_dps * (1.0 - beta) + rate * beta
+        self._tilt_deg = tilt_deg
+
+        linear = tuple(
+            measured - gravity
+            for measured, gravity in zip((ax, ay, az), self._gravity)
+        )
+        along_gravity = sum(value * axis for value, axis in zip(linear, unit))
+        planar = tuple(
+            value - along_gravity * axis for value, axis in zip(linear, unit)
+        )
+        planar_magnitude = math.sqrt(sum(value * value for value in planar))
+        total_magnitude = math.sqrt(sum(value * value for value in linear))
+        gamma = self.ENERGY_ALPHA
+        self._planar_accel_g = (
+            self._planar_accel_g * (1.0 - gamma) + planar_magnitude * gamma
+        )
+        self._motion_energy_g = (
+            self._motion_energy_g * (1.0 - gamma) + total_magnitude * gamma
+        )
+        if not self._calibrated:
+            self._calibration_energy.append(total_magnitude)
+            if len(self._calibration_energy) > 200:
+                self._calibration_energy.pop(0)
+            return
+        self._update_handled(now, stationary)
+
+    def _update_handled(self, now: float, stationary: bool) -> None:
+        """Flag external handling while nothing is being commanded.
+
+        Every other motion signal this runtime has is defined relative to a
+        commanded drive, so none of them can notice the chassis being picked
+        up and carried while it sits latched at zero PWM. Accelerometer energy
+        and a changed resting attitude can: with the motors idle, anything the
+        accelerometer sees is by definition something the robot did not do.
+        """
+        if not stationary:
+            self._handled_since = None
+            self._handled = False
+            return
+        tilt_changed = (
+            self._calibration_tilt_deg is not None
+            and abs(self._tilt_deg - self._calibration_tilt_deg)
+            >= self.HANDLED_TILT_DEG
+        )
+        energetic = self._motion_energy_g >= max(
+            self.HANDLED_ENERGY_G, self._still_energy_g * 4.0
+        )
+        if not (tilt_changed or energetic):
+            self._handled_since = None
+            self._handled = False
+            return
+        if self._handled_since is None:
+            self._handled_since = now
+        self._handled = now - self._handled_since >= self.HANDLED_CONFIRM_S
+
     def _sample_ready(self, bus: _SMBusLike) -> bool:
         # Only count and integrate complete new gyro+accelerometer samples.
         # This prevents a fast control loop from repeatedly integrating the
@@ -382,6 +533,24 @@ class LSM6DS3MCP2221Link:
         self._yaw_deg = 0.0
         self._filtered_gyro = (0.0, 0.0, 0.0)
         self._calibration.clear()
+        # Calibration is by definition a stationary window, so it is the one
+        # chance to measure what "not moving" actually looks like on this
+        # chassis, floor and USB path. Everything downstream compares against
+        # this instead of an absolute threshold guessed from a datasheet.
+        if self._calibration_energy:
+            spread = (
+                statistics.pstdev(self._calibration_energy)
+                if len(self._calibration_energy) > 1
+                else 0.0
+            )
+            self._still_energy_g = max(
+                self.MIN_STILL_ENERGY_G,
+                statistics.fmean(self._calibration_energy) + 2.0 * spread,
+            )
+            self._calibration_energy.clear()
+        self._calibration_tilt_deg = self._tilt_deg
+        self._yaw_history.clear()
+        self._yaw_delta_1s_deg = 0.0
         return True
 
     def _calibration_sample_is_still(
@@ -431,6 +600,7 @@ class LSM6DS3MCP2221Link:
             self._accel_deviation_g * 0.82 + deviation * 0.18
         )
         self._temperature_c = temperature
+        self._update_attitude(ax, ay, az, now, previous_at, stationary)
 
         if not self._calibrated:
             self._gyro = (gx, gy, gz)
@@ -498,7 +668,30 @@ class LSM6DS3MCP2221Link:
             self._yaw_deg = (
                 self._yaw_deg + yaw_rate * elapsed + 180.0
             ) % 360.0 - 180.0
+        self._update_yaw_history(now)
         return self.state(now)
+
+    def _update_yaw_history(self, now: float) -> None:
+        """Keep a bounded record of how far the chassis has just turned.
+
+        A single yaw rate says what is happening right now and the wrapped
+        yaw angle says where the estimate has drifted to; neither answers
+        "did that commanded pivot actually turn 60 degrees?". Differencing
+        unwrapped yaw across a short window does, without pretending to be an
+        absolute heading.
+        """
+        history = self._yaw_history
+        if history:
+            previous = history[-1][1]
+            step = (self._yaw_deg - previous + 180.0) % 360.0 - 180.0
+            unwrapped = history[-1][2] + step
+        else:
+            unwrapped = 0.0
+        history.append((now, self._yaw_deg, unwrapped))
+        cutoff = now - self.YAW_HISTORY_S
+        while len(history) > 2 and history[0][0] < cutoff:
+            history.popleft()
+        self._yaw_delta_1s_deg = unwrapped - history[0][2]
 
     def state(self, now: float | None = None) -> IMUState:
         now = time.monotonic() if now is None else now
@@ -528,6 +721,13 @@ class LSM6DS3MCP2221Link:
             sample_interval_s=self._sample_interval_s,
             sample_gaps=self._sample_gaps,
             detected=self._detected,
+            tilt_deg=self._tilt_deg,
+            tilt_rate_dps=self._tilt_rate_dps,
+            planar_accel_g=self._planar_accel_g,
+            motion_energy_g=self._motion_energy_g,
+            still_energy_g=self._still_energy_g,
+            handled=self._handled,
+            yaw_delta_1s_deg=self._yaw_delta_1s_deg,
         )
 
     def close(self) -> None:

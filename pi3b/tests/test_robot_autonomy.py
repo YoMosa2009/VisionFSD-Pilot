@@ -1157,8 +1157,24 @@ class StuckDetectionTests(unittest.TestCase):
     commanded drive for long enough. See robot_autonomy.py's "Stuck
     detection" section for the MOVING/NOT_MOVING/UNKNOWN contract."""
 
-    def _status(self, now: float, blocked: bool = False) -> ArduinoStatus:
-        return ArduinoStatus(front_cm=80.0, motion="S", received_at=now, blocked=blocked)
+    def _status(
+        self,
+        now: float,
+        blocked: bool = False,
+        front_cm: float | None = None,
+    ) -> ArduinoStatus:
+        """Uno status for a tick.
+
+        front_cm defaults to NO_ECHO (None), which is what the Uno reports
+        with nothing inside its ~2 m cone - the usual case in the open floor
+        these fixtures describe. That keeps the ultrasonic motion source
+        UNKNOWN so each test below exercises exactly the evidence sources it
+        names. Tests that want ultrasonic evidence pass a distance
+        explicitly: a constant one models a stall, a changing one progress.
+        """
+        return ArduinoStatus(
+            front_cm=front_cm, motion="S", received_at=now, blocked=blocked
+        )
 
     def test_all_unknown_evidence_never_latches_stuck(self) -> None:
         """A static test fixture that never reports real progress must not

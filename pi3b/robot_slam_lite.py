@@ -586,11 +586,43 @@ class LidarSlamLite:
             self._recenter_count,
         )
 
+    def reset(self) -> None:
+        """Discard the map and restart the pose at the centre of a new grid.
+
+        Used when the chassis is picked up or shoved: the occupancy grid, the
+        visit counts and the pose all describe a place the robot is no longer
+        in, and there is no encoder or absolute reference that could relate
+        the old frame to the new one. Starting clean is honest; carrying the
+        old map forward would silently corrupt every later plan.
+        """
+        self.grid[:] = 0
+        self.observed[:] = 0
+        self.visits[:] = 0
+        self.x = self.metres / 2.0
+        self.y = self.metres / 2.0
+        self.heading = 0.0
+        self._last_motion_at = None
+        self._last_scan_stamp = -1.0
+        self._previous_bins = None
+        self._yaw_since_scan = 0.0
+        self._yaw_confidence = 0.0
+        self._last_correction = 0.0
+        self._matched = False
+        self._map_updates = 0
+        self._latest_hits = np.empty((0, 2), dtype=np.int32)
+        self._last_imu_yaw_deg = None
+        self._translation_confidence = 0.0
+        self._translation_correction_m = 0.0
+        self._translation_matched = False
+
     def render(
         self,
         size: int = 500,
         target_xy: tuple[float, float] | None = None,
         waypoint_xy: tuple[float, float] | None = None,
+        path_xy: tuple[tuple[float, float], ...] = (),
+        steering_deg: float | None = None,
+        intent_color: tuple[int, int, int] = (120, 230, 255),
     ) -> np.ndarray:
         # Keep the estimated chassis at the centre of a robot-following local
         # viewport. The underlying occupancy grid is a fixed-size sliding
@@ -656,6 +688,40 @@ class LidarSlamLite:
                        (45, 65, 75), 1, cv2.LINE_AA)
         radians = math.radians(self.heading)
         tip = (int(px + math.sin(radians) * 20), int(py - math.cos(radians) * 20))
+        # The planned route, drawn from the chassis outward so the intended
+        # path is visible as a path rather than inferred from a single target
+        # marker. Clipped to the viewport by polylines() itself.
+        if len(path_xy) >= 2:
+            points = np.array(
+                [
+                    (
+                        px + (point[0] - self.x) * pixels_per_metre,
+                        py + (point[1] - self.y) * pixels_per_metre,
+                    )
+                    for point in path_xy
+                ],
+                dtype=np.float32,
+            )
+            polyline = np.rint(points).astype(np.int32).reshape(-1, 1, 2)
+            cv2.polylines(
+                panel, [polyline], False, (40, 120, 150), 5, cv2.LINE_AA
+            )
+            cv2.polylines(
+                panel, [polyline], False, intent_color, 2, cv2.LINE_AA
+            )
+        # The steering command actually being applied this tick, which can
+        # differ from the route while the local corridor planner curves around
+        # something the map has not resolved yet.
+        if steering_deg is not None:
+            steer_radians = math.radians(self.heading + steering_deg)
+            steer_tip = (
+                int(px + math.sin(steer_radians) * 46),
+                int(py - math.cos(steer_radians) * 46),
+            )
+            cv2.arrowedLine(
+                panel, (px, py), steer_tip, intent_color, 2, cv2.LINE_AA,
+                tipLength=0.22,
+            )
         if target_xy is not None:
             target = (
                 int(round(px + (target_xy[0] - self.x) * pixels_per_metre)),

@@ -103,7 +103,7 @@ Read `pi3b/logs/update-status.txt` for the latest result, installed commit and
 reason for any skipped update. `pi3b/logs/robot.log` also records the startup
 version and commit. A successful GitHub push does **not** verify Pi installation.
 Set `VISIONFSD_AUTO_UPDATE=0` to disable checks, or
-`VISIONFSD_AUTO_UPDATE_TIMEOUT_S` to change the fetch timeout (1–30 seconds).
+`VISIONFSD_AUTO_UPDATE_TIMEOUT_S` to change the fetch timeout (1ï¿½30 seconds).
 
 For a Pi still running v1.9.14, perform this recovery once while the robot is
 stopped, then reboot. It uses the current recovery script rather than the
@@ -559,6 +559,122 @@ do not verify Pi USB timing, Linux lock behavior, physical calibration or drivin
 Next supervised test: confirm **v1.9.17**, keep the robot stationary while the
 IMU calibrates, then confirm camera readiness and motion. If it stays stopped,
 retain the startup/update log and IMU error lines instead of waiting ten minutes.
+
+### v1.9.18: keep rolling, notice stalls, notice being moved, watch remotely
+
+Four behaviours reported from supervised driving of v1.9.17, and the code
+paths each one traces back to.
+
+**Drive/stop/drive pulsing, and ignoring an obviously clear route.** Any
+straight corridor shorter than `CLOSE_FRONT_TURN_M` (0.40 m) went directly to
+the pivot-in-place escape machine, even when the corridor profile showed two
+metres of open floor twenty degrees away. Escaping stops the chassis, pivots,
+then re-plans - which is exactly the observed stutter. A **steer-around band**
+now sits between cruising and escaping: with the scan not blocked all round,
+the planner curves past the obstruction at crawl speed instead. It is gated on
+a genuinely broad alternative (`STEER_AROUND_MIN_OPENING_M`, 0.55 m), a real
+turn away from the obstruction (8 degrees), and enough swept clearance for the
+arc itself. Nothing underneath it changed: the Uno's ~18 cm hard stop, the
+Pi's 26 cm ultrasonic recovery trigger and the all-round `CLOSE_LIDAR_M`
+check all still run first and still force a real escape.
+
+Escape pivots were also under-driven. `_pivot_crawl` used `min_move_pwm`,
+which is calibrated for straight rolling; a pivot additionally has to scrub
+both tyres. On carpet the wheel buzzed without rotating, the turn hit its
+2.4 s timeout, and the policy reported `STOP:BOXED_IN` - indistinguishable
+from a genuinely blocked turn. Pivots now add `ESCAPE_PIVOT_BOOST_PWM`.
+
+**Stalls that never registered.** Every previous motion source had a blind
+spot, and they overlapped badly in open floor: the IMU could only vote while
+turning, the Uno only when `blocked`, and the LD19 progress check only while
+something sat within 1.2 m. In the middle of a room a rug stall therefore
+gathered at most one vote, and a declaration needs two. Three sources are
+added. A **whole-scan range signature** (`robot_motion.py`) compares complete
+LD19 revolutions, so it works at any range - a wedged chassis reproduces the
+same scan indefinitely. The **Uno ultrasonic cone** is tracked across a
+commanded forward drive. **Accelerometer energy** votes NOT_MOVING when it
+sits at the stationary floor measured during calibration; it never votes
+MOVING, because a stalled motor buzzing against a rug produces plenty of
+energy. Recovery also gets one extra full round of maneuvers before latching,
+since a caster against a threshold often frees itself from a slightly
+different attitude.
+
+**Not knowing it had been moved.** Every evidence source is defined relative
+to a commanded drive, so a chassis latched at zero PWM and then lifted by hand
+could not observe its own rescue: it resumed the escape phase, heading
+commitment and route it had latched on, all computed for a position it was no
+longer in. Two independent signals now detect displacement - accelerometer
+energy or a changed resting attitude while the motors are commanded stopped,
+and a scan that changes further between consecutive revolutions than any
+drivable speed allows. Either one stops the chassis, clears the escape and
+stuck state, drops the steering commitment, and resets the occupancy map and
+the planner, because nothing on this robot can relate the old map frame to
+the new one. The dashboard reports `REORIENTING` while it settles.
+
+**Watching it.** The dashboard now also carries an `INTENT` line (what it is
+about to do, in words), a `MOTION` readout of the per-source stuck votes, the
+planned A* route drawn as a polyline from the chassis marker, and an arrow for
+the steering actually being applied - which can differ from the route while
+the local corridor planner curves around something the map has not resolved.
+The same rendered dashboard is served read-only over HTTP at
+`http://<pi>:8080/` (see below), and the runtime no longer requires a desktop
+session, so it can start and stream with no HDMI attached.
+
+The IMU itself gained attitude and motion cues: chassis tilt (the angle
+between gravity and the board Z axis, which is independent of the mount-yaw
+convention, so it cannot be wrong because the forward axis was guessed), a
+tilt rate, gravity-removed planar and total acceleration, the stationary
+energy floor learned during calibration, and the yaw change integrated over
+roughly the last second. None of these is integrated into a velocity or a
+position: with no wheel encoders and no absolute reference this sensor would
+drift within seconds, so they stay first-order observations.
+
+Desktop regression tests cover the scan-signature tracker, the steer-around
+gates, the new evidence sources, displacement handling and map reset, the
+route overlay, the IMU cues, and the stream's backlog/staleness/isolation
+behaviour. **None of this has been run on the robot.** These tests do not
+verify PWM levels against real carpet, pivot torque, LD19 timing, Pi 3B load
+with a stream attached, or Wi-Fi behaviour.
+
+Next supervised test: confirm **v1.9.18** on the dashboard, then check in
+order - continuous driving without move-stop-move pulses; a deliberate rug or
+threshold stall registering as `STUCK` rather than silently failing; lifting
+the chassis mid-run and seeing `REORIENTING` with the map rebuilt; the route
+polyline matching where it actually goes; and the phone view staying live
+while walking the robot around.
+
+### Remote dashboard view
+
+The runtime serves the same dashboard it draws on the Pi monitor as a
+view-only web page, so it can be watched from a phone or laptop on the same
+network:
+
+```
+http://<pi-address>:8080/
+```
+
+The page shows a LIVE/STALE/DISCONNECTED badge and the age of the picture, so
+a frozen view can never be mistaken for a stopped robot. There are no control
+endpoints; nothing on the page can command the chassis.
+
+Design constraints: the control loop only hands over a reference to an
+already-rendered frame under a short lock, and JPEG encoding, socket writes
+and client handling all run on other threads. Exactly one encoded frame is
+retained, so a client on slow Wi-Fi misses intermediate frames rather than
+building a backlog. A port that cannot be bound degrades to "no remote view"
+and never blocks the runtime.
+
+Environment overrides in `run_robot.sh`:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `VISIONFSD_WEB_PORT` | `8080` | Listening port |
+| `VISIONFSD_WEB_FPS` | `5` | Stream frame rate (clamped to 0.5..15) |
+| `VISIONFSD_NO_WEB` | unset | Set to `1` to disable streaming entirely |
+
+The runtime also starts without a desktop session. With no `DISPLAY` or
+`WAYLAND_DISPLAY` it logs that it is headless, skips the local window, and
+keeps driving and streaming normally.
 
 ### USB LSM6DS3 mounting
 

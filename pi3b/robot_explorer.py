@@ -30,6 +30,10 @@ class ExplorationState:
     waypoint_y_m: float | None = None
     replans: int = 0
     planning_ms: float = 0.0
+    # The planned route in map metres, thinned for drawing. This is what the
+    # robot currently intends to do, so the dashboard can show the plan rather
+    # than only the single next waypoint.
+    path_xy_m: tuple[tuple[float, float], ...] = ()
 
 
 class FrontierExplorer:
@@ -411,6 +415,25 @@ class FrontierExplorer:
             waypoint_y_m=waypoint_y,
             replans=self._replans,
             planning_ms=self._planning_ms,
+            path_xy_m=self._path_world(scale),
+        )
+
+    def _path_world(self, scale: float) -> tuple[tuple[float, float], ...]:
+        """Route cells as map metres, thinned to a drawable polyline.
+
+        A* returns one cell per step, which at roughly 2 cm per cell is far
+        more vertices than a dashboard needs. Keeping every eighth cell plus
+        the endpoint preserves the shape of the route at a fraction of the
+        drawing cost.
+        """
+        if not self._path_cells:
+            return ()
+        stride = 8
+        cells = self._path_cells[::stride]
+        if cells[-1] != self._path_cells[-1]:
+            cells.append(self._path_cells[-1])
+        return tuple(
+            ((col + 0.5) / scale, (row + 0.5) / scale) for row, col in cells
         )
 
     def update(

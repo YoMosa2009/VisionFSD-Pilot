@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import signal
 import sys
 import threading
@@ -32,7 +33,9 @@ from lidar_visualizer import LD19Parser, LivePolarMap
 from robot_camera_motion import CameraMotionState, estimate_motion
 from robot_explorer import ExplorationState, FrontierExplorer
 from robot_imu import AsyncIMULink, IMUState, LSM6DS3MCP2221Link
+from robot_motion import ScanMotionResult, ScanMotionTracker, range_signature
 from robot_slam_lite import LidarSlamLite, SlamLiteState
+from robot_web import start_dashboard_server
 from visionfsd_pi import (
     LatestCamera,
 )
@@ -85,6 +88,11 @@ ESCAPE_TURN_TIMEOUT_S = 2.40
 ESCAPE_TURN_SIDE_CLEARANCE_M = 0.18
 ESCAPE_DIRECT_TURN_CLEARANCE_M = 0.34
 ESCAPE_SIDE_HARD_CLEARANCE_M = 0.16
+# A pivot drags the whole chassis around one contact patch, which is strictly
+# more resistance than rolling straight. min_move_pwm is calibrated for the
+# straight case, so pivots need a little more to actually rotate on carpet
+# instead of buzzing in place until the turn times out.
+ESCAPE_PIVOT_BOOST_PWM = 18
 # Start choosing a broad alternate corridor before the robot reaches the
 # close-range recovery zone. This creates clearance through motion rather than
 # waiting until the only safe action is an abrupt stop.
@@ -94,6 +102,23 @@ CLOSE_FRONT_TURN_M = 0.40
 CLOSE_ULTRASONIC_CM = 26.0
 MIN_NAV_CORRIDOR_M = 0.30
 MIN_DRIVE_CORRIDOR_M = 0.40
+# Steer-around band.
+#
+# Previously any straight corridor shorter than CLOSE_FRONT_TURN_M went
+# straight to the pivot-in-place escape machine, even when the LiDAR could
+# plainly see two metres of open floor twenty degrees away. That produced the
+# observed behaviour: brief forward motion, a stop, a slow pivot, another
+# short move - and a robot that appeared to ignore an obviously clear route.
+#
+# These constants define the band where the planner keeps rolling and curves
+# around the obstruction instead. It is deliberately narrow, requires a
+# genuinely broad alternative, and does not touch the independent authorities
+# underneath it: the Uno's ~18 cm hard stop, the Pi's 26 cm ultrasonic
+# recovery trigger, and the all-round CLOSE_LIDAR_M block check all still run
+# first and still force a real escape.
+STEER_AROUND_MIN_OPENING_M = 0.55
+STEER_AROUND_MIN_SWEPT_M = 0.22
+STEER_AROUND_MIN_HEADING_DEG = 8.0
 OPENING_HALF_WIDTH_DEG = 5
 DISPLAY_PERIOD_S = 0.10
 TELEMETRY_PERIOD_S = 1.0
@@ -138,6 +163,21 @@ STUCK_VIBRATION_G = 0.12
 # the chassis, not sensor noise.
 STUCK_EXTERNAL_YAW_RATE_DPS = 12.0
 STUCK_EXTERNAL_ACCEL_G = 0.25
+# Accelerometer energy below this multiple of the stationary floor measured
+# during calibration means the chassis is not being shaken by anything - no
+# rolling, no wheel slip, no motor vibration. It is asymmetric evidence: low
+# energy implies not moving, but high energy does NOT imply moving, because a
+# stalled motor buzzes too.
+STUCK_IMU_ENERGY_STILL_RATIO = 1.6
+# Ultrasonic progress: the Uno's forward cone is an independent range source,
+# so a commanded forward drive that leaves it unchanged is real evidence.
+STUCK_ULTRASONIC_MAX_CM = 120.0
+STUCK_ULTRASONIC_MIN_WINDOW_S = 0.60
+STUCK_ULTRASONIC_MIN_ADVANCE_CM = 3.0
+# How long the chassis is held stopped after it was picked up, shoved, or
+# otherwise displaced, so the map and the planner restart from the place it
+# actually is rather than continuing a route computed somewhere else.
+DISPLACED_HOLD_S = 1.20
 LD19_MIN_SCAN_HISTORY_S = 0.10
 LD19_MAX_SCAN_HISTORY_S = 0.18
 LD19_PACKET_STALE_S = 0.25
@@ -948,6 +988,7 @@ class AutonomousPolicy:
         self._stuck_recovery_attempts = 0
         self._stuck_tried_maneuvers: set[str] = set()
         self._stuck_recovery_moved = False
+        self._stuck_retried_all = False
         self.visual_caution = False
         self._visual_since: float | None = None
         self._visual_last_at = 0.0
@@ -962,12 +1003,45 @@ class AutonomousPolicy:
         self._progress_last_scan_at: float | None = None
         self.stuck_phase = "IDLE"
         self.stuck_votes: dict[str, str] = {}
+        self.imu_motion_energy_g: float | None = None
+        self.imu_still_energy_g: float | None = None
+        self.imu_tilt_deg: float | None = None
+        self.imu_handled = False
+        self._scan_motion = ScanMotionResult()
+        self._scan_motion_at = 0.0
+        self._ultrasonic_reference_cm: float | None = None
+        self._ultrasonic_reference_at = 0.0
+        self.displacement_count = 0
+        self._displaced_until = 0.0
+        self.intent = "STANDBY"
+        self.intent_detail = "waiting for the standby timer"
 
     def observe_imu(self, state: IMUState) -> None:
         ready = state.connected and state.calibrated and state.fresh
         self.imu_yaw_rate_dps = state.gyro_z_dps if ready else None
         self.imu_yaw_deg = state.yaw_deg if ready else None
         self.imu_accel_deviation_g = state.accel_deviation_g if ready else None
+        self.imu_motion_energy_g = state.motion_energy_g if ready else None
+        self.imu_still_energy_g = state.still_energy_g if ready else None
+        self.imu_tilt_deg = state.tilt_deg if ready else None
+        self.imu_handled = bool(ready and state.handled)
+
+    def observe_scan_motion(self, result: ScanMotionResult, now: float) -> None:
+        """Accept whole-scan motion evidence from the LD19 signature tracker."""
+        if result.verdict != "UNKNOWN":
+            self._scan_motion = result
+            self._scan_motion_at = now
+        elif result.displaced:
+            self._scan_motion = replace(
+                self._scan_motion, displaced=True,
+                displacement_m=result.displacement_m,
+            )
+            self._scan_motion_at = now
+
+    @property
+    def steering_deg(self) -> float:
+        """Steering angle currently applied, relative to the chassis."""
+        return self._steering_deg
 
     def observe_exploration(self, state: ExplorationState) -> None:
         self.exploration = state
@@ -1129,17 +1203,29 @@ class AutonomousPolicy:
     def _reverse_straight(self) -> str:
         return self._set_output("B", -self.min_move_pwm, -self.min_move_pwm)
 
+    def _pivot_pwm(self) -> int:
+        """Drive level for a pivot, above the straight-rolling movement floor.
+
+        Rotating about a contact patch has to overcome the scrub of both
+        tyres, which min_move_pwm - measured for straight rolling - does not
+        cover on carpet. Under-driving a pivot is indistinguishable from a
+        blocked turn: the escape simply times out and the robot stops.
+        """
+        return min(MAX_PWM, self.min_move_pwm + ESCAPE_PIVOT_BOOST_PWM)
+
     def _pivot_crawl(self, direction: str) -> str:
         """Rotate slowly around one stopped wheel, never as an endless pivot."""
+        pwm = self._pivot_pwm()
         if direction == "L":
-            return self._set_output("L", -self.min_move_pwm, 0)
-        return self._set_output("R", 0, -self.min_move_pwm)
+            return self._set_output("L", -pwm, 0)
+        return self._set_output("R", 0, -pwm)
 
     def _center_pivot_crawl(self, direction: str) -> str:
         """Turn about the chassis centre when reversing is no longer safe."""
+        pwm = self._pivot_pwm()
         if direction == "L":
-            return self._set_output("L", -self.min_move_pwm, self.min_move_pwm)
-        return self._set_output("R", self.min_move_pwm, -self.min_move_pwm)
+            return self._set_output("L", -pwm, pwm)
+        return self._set_output("R", pwm, -pwm)
 
     def _escape_turn_drive(self) -> str:
         return (
@@ -1462,6 +1548,46 @@ class AutonomousPolicy:
         self.cruise_pwm = outer
         return self._set_output("F", left, right)
 
+    def _steer_around(
+        self, lidar: SectorClearance, now: float
+    ) -> str | None:
+        """Curve past a near obstruction at crawl speed instead of pivoting.
+
+        Returns None when no alternative is good enough, in which case the
+        caller falls through to the normal escape state machine. The gates
+        are deliberately strict: a genuinely broad opening, a real turn away
+        from the obstruction, and enough swept clearance for the arc itself.
+        """
+        if lidar.profile is None:
+            return None
+        choice = self._heading_from_profile(lidar.profile, now)
+        if choice is None:
+            return None
+        heading, opening = choice
+        if opening < STEER_AROUND_MIN_OPENING_M:
+            return None
+        if abs(heading) < STEER_AROUND_MIN_HEADING_DEG:
+            # The clearest option is essentially straight ahead, which is the
+            # direction that is already too short. Escaping is correct here.
+            return None
+        applied_heading = float(np.clip(
+            heading * CORRIDOR_STEERING_GAIN,
+            -MAX_GENTLE_HEADING_DEG,
+            MAX_GENTLE_HEADING_DEG,
+        ))
+        swept = self._swept_trajectory_limit(lidar.profile, applied_heading)
+        if swept < STEER_AROUND_MIN_SWEPT_M:
+            return None
+        self._arc_active = True
+        self.drive_confidence = float(np.clip(opening / 2.0, 0.0, 0.55))
+        self.reason = (
+            f"STEER_AROUND:{applied_heading:+.0f}deg "
+            f"open{opening:.2f}m swept{swept:.2f}m"
+        )
+        # Crawl speed only. This band exists to keep making progress through
+        # clutter, never to carry speed toward something close.
+        return self._differential(self._cruise_speed(None), applied_heading)
+
     def _heading_from_profile(self, profile: np.ndarray, now: float) -> tuple[float, float] | None:
         """Pick the centre of a broad opening, preferring straight and stability."""
         # A single heading with a long range can be a sampling gap between two
@@ -1600,13 +1726,85 @@ class AutonomousPolicy:
                camera_motion: CameraMotionState | None = None) -> str:
         previous_output = (self.left_pwm, self.right_pwm)
         self._observe_visual_approach(camera_motion, now)
+        # Displacement is checked before anything else. Every stored phase,
+        # heading commitment and route below this point describes a position
+        # the chassis no longer occupies.
+        if self._displacement_detected(now):
+            self.reason = "STOP:DISPLACED_REORIENT"
+            self.drive_confidence = 0.0
+            self._update_intent()
+            return self._note_displacement(now)
+        if now < self._displaced_until:
+            self.reason = "STOP:DISPLACED_SETTLING"
+            self.drive_confidence = 0.0
+            self._update_intent()
+            return self._hold_stop(self.reason)
         command = self._plan(lidar, arduino, _person, now, camera_ready, imu_ready)
         command = self._apply_stuck_check(
             lidar, arduino, now, command, camera_motion, previous_output
         )
         if self.visual_caution and command == "F":
             self.reason += ":VISION_APPROACH"
+        self._update_intent()
         return command
+
+    # -- Intent reporting ------------------------------------------------
+    #
+    # The dashboard used to show only the raw policy reason string, which
+    # describes the state machine rather than what the chassis is about to
+    # do. These map the internal state onto a short answer to "what is it
+    # doing, and why" that is legible while walking beside the robot.
+
+    INTENT_LABELS = {
+        "STANDBY": "STANDBY",
+        "STOP": "HOLDING",
+        "ESCAPE": "BACKING OUT",
+        "STUCK": "FREEING ITSELF",
+        "EXPLORE": "EXPLORING",
+        "DRIVE": "DRIVING",
+        "STEER": "STEERING AROUND",
+        "CLEAR": "CRUISING",
+        "ARC": "CURVING PAST",
+    }
+
+    def _update_intent(self) -> None:
+        head = self.reason.split(":", 1)[0].split("_", 1)[0].split(" ", 1)[0]
+        self.intent = self.INTENT_LABELS.get(head, head)
+        if self.reason.startswith("STOP:DISPLACED"):
+            self.intent = "REORIENTING"
+            self.intent_detail = "picked up or shoved; rebuilding the map here"
+            return
+        if self._stuck_phase == "LATCHED":
+            self.intent = "STUCK"
+            self.intent_detail = "recovery exhausted; waiting to retry"
+            return
+        if self._stuck_phase == "RECOVER":
+            self.intent_detail = (
+                f"trying {self._stuck_maneuver} "
+                f"(attempt {self._stuck_recovery_attempts})"
+            )
+            return
+        if self._escape_phase != "IDLE":
+            self.intent_detail = (
+                f"{self._escape_phase.lower()} then turn {self.turn_command}"
+            )
+            return
+        if self.left_pwm == 0 and self.right_pwm == 0:
+            self.intent_detail = self.reason
+            return
+        turn = (
+            "straight"
+            if abs(self._steering_deg) < 4.0
+            else f"{abs(self._steering_deg):.0f}deg "
+            + ("left" if self._steering_deg < 0.0 else "right")
+        )
+        if self.exploration.active:
+            self.intent_detail = (
+                f"{turn} toward a {self.exploration.mode.lower()} target "
+                f"{self.exploration.target_distance_m:.1f}m away"
+            )
+        else:
+            self.intent_detail = f"{turn} along the clearest corridor"
 
     def _plan(self, lidar: SectorClearance, arduino: ArduinoStatus, _person: bool, now: float,
               camera_ready: bool = True, imu_ready: bool = True) -> str:
@@ -1639,19 +1837,25 @@ class AutonomousPolicy:
         # curved corridor exists. Inside the front-turn threshold, pivot toward
         # that broad opening; reserve reverse recovery for genuinely short
         # corridors or the independent ultrasonic near-field trigger.
-        close_lidar = (
-            best_clearance < CLOSE_LIDAR_M
-            or straight_clearance < CLOSE_FRONT_TURN_M
-        )
+        blocked_everywhere = best_clearance < CLOSE_LIDAR_M
+        close_straight = straight_clearance < CLOSE_FRONT_TURN_M
         if self._escape_phase != "IDLE":
             recovery_command = self._continue_escape(
                 lidar, arduino, straight_clearance, now
             )
             if recovery_command is not None:
                 return recovery_command
-        if close_ultrasonic or close_lidar:
+        if close_ultrasonic or blocked_everywhere:
             source = "ULTRASONIC" if close_ultrasonic else "LD19"
             return self._start_escape(lidar, now, source)
+        if close_straight:
+            # Short straight corridor, but the scan is not blocked all round.
+            # Try to curve past while still rolling before giving the pivot
+            # escape machine authority; see STEER_AROUND_* for why.
+            steer_around = self._steer_around(lidar, now)
+            if steer_around is not None:
+                return steer_around
+            return self._start_escape(lidar, now, "LD19")
 
         # With a corridor profile the planner can steer continuously: it knows
         # how far its own body can travel along every heading, so it curves
@@ -1832,7 +2036,119 @@ class AutonomousPolicy:
         votes["uno"] = "NOT_MOVING" if (arduino.blocked and forward_component) else "UNKNOWN"
 
         votes["lidar"] = self._lidar_progress_evidence(lidar, left_pwm, right_pwm, now)
+        votes["scan"] = self._scan_motion_evidence(now, translating or turning)
+        votes["ultrasonic"] = self._ultrasonic_progress_evidence(
+            arduino, forward_component, now
+        )
+        votes["imu_energy"] = self._imu_energy_evidence(translating or turning)
         return votes
+
+    def _scan_motion_evidence(self, now: float, commanded: bool) -> str:
+        """Whole-revolution LD19 evidence, valid at any range.
+
+        This is the source that covers the open-room case the per-sector
+        progress check cannot: with every wall metres away, _lidar_progress
+        has nothing close enough to track, but a stalled chassis still
+        reproduces the same complete scan revolution after revolution.
+        """
+        if not commanded:
+            return "UNKNOWN"
+        if self._scan_motion.verdict == "UNKNOWN":
+            return "UNKNOWN"
+        if now - self._scan_motion_at > 1.0:
+            # The tracker only produces a verdict once per window; do not let
+            # one old verdict keep voting after the geometry moved on.
+            return "UNKNOWN"
+        return self._scan_motion.verdict
+
+    def _ultrasonic_progress_evidence(
+        self, arduino: ArduinoStatus, forward_component: bool, now: float
+    ) -> str:
+        """Track the Uno's forward cone across a commanded forward drive."""
+        distance_cm = arduino.front_cm
+        if (
+            not forward_component
+            or distance_cm is None
+            or distance_cm > STUCK_ULTRASONIC_MAX_CM
+        ):
+            self._ultrasonic_reference_cm = None
+            return "UNKNOWN"
+        if self._ultrasonic_reference_cm is None:
+            self._ultrasonic_reference_cm = distance_cm
+            self._ultrasonic_reference_at = now
+            return "UNKNOWN"
+        if now - self._ultrasonic_reference_at < STUCK_ULTRASONIC_MIN_WINDOW_S:
+            return "UNKNOWN"
+        advanced = abs(self._ultrasonic_reference_cm - distance_cm)
+        self._ultrasonic_reference_cm = distance_cm
+        self._ultrasonic_reference_at = now
+        return (
+            "MOVING"
+            if advanced >= STUCK_ULTRASONIC_MIN_ADVANCE_CM
+            else "NOT_MOVING"
+        )
+
+    def _imu_energy_evidence(self, commanded: bool) -> str:
+        """Asymmetric accelerometer evidence.
+
+        Energy at the stationary noise floor while a drive is commanded means
+        nothing is happening: the wheels are not even turning against the
+        floor. The converse is not true - a stalled motor buzzing against a
+        rug produces plenty of energy - so this source never votes MOVING.
+        """
+        if (
+            not commanded
+            or self.imu_motion_energy_g is None
+            or self.imu_still_energy_g is None
+        ):
+            return "UNKNOWN"
+        floor = self.imu_still_energy_g * STUCK_IMU_ENERGY_STILL_RATIO
+        return "NOT_MOVING" if self.imu_motion_energy_g <= floor else "UNKNOWN"
+
+    def _displacement_detected(self, now: float) -> bool:
+        """Was the chassis moved by something other than its own wheels?"""
+        if self.imu_handled:
+            return True
+        return (
+            self._scan_motion.displaced
+            and now - self._scan_motion_at <= 1.0
+        )
+
+    def _note_displacement(self, now: float) -> str:
+        """Discard everything that assumed the old position.
+
+        Being picked up invalidates the escape phase, the stuck latch, the
+        committed steering heading and the route the explorer computed - all
+        of them describe a place the robot is no longer in. Continuing to run
+        them is exactly the "outdated drive command" behaviour seen when the
+        chassis was rescued by hand.
+        """
+        if now >= self._displaced_until:
+            self.displacement_count += 1
+        self._displaced_until = now + DISPLACED_HOLD_S
+        self._reset_escape()
+        self._reset_stuck_state()
+        self._scan_motion = replace(self._scan_motion, displaced=False)
+        self._heading_index = None
+        self._steering_deg = 0.0
+        self._guidance_bias = 0.0
+        self._direction_lock_until = 0.0
+        self.stuck_phase = self._stuck_phase
+        return self._set_output("STOP", 0, 0)
+
+    def _reset_stuck_state(self) -> None:
+        self._stuck_phase = "IDLE"
+        self._stuck_phase_until = 0.0
+        self._stuck_maneuver = None
+        self._stuck_recovery_attempts = 0
+        self._stuck_tried_maneuvers.clear()
+        self._stuck_recovery_moved = False
+        self._stuck_retried_all = False
+        self._stuck_window_start = None
+        self._stuck_not_moving_ticks = 0
+        self._progress_reference_m = None
+        self._ultrasonic_reference_cm = None
+        self.stuck_phase = "IDLE"
 
     def _stuck_reason_detail(self) -> str:
         if self.imu_accel_deviation_g is None:
@@ -1914,12 +2230,26 @@ class AutonomousPolicy:
         self._reset_escape()
         if self._stuck_recovery_attempts == 0:
             self._stuck_tried_maneuvers.clear()
+            self._stuck_retried_all = False
             # Do not retry the same reverse that the sensors just disproved.
             if self.left_pwm < 0 and self.right_pwm < 0:
                 self._stuck_tried_maneuvers.add("REVERSE")
         self._stuck_recovery_attempts += 1
         candidates = [maneuver for maneuver in self._stuck_candidate_maneuvers(lidar)
                       if maneuver not in self._stuck_tried_maneuvers]
+        if (
+            not candidates
+            and not self._stuck_retried_all
+            and self._stuck_recovery_attempts <= STUCK_MAX_RECOVERY_ATTEMPTS
+        ):
+            # Every geometrically safe option has been tried once. Wheels on a
+            # rug or a caster against a threshold often free themselves on a
+            # second attempt from a slightly different attitude, so allow one
+            # more full round before giving up and holding still. The attempt
+            # ceiling above still bounds the whole episode.
+            self._stuck_retried_all = True
+            self._stuck_tried_maneuvers.clear()
+            candidates = self._stuck_candidate_maneuvers(lidar)
         if self._stuck_recovery_attempts > STUCK_MAX_RECOVERY_ATTEMPTS or not candidates:
             return self._latch_stuck(now)
         maneuver = candidates[0]
@@ -2095,13 +2425,28 @@ def format_imu_calibration_diagnostic(imu: IMUState) -> str:
     )
 
 
+_INTENT_COLOR = {
+    "DRIVING": (110, 240, 150),
+    "CRUISING": (110, 240, 150),
+    "EXPLORING": (225, 190, 235),
+    "STEERING AROUND": (120, 230, 255),
+    "CURVING PAST": (120, 230, 255),
+    "BACKING OUT": (90, 180, 255),
+    "FREEING ITSELF": (80, 150, 255),
+    "STUCK": (70, 95, 255),
+    "REORIENTING": (255, 190, 80),
+    "HOLDING": (150, 170, 190),
+    "STANDBY": (150, 170, 190),
+}
+
+
 def draw_dashboard(local_map: np.ndarray, policy: AutonomousPolicy,
                    clearance: SectorClearance, status: ArduinoStatus, _person: bool,
                    camera_ready: bool, differential_ready: bool,
                    imu: IMUState, slam_lite: SlamLiteState,
                    camera_motion: CameraMotionState | None = None) -> np.ndarray:
     panel = local_map.copy()
-    cv2.rectangle(panel, (0, 0), (panel.shape[1], 182), (14, 22, 31), -1)
+    cv2.rectangle(panel, (0, 0), (panel.shape[1], 206), (14, 22, 31), -1)
     front = "--" if clearance.front_m is None else f"{clearance.front_m:.2f}m"
     front_left = "--" if clearance.front_left_m is None else f"{clearance.front_left_m:.2f}m"
     front_right = "--" if clearance.front_right_m is None else f"{clearance.front_right_m:.2f}m"
@@ -2168,7 +2513,44 @@ def draw_dashboard(local_map: np.ndarray, policy: AutonomousPolicy,
                 f"{slam_lite.yaw_source} yaw {slam_lite.yaw_confidence:.2f} "
                 f"xy {slam_lite.translation_confidence:.2f}",
                 (12, 169), cv2.FONT_HERSHEY_SIMPLEX, 0.37, (185, 205, 225), 1, cv2.LINE_AA)
+    # What the robot is about to do, in words, plus the independent motion
+    # evidence behind any stuck declaration.
+    votes = "/".join(
+        f"{source[:3]}:{vote[0]}"
+        for source, vote in sorted(policy.stuck_votes.items())
+    )
+    cv2.putText(
+        panel,
+        f"INTENT {policy.intent} - {policy.intent_detail}",
+        (12, 193),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.40,
+        _INTENT_COLOR.get(policy.intent, (235, 225, 150)),
+        1,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        panel,
+        f"MOTION {policy.stuck_phase} [{votes}]",
+        (panel.shape[1] - 300, 24),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.34,
+        (150, 170, 190) if policy.stuck_phase == "IDLE" else (90, 165, 255),
+        1,
+        cv2.LINE_AA,
+    )
     return panel
+
+
+def display_available() -> bool:
+    """True when a desktop session exists to host the OpenCV window.
+
+    The runtime is expected to start on a headless Pi - powered from the
+    battery bank with no HDMI attached - and stream its dashboard instead.
+    Attempting to open a window in that case raises inside OpenCV and used to
+    take the whole runtime down before the robot ever moved.
+    """
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
 
 def open_dashboard_window() -> None:
@@ -2209,6 +2591,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-imu", action="store_true",
                         help="Disable the USB IMU and use camera+LD19 pose prediction")
     parser.add_argument("--no-display", action="store_true")
+    parser.add_argument("--web-port", type=int, default=8080,
+                        help="Port for the view-only dashboard stream. The "
+                             "same rendered dashboard the Pi monitor shows, "
+                             "reachable from a phone or laptop on the same "
+                             "network. Use --no-web to disable it.")
+    parser.add_argument("--web-fps", type=float, default=5.0,
+                        help="Dashboard stream frame rate. Encoding is paced "
+                             "on its own thread and never blocks control.")
+    parser.add_argument("--web-quality", type=int, default=70,
+                        help="Dashboard stream JPEG quality, 30..95")
+    parser.add_argument("--no-web", action="store_true",
+                        help="Disable the view-only dashboard stream")
     return parser.parse_args()
 
 
@@ -2247,6 +2641,7 @@ def main() -> int:
     # geometry remains the authority that decides whether motion is safe.
     local_map = LidarSlamLite()
     explorer = FrontierExplorer()
+    scan_motion = ScanMotionTracker()
     slam_lite = local_map.state()
     exploration = ExplorationState()
     imu_state = IMUState(error="disabled") if imu is None else imu.state()
@@ -2264,7 +2659,31 @@ def main() -> int:
     imu_detected = False
     imu_calibration_complete = False
     next_imu_calibration_diagnostic_at = 0.0
+    last_displacement_count = policy.displacement_count
     keep_running = True
+    # A desktop session is no longer required. Without one the runtime keeps
+    # driving and keeps streaming; only the local window is skipped.
+    show_window = not args.no_display and display_available()
+    if not args.no_display and not show_window:
+        print("No DISPLAY/WAYLAND_DISPLAY; running headless with stream only")
+    dashboard_stream = None
+    dashboard_server = None
+    if not args.no_web:
+        started = start_dashboard_server(
+            port=args.web_port,
+            fps=args.web_fps,
+            quality=args.web_quality,
+            version=RUNTIME_VERSION,
+        )
+        if started is None:
+            print(
+                f"Dashboard stream port {args.web_port} unavailable; "
+                "continuing without a remote view"
+            )
+        else:
+            dashboard_stream, dashboard_server = started
+            print(f"Dashboard stream: {dashboard_server.url}")
+    next_web_render_at = 0.0
 
     def stop(_signum: int, _frame: object) -> None:
         nonlocal keep_running
@@ -2272,7 +2691,7 @@ def main() -> int:
 
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
-    if not args.no_display:
+    if show_window:
         open_dashboard_window()
     try:
         while keep_running:
@@ -2366,6 +2785,12 @@ def main() -> int:
             control_now = time.monotonic()
             control_gap_ms = 0.0 if last_control_at == 0.0 else (control_now - last_control_at) * 1000.0
             last_control_at = control_now
+            # Whole-scan motion evidence. This runs before the decision so a
+            # displacement is acted on in the same tick it is observed.
+            scan_result = scan_motion.update(
+                range_signature(points), clearance.scan_at
+            )
+            policy.observe_scan_motion(scan_result, control_now)
             command = policy.decide(
                 clearance,
                 status,
@@ -2376,6 +2801,21 @@ def main() -> int:
                 camera_motion,
             )
             policy.send(arduino, command, control_now)
+            if policy.displacement_count != last_displacement_count:
+                # The chassis was picked up or shoved. The occupancy grid, the
+                # visit history and the cached route all describe where it
+                # used to be, and no sensor here can relate the old frame to
+                # the new one, so restart the map where it now stands.
+                last_displacement_count = policy.displacement_count
+                local_map.reset()
+                explorer.invalidate()
+                scan_motion.reset()
+                print(
+                    "NAV_EVENT reason=DISPLACED "
+                    f"count={policy.displacement_count} "
+                    f"imu_handled={int(policy.imu_handled)} "
+                    f"scan_delta_m={scan_result.displacement_m:.2f}"
+                )
             policy_state = (
                 command,
                 policy._escape_phase,
@@ -2438,10 +2878,25 @@ def main() -> int:
                     f"lease_stops={arduino.drive_lease_expirations} "
                     f"uno_timeouts={arduino.uno_watchdog_stops} "
                     f"stuck={policy.stuck_phase}[{stuck_votes}] "
+                    f"scan_change_m={scan_result.change_m:.3f} "
+                    f"imu_tilt={imu_state.tilt_deg:.1f} "
+                    f"imu_energy={imu_state.motion_energy_g:.3f} "
+                    f"imu_still={imu_state.still_energy_g:.3f} "
+                    f"imu_yaw_1s={imu_state.yaw_delta_1s_deg:+.0f} "
+                    f"handled={int(imu_state.handled)} "
+                    f"displaced={policy.displacement_count} "
+                    f"intent={policy.intent} "
                     f"recenter={slam_lite.recenter_count}"
                 )
-            if not args.no_display and now >= next_display_at:
-                next_display_at = now + DISPLAY_PERIOD_S
+            window_due = show_window and now >= next_display_at
+            stream_due = (
+                dashboard_stream is not None and now >= next_web_render_at
+            )
+            if window_due or stream_due:
+                if window_due:
+                    next_display_at = now + DISPLAY_PERIOD_S
+                if stream_due:
+                    next_web_render_at = now + dashboard_stream.publish_period_s
                 target_xy = (
                     None
                     if exploration.target_x_m is None or exploration.target_y_m is None
@@ -2457,6 +2912,11 @@ def main() -> int:
                         size=640,
                         target_xy=target_xy,
                         waypoint_xy=waypoint_xy,
+                        path_xy=exploration.path_xy_m,
+                        steering_deg=policy.steering_deg,
+                        intent_color=_INTENT_COLOR.get(
+                            policy.intent, (120, 230, 255)
+                        ),
                     ),
                     policy,
                     clearance,
@@ -2468,12 +2928,15 @@ def main() -> int:
                     slam_lite,
                     camera_motion,
                 )
-                cv2.imshow(WINDOW_TITLE, panel)
-                if fullscreen_refreshes > 0:
-                    maximize_dashboard_window()
-                    fullscreen_refreshes -= 1
-                if cv2.waitKey(1) & 0xFF in (27, ord("q"), ord("Q")):
-                    break
+                if stream_due:
+                    dashboard_stream.publish(panel)
+                if window_due:
+                    cv2.imshow(WINDOW_TITLE, panel)
+                    if fullscreen_refreshes > 0:
+                        maximize_dashboard_window()
+                        fullscreen_refreshes -= 1
+                    if cv2.waitKey(1) & 0xFF in (27, ord("q"), ord("Q")):
+                        break
             time.sleep(0.03)
     finally:
         arduino.close()
@@ -2481,7 +2944,10 @@ def main() -> int:
         camera.close()
         if imu is not None:
             imu.close()
-        cv2.destroyAllWindows()
+        if dashboard_server is not None:
+            dashboard_server.close()
+        if show_window:
+            cv2.destroyAllWindows()
     return 0
 
 
