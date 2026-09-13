@@ -2,6 +2,8 @@
 # Recover an older Pi installation whose local edits block update.sh.
 set -euo pipefail
 
+main() {
+
 INSTALL_ROOT="${VISIONFSD_PI_HOME:-$HOME/visionfsd-pi}"
 REF="codex/pi3b-runtime"
 
@@ -34,17 +36,15 @@ if [[ -f "$PI_ROOT/requirements.txt" ]]; then
   old_requirements="$(sha256sum "$PI_ROOT/requirements.txt" | awk '{print $1}')"
 fi
 
-# Older releases could not switch revisions when any tracked file was edited.
-# Preserve every tracked edit so checkout is safe; untracked models and the
-# virtual environment are intentionally left in place.
-if [[ -n "$(git -C "$INSTALL_ROOT" status --porcelain --untracked-files=no)" ]]; then
+# Preserve only deployment edits; leave unrelated work alone.
+if ! git -c core.filemode=false -C "$INSTALL_ROOT" diff HEAD --quiet -- pi3b robot/firmware/visionfsd_pi_autonomy; then
   backup_name="visionfsd-pi-recovery-$(date +%Y%m%d-%H%M%S)"
-  git -C "$INSTALL_ROOT" stash push -m "$backup_name"
-  echo "Backed up tracked local changes in git stash: $backup_name"
+  git -C "$INSTALL_ROOT" stash push -m "$backup_name" -- pi3b robot/firmware/visionfsd_pi_autonomy
+  echo "Backed up local Pi changes in git stash: $backup_name"
 fi
 
 git -C "$INSTALL_ROOT" fetch --depth 1 origin "$REF"
-git -C "$INSTALL_ROOT" checkout --detach FETCH_HEAD
+git -c core.filemode=false -C "$INSTALL_ROOT" checkout --detach FETCH_HEAD
 
 PI_ROOT="$INSTALL_ROOT/pi3b"
 chmod +x \
@@ -82,6 +82,10 @@ fi
 bash "$PI_ROOT/sync_primary_model.sh" "$PI_ROOT"
 
 printf '%s\n' "$REF" > "$PI_ROOT/.install-ref"
+rm -f "$PI_ROOT/logs/update-blocked"
 version="$(tr -d '\r\n' < "$PI_ROOT/VERSION")"
 echo "Recovered VisionFSD Pi to v$version from $REF"
-echo "Run: bash $PI_ROOT/run.sh --camera 0 --fps 25 --threads 3"
+echo "Reboot the Pi to start the updated robot runtime."
+
+}
+main "$@"

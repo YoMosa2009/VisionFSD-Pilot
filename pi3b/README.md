@@ -81,39 +81,47 @@ updates can then use `bash ~/visionfsd-pi/pi3b/update.sh`.
 
 ### Automatic updates on boot
 
-`run_robot.sh` runs `auto_update.sh` once before the robot autostarts, so a
-manual `update.sh` run is no longer required before every test session. It is
-deliberately conservative and bounded:
+`run_robot.sh` checks for an update before starting the runtime. From v1.9.17:
 
-- A `git fetch` with a (default 12 s) timeout; if it fails or times out, the
-  robot launches on whatever is already installed.
-- Skipped entirely if `pi3b/.install-ref` is missing (a fresh checkout that
-  has never run `update.sh`) -- it never guesses a ref to deploy.
-- Skipped entirely if the checked-out `pi3b`/Uno-firmware files have local
-  edits -- it never stashes changes on your behalf. Run `update.sh` manually
-  in that case.
-- If a new commit is fetched, it calls the same `update.sh` used for manual
-  updates; if that fails partway (no network for a pip/model download, for
-  example), it rolls back to the previously installed commit rather than
-  leaving the robot on a broken checkout.
-- If an update was applied, `run_robot.sh` re-execs itself once so a fresh
-  process picks up the new code, then continues its normal startup sequence
-  (device wait, dashboard, launch).
+- Fetch retries up to three times, with a default 12-second timeout per attempt
+  and two seconds between attempts, to allow the boot network to become ready.
+- The branch comes from `.install-ref`; a missing file defaults to this robot's
+  deployment branch, `codex/pi3b-runtime`.
+- Permission-only working-tree changes from installation do not block updates.
+  Staged or unstaged tracked content edits do block them and remain untouched.
+  Untracked files are preserved; checkout conflicts abort the update.
+- Updates use the exact fetched commit, compile its Python files before checkout,
+  and restart the launcher once while retaining the process lock. The launcher
+  and manual updater parse their complete shell bodies before replacing files.
+- Boot updates do not run sudo, pip or model downloads. A changed requirements
+  file requires the normal manual `update.sh` command, and is reported explicitly.
+- Offline or rejected updates keep the installed code. A post-checkout failure
+  rolls back. A failed rollback withholds startup and records `update-blocked`;
+  a successful manual update clears that marker.
 
-Both the auto-update step and the eventual robot launch are logged to
-`pi3b/logs/robot.log`, prefixed `=== VisionFSD auto-update: ... ===`.
+Read `pi3b/logs/update-status.txt` for the latest result, installed commit and
+reason for any skipped update. `pi3b/logs/robot.log` also records the startup
+version and commit. A successful GitHub push does **not** verify Pi installation.
+Set `VISIONFSD_AUTO_UPDATE=0` to disable checks, or
+`VISIONFSD_AUTO_UPDATE_TIMEOUT_S` to change the fetch timeout (1–30 seconds).
 
-If the robot won't start and you suspect the newest commit, the escape hatch
-is to boot once with auto-update disabled and fix or roll back by hand:
+For a Pi still running v1.9.14, perform this recovery once while the robot is
+stopped, then reboot. It uses the current recovery script rather than the
+possibly broken updater already installed:
 
 ```bash
-VISIONFSD_AUTO_UPDATE=0 bash ~/visionfsd-pi/pi3b/run_robot.sh
+curl -fsSL https://raw.githubusercontent.com/YoMosa2009/VisionFSD-Pilot/codex/pi3b-runtime/pi3b/recover-update.sh -o /tmp/visionfsd-recover.sh &&
+  bash /tmp/visionfsd-recover.sh && sudo reboot
 ```
 
-Set `VISIONFSD_AUTO_UPDATE=0` in the environment permanently (for example
-while iterating on local edits without wanting them silently left alone every
-boot) to disable auto-update every run; set `VISIONFSD_AUTO_UPDATE_TIMEOUT_S`
-to change the fetch timeout.
+Then confirm the dashboard version and inspect:
+
+```bash
+cat ~/visionfsd-pi/pi3b/VERSION
+cat ~/visionfsd-pi/pi3b/logs/update-status.txt
+git -C ~/visionfsd-pi rev-parse HEAD
+tail -n 100 ~/visionfsd-pi/pi3b/logs/robot.log
+```
 
 ## OSOYOO Model 3 robot mode
 
@@ -516,6 +524,41 @@ offset obstacles. Retain the NAV log, especially `cam_ms`, `control_gap_ms`,
 
 Implementation references: [OpenCV sparse optical flow](https://docs.opencv.org/4.12.0/dc/d6b/group__video__track.html)
 and [LDROBOT SDK data processing](https://github.com/ldrobotSensorTeam/ldlidar_sdk/blob/master/src/ldlidar_dataprocess.cpp).
+
+### v1.9.17: recover stalled USB calibration and repair boot updates
+
+The v1.9.14 photo shows calibration at 50% with `HOLD ACCEPTING`, stopped
+motors and deferred camera. It does not establish the underlying USB fault.
+The [Blinka MCP2221 transport](https://github.com/adafruit/Adafruit_Blinka/blob/main/src/adafruit_blinka/microcontroller/mcp2221/mcp2221.py)
+uses a blocking HID read without a timeout and has an unbounded I2C status loop.
+Previously either could strand the sampling thread indefinitely.
+
+USB access now runs in one spawned process, isolated from navigation.
+A transaction exceeding 0.75 seconds, or adapter initialization exceeding eight
+seconds, terminates that process and releases its USB handle. The existing
+one-second reconnect path creates a new owner. Accepted calibration samples
+and calibrated bias stay in the parent sampler. No abandoned reader competes
+for the adapter. Stale calibration reports `USB WAIT`; a failed transaction
+reports `USB RETRY` and logs the error. A recognized IMU with a configuration
+fault stays detected and cannot be mistaken for an absent optional IMU.
+Calibration acceptance thresholds and the motor readiness gate are unchanged.
+
+The installer previously chmod'ed launchers stored in Git as 100644. This
+created permission-only modifications on Linux, and the old boot updater could
+skip every subsequent update. Script modes and update checks are now consistent;
+see the boot-update section above for recovery and diagnostics.
+
+Regression tests deliberately block USB initialization/reads, verify reader
+termination and replacement, and resume calibration after a simulated timeout.
+Update tests use real temporary Git repositories for fetch, checkout, repeat
+boot, offline retries, permission changes, edited files and rollback. A Bash
+launcher integration test runs the actual update and re-exec path with a dummy
+runtime and stand-ins for Linux utilities absent on Windows. These desktop tests
+do not verify Pi USB timing, Linux lock behavior, physical calibration or driving.
+
+Next supervised test: confirm **v1.9.17**, keep the robot stationary while the
+IMU calibrates, then confirm camera readiness and motion. If it stays stopped,
+retain the startup/update log and IMU error lines instead of waiting ten minutes.
 
 ### USB LSM6DS3 mounting
 

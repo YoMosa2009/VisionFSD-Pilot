@@ -3,6 +3,9 @@
 # robot/firmware/visionfsd_pi_autonomy/visionfsd_pi_autonomy.ino first.
 set -euo pipefail
 
+# Parse the complete launcher before OTA can replace this file.
+main() {
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON="$ROOT/.venv/bin/python"
 
@@ -22,9 +25,11 @@ if ! command -v flock >/dev/null 2>&1; then
 fi
 # Raspberry Pi desktop releases may execute both XDG and compositor autostart
 # entries.  Only one process may own the Uno, LD19, and webcam.
-exec 9>"$LOG_DIR/robot.lock"
-if ! flock -n 9; then
-  exit 0
+# Preserve the inherited lock across our own exec; reopening it creates a
+# duplicate-start gap. A fresh invocation still has to acquire the lock.
+if [[ "${VISIONFSD_POST_UPDATE_REEXEC:-0}" != "1" ]] || ! flock -n 9 2>/dev/null; then
+  exec 9>"$LOG_DIR/robot.lock"
+  if ! flock -n 9; then exit 0; fi
 fi
 LOG="$LOG_DIR/robot.log"
 # Skipped on the re-exec below (see auto-update block just after) so this
@@ -50,7 +55,10 @@ if [[ "${VISIONFSD_POST_UPDATE_REEXEC:-0}" != "1" ]]; then
   if [[ "${auto_update_status:-0}" -eq 2 ]]; then
     echo "auto-update applied a new version; restarting run_robot.sh" >>"$LOG"
     export VISIONFSD_POST_UPDATE_REEXEC=1
-    exec "$ROOT/run_robot.sh" "$@"
+    exec bash "$ROOT/run_robot.sh" "$@"
+  elif [[ "${auto_update_status:-0}" -ne 0 ]]; then
+    echo "Updater failed; runtime withheld. See $LOG" >&2
+    exit 1
   fi
 fi
 
@@ -72,6 +80,7 @@ fi
 {
   echo "=== VisionFSD robot start: $(date -Is) ==="
   echo "version: $(tr -d '\r\n' < "$ROOT/VERSION" 2>/dev/null)"
+  echo "commit: $(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
   echo "serial: $(ls /dev/ttyACM* /dev/ttyUSB* 2>/dev/null | tr '\n' ' ')"
   echo "display: DISPLAY=${DISPLAY:-unset} WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-unset} QT_QPA_PLATFORM=${QT_QPA_PLATFORM:-unset}"
   if command -v vcgencmd >/dev/null 2>&1; then
@@ -108,3 +117,6 @@ if [[ -t 1 ]]; then
 fi
 exec >>"$LOG" 2>&1
 exec "$PYTHON" -u "${ARGS[@]}"
+
+}
+main "$@"

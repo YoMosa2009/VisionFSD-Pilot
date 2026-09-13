@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import math
+import multiprocessing
 import os
 import statistics
 import threading
@@ -45,9 +46,10 @@ class IMUState:
     calibration_hold: str = ""
     sample_interval_s: float = 0.0
     sample_gaps: int = 0
+    detected: bool = False
 
 
-class _MCP2221Bus:
+class _BlinkaMCP2221Bus:
     """SMBus-shaped adapter over Blinka's MCP2221 USB-I2C transport."""
 
     def __init__(self) -> None:
@@ -83,6 +85,99 @@ class _MCP2221Bus:
         if not self._closed:
             self._closed = True
             self._i2c.unlock()
+
+
+def _usb_bus_worker(connection, bus_factory) -> None:
+    """Own Blinka and its HID handle in a disposable process.
+
+    Blinka can block inside hid.read or an I2C status loop. A thread timeout
+    cannot release that handle safely; only this process ever touches it.
+    """
+    bus = None
+    try:
+        bus = bus_factory()
+        connection.send((True, None))
+        while True:
+            method, args = connection.recv()
+            if method == "close":
+                break
+            try:
+                result = getattr(bus, method)(*args)
+                connection.send((True, result))
+            except Exception as exc:
+                connection.send((False, str(exc)))
+    except Exception as exc:
+        try:
+            connection.send((False, str(exc)))
+        except (EOFError, BrokenPipeError, OSError):
+            pass
+    finally:
+        if bus is not None:
+            bus.close()
+        connection.close()
+
+
+class _MCP2221Bus:
+    """Bound USB operations without abandoning a thread holding the adapter."""
+
+    def __init__(self, bus_factory=None, startup_timeout_s=8.0,
+                 transaction_timeout_s=0.75) -> None:
+        context = multiprocessing.get_context("spawn")
+        self._connection, child = context.Pipe()
+        self._timeout = transaction_timeout_s
+        self._process = context.Process(
+            target=_usb_bus_worker,
+            args=(child, bus_factory or _BlinkaMCP2221Bus),
+            name="imu-usb", daemon=True,
+        )
+        self._process.start()
+        child.close()
+        try:
+            self._receive(startup_timeout_s)
+        except Exception:
+            self.close()
+            raise
+
+    def _receive(self, timeout_s):
+        try:
+            if not self._connection.poll(timeout_s):
+                raise OSError("MCP2221 USB timeout; reopening adapter")
+            ok, result = self._connection.recv()
+        except (EOFError, BrokenPipeError, OSError) as exc:
+            self.close()
+            raise OSError(str(exc) or "MCP2221 USB worker exited") from exc
+        # A sensor NACK is a completed transaction, not a dead USB reader.
+        # Keep the owner alive so automatic probing can try address 0x6B.
+        if not ok:
+            raise OSError(result)
+        return result
+
+    def _call(self, method, *args):
+        try:
+            self._connection.send((method, args))
+        except (EOFError, BrokenPipeError, OSError) as exc:
+            self.close()
+            raise OSError("MCP2221 USB worker unavailable") from exc
+        return self._receive(self._timeout)
+
+    def read_byte_data(self, address, register):
+        return self._call("read_byte_data", address, register)
+
+    def write_byte_data(self, address, register, value):
+        return self._call("write_byte_data", address, register, value)
+
+    def read_i2c_block_data(self, address, register, length):
+        return self._call("read_i2c_block_data", address, register, length)
+
+    def close(self):
+        # Termination releases the OS HID handle even if Blinka cannot return.
+        if self._process.is_alive():
+            self._process.terminate()
+            self._process.join(timeout=0.5)
+        if self._process.is_alive():
+            self._process.kill()
+            self._process.join(timeout=0.5)
+        self._connection.close()
 
 
 def _mcp2221_bus_factory(_bus_number: int) -> _SMBusLike:
@@ -145,6 +240,7 @@ class LSM6DS3MCP2221Link:
         self._gyro_bias = (0.0, 0.0, 0.0)
         self._stationary_bias_samples = 0
         self._calibrated = False
+        self._detected = False
         self._calibration_hold = "WAITING"
         self._last_sample_at = 0.0
         self._connected_at = 0.0
@@ -199,6 +295,7 @@ class LSM6DS3MCP2221Link:
                     errors.append(f"0x{address:02X}: {exc}")
                     continue
                 if identity in self.EXPECTED_IDS:
+                    self._detected = True
                     self.address = address
                     break
                 errors.append(f"0x{address:02X}: WHO_AM_I 0x{identity:02X}")
@@ -243,6 +340,8 @@ class LSM6DS3MCP2221Link:
             except Exception:
                 pass
         self._error = str(error)
+        if not self._calibrated:
+            self._calibration_hold = "USB RETRY"
         self._next_connect_at = now + self.RETRY_SECONDS
         self._last_sample_at = 0.0
         self._connected_at = 0.0
@@ -428,6 +527,7 @@ class LSM6DS3MCP2221Link:
             calibration_hold=self._calibration_hold,
             sample_interval_s=self._sample_interval_s,
             sample_gaps=self._sample_gaps,
+            detected=self._detected,
         )
 
     def close(self) -> None:
@@ -457,17 +557,20 @@ class AsyncIMULink:
         self._thread.start()
 
     def _run(self) -> None:
-        while not self._stop.is_set():
-            with self._lock:
-                stationary = self._stationary
-            now = time.monotonic()
-            try:
-                state = self._link.tick(now, stationary)
-            except Exception as exc:
-                state = IMUState(error=f"IMU sampler error: {exc}", source=LSM6DS3MCP2221Link.SENSOR_NAME)
-            with self._lock:
-                self._state = state
-            self._stop.wait(max(0.0, self._sample_period_s - (time.monotonic() - now)))
+        try:
+            while not self._stop.is_set():
+                with self._lock:
+                    stationary = self._stationary
+                now = time.monotonic()
+                try:
+                    state = self._link.tick(now, stationary)
+                except Exception as exc:
+                    state = IMUState(error=f"IMU sampler error: {exc}", source=LSM6DS3MCP2221Link.SENSOR_NAME)
+                with self._lock:
+                    self._state = state
+                self._stop.wait(max(0.0, self._sample_period_s - (time.monotonic() - now)))
+        finally:
+            self._link.close()
 
     def tick(self, _now: float | None = None, stationary: bool = True) -> IMUState:
         with self._lock:
@@ -479,13 +582,14 @@ class AsyncIMULink:
         with self._lock:
             state = self._state
         # Age completed measurements even when a USB read blocks the sampler.
+        fresh = (state.fresh and state.connected
+                 and now - state.updated_at <= LSM6DS3MCP2221Link.MAX_SAMPLE_AGE_S)
         return replace(
-            state,
-            fresh=(state.fresh and state.connected
-                   and now - state.updated_at <= LSM6DS3MCP2221Link.MAX_SAMPLE_AGE_S),
+            state, fresh=fresh,
+            calibration_hold=("USB WAIT" if state.connected and not fresh
+                              and not state.calibrated else state.calibration_hold),
         )
 
     def close(self) -> None:
         self._stop.set()
         self._thread.join(timeout=2.0)
-        self._link.close()

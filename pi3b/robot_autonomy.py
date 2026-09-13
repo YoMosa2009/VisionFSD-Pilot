@@ -2284,14 +2284,14 @@ def main() -> int:
                 )
                 if imu_state.error != last_imu_error:
                     if imu_state.error:
-                        print(f"IMU unavailable; camera+LD19 pose active: {imu_state.error}")
+                        print(f"IMU USB error: {imu_state.error}")
                     elif last_imu_error:
                         print(f"{imu_state.source} connected; calibrating while stationary")
                     last_imu_error = imu_state.error
                 if imu_state.calibrated and imu_state.source != calibrated_source:
                     print(f"{imu_state.source} calibrated; measured yaw enabled")
                     calibrated_source = imu_state.source
-                imu_detected = imu_detected or imu_state.connected
+                imu_detected = imu_detected or imu_state.connected or imu_state.detected
                 imu_calibration_complete = (
                     imu_calibration_complete or imu_state.calibrated
                 )

@@ -2,6 +2,8 @@
 # Update an existing Pi deployment without re-imaging or reconfiguring it.
 set -euo pipefail
 
+main() {
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PI_ROOT="$ROOT/pi3b"
 REF_FILE="$PI_ROOT/.install-ref"
@@ -31,14 +33,14 @@ fi
 
 # Installed Pi checkouts are read-only in normal use, but preserve any tracked
 # local edits instead of making checkout fail or deleting them.
-if ! git -C "$ROOT" diff --quiet -- pi3b robot/firmware/visionfsd_pi_autonomy; then
+if ! git -c core.filemode=false -C "$ROOT" diff HEAD --quiet -- pi3b robot/firmware/visionfsd_pi_autonomy; then
   backup_name="visionfsd-pi-update-$(date +%Y%m%d-%H%M%S)"
   git -C "$ROOT" stash push -m "$backup_name" -- pi3b robot/firmware/visionfsd_pi_autonomy
   echo "Backed up local Pi changes in git stash: $backup_name"
 fi
 
 git -C "$ROOT" fetch --depth 1 origin "$REF"
-git -C "$ROOT" checkout --detach FETCH_HEAD
+git -c core.filemode=false -C "$ROOT" checkout --detach FETCH_HEAD
 configure_sparse_checkout
 chmod +x \
   "$PI_ROOT/install.sh" \
@@ -96,6 +98,10 @@ if [[ -d "$HOME/.config/labwc" ]] && ! grep -qs "visionfsd" "$labwc_autostart"; 
   echo "Autostart: added to $labwc_autostart"
 fi
 printf '%s\n' "$REF" > "$REF_FILE"
+rm -f "$PI_ROOT/logs/update-blocked"
 version="$(tr -d '\r\n' < "$PI_ROOT/VERSION")"
 echo "Updated VisionFSD Pi to v$version from $REF"
 echo "Robot mode: re-flash $ROOT/robot/firmware/visionfsd_pi_autonomy/visionfsd_pi_autonomy.ino to the Uno before testing."
+
+}
+main "$@"
