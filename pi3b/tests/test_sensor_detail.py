@@ -11,7 +11,8 @@ import numpy as np
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from lidar_visualizer import LidarPoint, LivePolarMap
-from robot_autonomy import CameraSafety, ArduinoStatus, AutonomousPolicy, SectorClearance, STEER_HEADINGS, corridor_profile
+from robot_autonomy import (CameraSafety, ArduinoStatus, AutonomousPolicy, FRONT_OVERHANG_M,
+                            SectorClearance, STEER_HEADINGS, corridor_profile)
 from robot_camera_motion import CameraMotionState, estimate_motion
 from robot_slam_lite import LidarSlamLite
 
@@ -153,7 +154,11 @@ class LidarDetailTests(unittest.TestCase):
         point = LidarPoint(16.8, 500, 200, 1.)
         profile = corridor_profile([(0, point)], np.array([0.], dtype=np.float32))
         self.assertLess(profile[0], .45)
-        self.assertAlmostEqual(profile[0], .5 * np.cos(np.radians(16.8)) - .075, places=5)
+        self.assertAlmostEqual(
+            profile[0],
+            .5 * np.cos(np.radians(16.8)) - FRONT_OVERHANG_M,
+            places=5,
+        )
 
     def test_map_yaw_deskew_aligns_rotating_returns_without_changing_ranges(self):
         points = [(i, LidarPoint((-30. * age) % 360., 1000, 200, 1. - age))

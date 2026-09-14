@@ -45,7 +45,16 @@ class FrontierExplorer:
     ROBOT_CLEARANCE_M = 0.14
     MIN_FRONTIER_CELLS = 4
     MIN_TARGET_DISTANCE_M = 0.45
-    WAYPOINT_LOOKAHEAD_M = 0.85
+    # Pure-pursuit lookahead. Raised from 0.85 m after testing showed the
+    # robot turning continuously all the way along a curved route.
+    #
+    # The waypoint is chased, so the lookahead sets how hard the chassis is
+    # asked to turn: a short one keeps the target close and off to the side,
+    # which holds a large heading error the whole way round a bend and reads
+    # as one endless sharp turn. It also has to be large relative to the turn
+    # radius - about 1.0 m here - or the robot is being asked to cut inside a
+    # circle it cannot physically follow, and simply saturates.
+    WAYPOINT_LOOKAHEAD_M = 1.30
     TARGET_REACHED_M = 0.30
     MAX_ASTAR_VISITS = 12_000
     PLAN_TIME_BUDGET_S = 0.045

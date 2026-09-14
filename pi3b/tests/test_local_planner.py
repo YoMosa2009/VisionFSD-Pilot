@@ -19,11 +19,11 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from robot_autonomy import (
     ARC_STEER_OPTIONS,
-    BODY_RADIUS_M,
     CHASSIS_TURN_RATE_DPS_AT_FULL_SPLIT,
     MAX_GENTLE_HEADING_DEG,
     MAX_PWM,
     MAX_TURN_SPLIT_PWM,
+    ROBOT_FOOTPRINT,
 )
 from robot_local_planner import (
     ArcBank,
@@ -41,6 +41,7 @@ SPEEDS = tuple((pwm, 0.55 * pwm / 255.0) for pwm in (105, 111, 118))
 def _limits(**overrides) -> PlannerLimits:
     """Planner limits with the runtime's own chassis turn model."""
     base = dict(
+        footprint=ROBOT_FOOTPRINT,
         yaw_rate_dps_at_full_steer=(
             MAX_TURN_SPLIT_PWM / MAX_PWM * CHASSIS_TURN_RATE_DPS_AT_FULL_SPLIT
         ),
@@ -61,7 +62,7 @@ def _wall(distance_m: float, half_width_m: float = 2.0, count: int = 400):
 
 def _choose(obstacle_x, obstacle_y, goal=None, steering=0.0, limits=None):
     return evaluate_arcs(
-        obstacle_x, obstacle_y, _bank(limits), BODY_RADIUS_M, goal, steering
+        obstacle_x, obstacle_y, _bank(limits), goal, steering
     )
 
 
@@ -240,12 +241,12 @@ class SpeedGovernorTests(unittest.TestCase):
         fast = evaluate_arcs(
             wall_x, wall_y,
             ArcBank(cautious, ARC_STEER_OPTIONS, fast_speeds),
-            BODY_RADIUS_M, None, 0.0,
+            None, 0.0,
         )
         slow = evaluate_arcs(
             wall_x, wall_y,
             ArcBank(optimistic, ARC_STEER_OPTIONS, slow_speeds),
-            BODY_RADIUS_M, None, 0.0,
+            None, 0.0,
         )
         self.assertGreaterEqual(slow.stopping_m * 4.0, 0.0)
         if fast.admissible and slow.admissible:
@@ -332,11 +333,11 @@ class ObstacleMemoryTests(unittest.TestCase):
         planner.memory.add_scan(angles, ranges, 1.0)
         remembered_x, remembered_y = planner.memory.cartesian()
         blind = evaluate_arcs(
-            remembered_x, remembered_y, _bank(), BODY_RADIUS_M, None, 0.0
+            remembered_x, remembered_y, _bank(), None, 0.0
         )
         empty = np.zeros(0, dtype=np.float32)
         forgetful = evaluate_arcs(
-            empty, empty, _bank(), BODY_RADIUS_M, None, 0.0
+            empty, empty, _bank(), None, 0.0
         )
         self.assertTrue(forgetful.admissible)
         self.assertLess(blind.reachable_m, forgetful.reachable_m)
@@ -417,10 +418,10 @@ class PlannerBudgetTests(unittest.TestCase):
         rng = np.random.default_rng(0)
         x = rng.uniform(-3.0, 3.0, 1500).astype(np.float32)
         y = rng.uniform(-3.0, 3.0, 1500).astype(np.float32)
-        evaluate_arcs(x, y, bank, BODY_RADIUS_M, 10.0, 0.0)
+        evaluate_arcs(x, y, bank, 10.0, 0.0)
         started = time.perf_counter()
         for _ in range(20):
-            evaluate_arcs(x, y, bank, BODY_RADIUS_M, 10.0, 0.0)
+            evaluate_arcs(x, y, bank, 10.0, 0.0)
         elapsed = (time.perf_counter() - started) / 20.0
         # Generous versus this desktop so the bound still means something on a
         # Pi 3B, but far below the 0.5 s Uno lease it must not threaten.

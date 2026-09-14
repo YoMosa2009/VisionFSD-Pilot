@@ -35,9 +35,12 @@ from robot_explorer import ExplorationState, FrontierExplorer
 from robot_imu import AsyncIMULink, IMUState, LSM6DS3MCP2221Link
 from robot_local_planner import (
     ArcChoice,
+    Footprint,
+    GapChoice,
     LocalPlanner,
     PlannerLimits,
     evaluate_arcs,
+    find_gap,
 )
 from robot_motion import (
     ScanMotionResult,
@@ -46,7 +49,7 @@ from robot_motion import (
     signature_from_arrays,
 )
 from robot_slam_lite import LidarSlamLite, SlamLiteState
-from robot_web import start_dashboard_server
+from robot_web import RobotControl, start_dashboard_server
 from visionfsd_pi import (
     LatestCamera,
 )
@@ -83,6 +86,8 @@ MIN_MOVE_PWM = 105
 DEFAULT_CRUISE_PWM = 112
 # Largest direct-PWM rise per planner decision after the initial non-stalling
 # floor.  The Uno applies its own 20 ms output ramp as the final authority.
+# Nominal per-tick ramp steps, retained for the swept-arc sampling density
+# below. The live drive ramps are per-second; see MAX_PWM_RATE_PER_S.
 MAX_PWM_STEP = 4
 # Straight cruise stays low, but a useful forward arc needs more than the old
 # eight-PWM split.  Bounded outer-wheel headroom supplies yaw while the inside
@@ -177,9 +182,6 @@ EMERGENCY_BRAKE_ULTRASONIC_CM = 30.0
 EMERGENCY_BRAKE_S = 0.22
 # Arc planner: candidate steering commands, in degrees.
 ARC_STEER_OPTIONS = np.arange(-36.0, 36.1, 9.0, dtype=np.float32)
-# Radius of the circle that covers the chassis footprint, used for the arc
-# collision check. Half the diagonal, so it is never optimistic.
-BODY_RADIUS_M = math.hypot(0.14, 0.15) / 2.0
 # Default estimate of chassis speed at full PWM. This robot has no encoders,
 # so it is an estimate and not a measurement; every distance the speed
 # governor computes scales with it, and setting it too high only makes the
@@ -190,6 +192,28 @@ DEFAULT_TOP_SPEED_MPS = 0.55
 # control tick: re-deciding faster than the measurement updates spends Pi 3B
 # cycles without changing the answer.
 ARC_REPLAN_PERIOD_S = 0.07
+# Gap seeking: how long a chosen opening is held before it may be re-decided,
+# and how close the heading has to get before forward planning resumes.
+GAP_COMMIT_S = 2.60
+GAP_ALIGNED_DEG = 14.0
+# Rate limits are expressed per second, not per control tick.
+#
+# Per-tick limits silently couple responsiveness to loop rate: a tick spent
+# rendering the dashboard or replanning a route made the steering and PWM
+# ramps advance no further than an idle one, so the chassis felt laggy
+# exactly when the scene was busiest. These are the previous per-tick steps
+# times the nominal 30 Hz loop, so nominal behaviour is unchanged and a slow
+# tick now catches up instead of falling behind.
+MAX_STEERING_RATE_DPS = 75.0
+MAX_PWM_RATE_PER_S = 120.0
+# Target control period. The loop sleeps the remainder of this rather than a
+# fixed amount on top of however long the work took.
+CONTROL_PERIOD_S = 0.025
+# Wheel commands for a manual direction request from the dashboard. Pivots use
+# the same boosted level as an escape pivot, because they fight the same tyre
+# scrub. Forward is deliberately the movement floor: manual driving exists to
+# nudge the robot out of somewhere, not to race it.
+MANUAL_FORWARD_MIN_M = 0.32
 OPENING_HALF_WIDTH_DEG = 5
 DISPLAY_PERIOD_S = 0.10
 TELEMETRY_PERIOD_S = 1.0
@@ -256,11 +280,32 @@ LD19_PACKET_STALE_S = 0.25
 # Measured chassis, in metres.  The planner needs its own width because a
 # rectangle fits through a gap that a point always would: this is what lets it
 # steer around an object rather than treat one sector as blocked.
-ROBOT_WIDTH_M = 0.14
-ROBOT_LENGTH_M = 0.15
-SAFETY_MARGIN_M = 0.075
+# Measured chassis, not an estimate: 9 x 10.5 inches over the wheels.
+#
+# The previous 0.14 x 0.15 m figures understated the robot by about 60% in
+# width and 80% in length, so every corridor and footprint check was computed
+# for a robot substantially smaller than the one driving. That is the most
+# likely remaining cause of clipping furniture: the geometry said the gap fit.
+ROBOT_WIDTH_M = 9.0 * 0.0254
+ROBOT_LENGTH_M = 10.5 * 0.0254
+# Trimmed from 0.075 because the footprint it pads is now correct rather than
+# optimistic; the net swept corridor still widens.
+SAFETY_MARGIN_M = 0.055
 CORRIDOR_HALF_WIDTH_M = ROBOT_WIDTH_M / 2.0 + SAFETY_MARGIN_M
 FRONT_OVERHANG_M = ROBOT_LENGTH_M / 2.0
+# Two-circle cover of the measured rectangle, used for the arc collision
+# check. See Footprint: a single circumscribed circle would have a 17.6 cm
+# radius against a true half-width of 11.4 cm and would refuse gaps the robot
+# fits through.
+ROBOT_FOOTPRINT = Footprint.from_rectangle(ROBOT_WIDTH_M, ROBOT_LENGTH_M)
+_MANUAL_PIVOT_PWM = min(MAX_PWM, MIN_MOVE_PWM + ESCAPE_PIVOT_BOOST_PWM)
+MANUAL_DRIVE = {
+    "F": (MIN_MOVE_PWM, MIN_MOVE_PWM),
+    "B": (-MIN_MOVE_PWM, -MIN_MOVE_PWM),
+    "L": (-_MANUAL_PIVOT_PWM, _MANUAL_PIVOT_PWM),
+    "R": (_MANUAL_PIVOT_PWM, -_MANUAL_PIVOT_PWM),
+    "STOP": (0, 0),
+}
 PLANNING_HORIZON_M = 3.0
 # Candidate headings for the corridor sweep, symmetric so straight ahead is
 # itself an option rather than falling between two near-tied neighbours.
@@ -1056,6 +1101,7 @@ class AutonomousPolicy:
         self.local_planner = LocalPlanner(
             limits=PlannerLimits(
                 top_speed_mps=top_speed_mps,
+                footprint=ROBOT_FOOTPRINT,
                 yaw_rate_dps_at_full_steer=(
                     MAX_TURN_SPLIT_PWM
                     / MAX_PWM
@@ -1071,6 +1117,14 @@ class AutonomousPolicy:
         self._brake_until = 0.0
         self._next_arc_search_at = 0.0
         self._imu_yaw_reference_deg: float | None = None
+        self.gap = GapChoice()
+        self._gap_bearing_deg: float | None = None
+        self._gap_commit_until = 0.0
+        self._gap_started_yaw_deg: float | None = None
+        self._gap_yaw_source = "TIME"
+        self._last_output_at = 0.0
+        self._output_elapsed_s = CONTROL_PERIOD_S
+        self.control: RobotControl | None = None
         self.standby_s = standby_s
         self.speed = max(min_move_pwm, speed)
         self.min_move_pwm = min_move_pwm
@@ -1259,6 +1313,22 @@ class AutonomousPolicy:
         values = [value for value in (primary, outer) if value is not None]
         return min(values) if values else None
 
+    def _note_output_tick(self, now: float) -> None:
+        """Record how long since the last output so ramps can be per-second."""
+        previous = self._last_output_at
+        self._last_output_at = now
+        self._output_elapsed_s = (
+            CONTROL_PERIOD_S
+            if previous <= 0.0
+            else min(0.20, max(0.001, now - previous))
+        )
+
+    def _pwm_step(self) -> int:
+        return max(1, int(round(MAX_PWM_RATE_PER_S * self._output_elapsed_s)))
+
+    def _steering_step_deg(self) -> float:
+        return max(0.2, MAX_STEERING_RATE_DPS * self._output_elapsed_s)
+
     def _ramp(self, current: int, target: int) -> int:
         """Use a direct, non-buzzing motor band with a controlled rise.
 
@@ -1277,15 +1347,60 @@ class AutonomousPolicy:
             # Brake to zero before reversing; the following decision begins
             # the other direction at the non-stalling floor.
             return 0
+        step = self._pwm_step()
         if abs(target) < abs(current):
-            magnitude = max(abs(target), abs(current) - MAX_PWM_STEP)
+            magnitude = max(abs(target), abs(current) - step)
             return direction * magnitude
-        return direction * min(abs(target), abs(current) + MAX_PWM_STEP)
+        return direction * min(abs(target), abs(current) + step)
 
     def _set_output(self, label: str, left_pwm: int, right_pwm: int) -> str:
         self.left_pwm = self._ramp(self.left_pwm, int(np.clip(left_pwm, -MAX_PWM, MAX_PWM)))
         self.right_pwm = self._ramp(self.right_pwm, int(np.clip(right_pwm, -MAX_PWM, MAX_PWM)))
         return label
+
+    def _apply_control_mode(
+        self, lidar: SectorClearance, arduino: ArduinoStatus, now: float
+    ) -> str | None:
+        """Honour a halt or a manual command from the dashboard.
+
+        Manual driving keeps the independent safety layers underneath it: the
+        Uno still refuses a forward command inside its ultrasonic stop, and a
+        forward request is refused here when the LD19 says the space ahead is
+        gone. Reverse and pivots stay available, because the whole point of
+        taking manual control is usually to drive out of somewhere the
+        planner could not.
+        """
+        control = self.control
+        if control is None:
+            return None
+        if control.halted:
+            self.reason = "STOP:HALTED_BY_OPERATOR"
+            self.drive_confidence = 0.0
+            self._reset_escape()
+            self._reset_stuck_state()
+            return self._hold_stop(self.reason)
+        if not control.manual:
+            return None
+        command = control.manual_command(now)
+        left, right = MANUAL_DRIVE.get(command, (0, 0))
+        forward = left > 0 and right > 0
+        if forward:
+            straight = lidar.limit_at(0.0)
+            if straight is None:
+                straight = lidar.front_m
+            blocked = (
+                arduino.front_cm is not None
+                and arduino.front_cm < CLOSE_ULTRASONIC_CM
+            ) or (straight is not None and straight < MANUAL_FORWARD_MIN_M)
+            if blocked:
+                self.reason = "STOP:MANUAL_FORWARD_BLOCKED"
+                self.drive_confidence = 0.0
+                return self._set_output("STOP", 0, 0)
+        self.reason = f"MANUAL:{command}"
+        self.drive_confidence = 0.0
+        self._arc_active = False
+        return self._set_output(command if command != "STOP" else "STOP",
+                                left, right)
 
     def _raw_turn_side_score(
         self, lidar: SectorClearance, direction: str
@@ -1696,10 +1811,9 @@ class AutonomousPolicy:
         target_heading = float(
             np.clip(heading_deg, -MAX_GENTLE_HEADING_DEG, MAX_GENTLE_HEADING_DEG)
         )
+        step = self._steering_step_deg()
         steering_delta = float(np.clip(
-            target_heading - self._steering_deg,
-            -MAX_STEERING_STEP_DEG,
-            MAX_STEERING_STEP_DEG,
+            target_heading - self._steering_deg, -step, step
         ))
         self._steering_deg += steering_delta
         heading = self._steering_deg
@@ -1757,11 +1871,11 @@ class AutonomousPolicy:
         """
         top = self.local_planner.limits.top_speed_mps
         levels = [self.min_move_pwm]
-        middle = (self.min_move_pwm + self.speed) // 2
-        if middle > self.min_move_pwm:
-            levels.append(middle)
-        if self.speed > middle and not self.visual_caution:
+        if self.speed > self.min_move_pwm and not self.visual_caution:
             levels.append(self.speed)
+        # Two levels, not three. The usable band between the motor deadband
+        # and cruise is only a few PWM wide, so a middle level is not a
+        # materially different speed - it just costs a third of the search.
         return tuple((pwm, top * pwm / 255.0) for pwm in sorted(set(levels)))
 
     def _drive_arc(self, lidar: SectorClearance, now: float) -> str | None:
@@ -1791,16 +1905,19 @@ class AutonomousPolicy:
                 self.local_planner.bank(
                     ARC_STEER_OPTIONS, self._speed_options()
                 ),
-                BODY_RADIUS_M,
                 goal_heading,
                 self._steering_deg,
             )
             self.local_planner.last_choice = self.arc
         choice = self.arc
         if not choice.admissible:
-            # Nothing the chassis could still stop inside. This is the
-            # condition the previous planner expressed as "drive anyway and
-            # hope", which is what produced contact with walls.
+            # Nothing the chassis could still stop inside. Before falling back
+            # to the blind escape pivot, ask the scan where the actual
+            # openings are: repeatedly pivoting a fixed amount and
+            # re-evaluating is what looked like spinning in a cluttered room.
+            gap_command = self._seek_gap(lidar, now)
+            if gap_command is not None:
+                return gap_command
             return self._start_escape(lidar, now, "NO_SAFE_ARC")
         self._arc_active = abs(choice.steering_deg) > 6.0
         self.drive_confidence = float(np.clip(choice.reachable_m / 2.0, 0.0, 1.0))
@@ -1816,6 +1933,89 @@ class AutonomousPolicy:
                 f"pwm{choice.pwm}"
             )
         return self._differential(choice.pwm, choice.steering_deg)
+
+    def _seek_gap(self, lidar: SectorClearance, now: float) -> str | None:
+        """Pivot toward a measured opening and commit to it.
+
+        The arc search only sees headings the chassis can reach while still
+        rolling, roughly plus or minus 36 degrees. Surrounded by furniture,
+        every one of those is blocked and the old answer was a fixed-size
+        blind pivot re-decided on arrival - which in a cluttered room is
+        exactly the repeated spinning that never commits to anything.
+
+        This asks the whole revolution where the real openings are, turns to
+        face the best one, and holds that commitment until the heading is
+        reached or the opening stops existing. Committing is the point: the
+        known failure of gap-following is two similar gaps swapping rank
+        between scans, so the choice is deliberately sticky.
+        """
+        if self._obstacle_x.size == 0:
+            return None
+        if now < self._gap_commit_until and self._gap_bearing_deg is not None:
+            held = self._gap_bearing_deg
+        else:
+            held = None
+        goal_heading = (
+            self.exploration.heading_error_deg
+            if self.exploration.active
+            else None
+        )
+        gap = find_gap(
+            self._obstacle_x,
+            self._obstacle_y,
+            self.local_planner.limits,
+            goal_heading,
+            held if held is not None else self._gap_bearing_deg,
+        )
+        self.gap = gap
+        if not gap.found:
+            self._gap_bearing_deg = None
+            return None
+        if held is None:
+            # A fresh commitment. Hold it long enough for the chassis to make
+            # real progress toward the opening rather than re-deciding on the
+            # next revolution.
+            self._gap_bearing_deg = gap.bearing_deg
+            self._gap_commit_until = now + GAP_COMMIT_S
+            self._gap_started_yaw_deg, self._gap_yaw_source = (
+                self._turn_reference_yaw_deg()
+            )
+        remaining = gap.bearing_deg
+        turned = self._gap_turned_deg()
+        if turned is not None:
+            remaining = (
+                self._gap_bearing_deg - turned + 180.0
+            ) % 360.0 - 180.0
+        if abs(remaining) <= GAP_ALIGNED_DEG:
+            # Facing the opening. Hand back to the arc planner, which can now
+            # find a forward trajectory down it.
+            self._gap_commit_until = 0.0
+            self._gap_bearing_deg = None
+            return None
+        direction = "L" if remaining < 0.0 else "R"
+        self.turn_command = direction
+        self._arc_active = False
+        self.drive_confidence = 0.25
+        self.reason = (
+            f"GAP_SEEK:{direction} bearing{gap.bearing_deg:+.0f}deg "
+            f"width{gap.width_deg:.0f} depth{gap.clearance_m:.2f}m "
+            f"left{remaining:+.0f}deg"
+        )
+        return self._center_pivot_crawl(direction)
+
+    def _gap_turned_deg(self) -> float | None:
+        """Yaw turned clockwise since the current gap commitment began.
+
+        Gap bearings are robot-frame, clockwise-positive. The two yaw sources
+        do not agree on that: the mapper's heading also increases clockwise,
+        but IMU yaw comes from a counter-clockwise-positive gyro, so it has to
+        be negated before the two can be compared.
+        """
+        current = self._yaw_for_source(self._gap_yaw_source)
+        if current is None or self._gap_started_yaw_deg is None:
+            return None
+        delta = self._yaw_delta_deg(current, self._gap_started_yaw_deg)
+        return -delta if self._gap_yaw_source == "IMU" else delta
 
     def _steer_around(
         self, lidar: SectorClearance, now: float
@@ -1943,7 +2143,7 @@ class AutonomousPolicy:
         target = float(np.clip(
             target_heading_deg, float(STEER_HEADINGS[0]), float(STEER_HEADINGS[-1])
         ))
-        count = max(2, int(abs(target - start) / MAX_STEERING_STEP_DEG) + 1)
+        count = max(2, min(40, int(abs(target - start) / MAX_STEERING_STEP_DEG) + 1))
         headings = np.linspace(start, target, count)
         indices = np.abs(STEER_HEADINGS[:, None] - headings[None, :]).argmin(axis=0)
         return float(np.min(opening[indices]))
@@ -1994,7 +2194,14 @@ class AutonomousPolicy:
                camera_ready: bool = True, imu_ready: bool = True,
                camera_motion: CameraMotionState | None = None) -> str:
         previous_output = (self.left_pwm, self.right_pwm)
+        self._note_output_tick(now)
         self._observe_visual_approach(camera_motion, now)
+        # An operator halt or a manual command outranks every autonomous
+        # behaviour below, including recovery.
+        operator_command = self._apply_control_mode(lidar, arduino, now)
+        if operator_command is not None:
+            self._update_intent()
+            return operator_command
         # Displacement is checked before anything else. Every stored phase,
         # heading commitment and route below this point describes a position
         # the chassis no longer occupies.
@@ -2416,6 +2623,8 @@ class AutonomousPolicy:
         self._imu_yaw_reference_deg = None
         self._brake_until = 0.0
         self._next_arc_search_at = 0.0
+        self._gap_bearing_deg = None
+        self._gap_commit_until = 0.0
         self._scan_motion = replace(self._scan_motion, displaced=False)
         self._heading_index = None
         self._steering_deg = 0.0
@@ -2980,12 +3189,15 @@ def main() -> int:
         print("No DISPLAY/WAYLAND_DISPLAY; running headless with stream only")
     dashboard_stream = None
     dashboard_server = None
+    robot_control = RobotControl()
+    policy.control = robot_control
     if not args.no_web:
         started = start_dashboard_server(
             port=args.web_port,
             fps=args.web_fps,
             quality=args.web_quality,
             version=RUNTIME_VERSION,
+            control=robot_control,
         )
         if started is None:
             print(
@@ -2995,6 +3207,11 @@ def main() -> int:
         else:
             dashboard_stream, dashboard_server = started
             print(f"Dashboard stream: {dashboard_server.url}")
+            print(
+                "Dashboard STOP/RESUME/MANUAL controls are enabled on that "
+                "page and are not authenticated; anyone who can reach the "
+                "port can drive the robot."
+            )
     next_web_render_at = 0.0
 
     def stop(_signum: int, _frame: object) -> None:
@@ -3008,6 +3225,7 @@ def main() -> int:
     try:
         while keep_running:
             now = time.monotonic()
+            loop_started = now
             arduino.poll_capabilities(now)
             if imu is not None:
                 imu_state = imu.tick(
@@ -3262,7 +3480,13 @@ def main() -> int:
                         fullscreen_refreshes -= 1
                     if cv2.waitKey(1) & 0xFF in (27, ord("q"), ord("Q")):
                         break
-            time.sleep(0.03)
+            # Sleep the remainder of the control period rather than a fixed
+            # amount on top of the work: a tick that spent time rendering the
+            # dashboard or replanning otherwise pushed the next sensor read
+            # and the next motor command further out, which is felt as lag.
+            remaining = CONTROL_PERIOD_S - (time.monotonic() - loop_started)
+            if remaining > 0.0:
+                time.sleep(remaining)
     finally:
         arduino.close()
         lidar.close()

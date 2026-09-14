@@ -18,8 +18,10 @@ Design constraints, in priority order:
 3. **Honest staleness.**  The viewer is told the age of what it is looking
    at, so a frozen picture can never be mistaken for a live robot.
 
-The stream is read-only: there are no control endpoints, and nothing here can
-command the chassis.
+The picture is read-only. There is one control endpoint, added deliberately:
+POST /control carries an operator halt, a resume, and a manual driving mode
+with a dead-man expiry. See RobotControl for how it fails safe. It cannot
+authenticate, so the port belongs on a trusted network only.
 """
 
 from __future__ import annotations
@@ -33,6 +35,91 @@ import time
 
 import cv2
 import numpy as np
+
+
+class RobotControl:
+    """Operator halt and manual driving, shared with the control loop.
+
+    This is the one part of the dashboard that is not read-only, so it is
+    built to fail safe in every direction:
+
+    * a manual command expires on its own after a fraction of a second, so a
+      dropped phone, a closed tab or a walk out of Wi-Fi range stops the
+      robot rather than leaving it driving;
+    * leaving manual mode clears any held command;
+    * the halt is sticky and has to be released explicitly; and
+    * nothing here can weaken the Uno's ultrasonic stop or the LD19 forward
+      check in the policy, which both still apply to manual driving.
+
+    It cannot authenticate. Anyone who can reach the page on the network can
+    drive the robot, so treat the port as trusted-network-only.
+    """
+
+    #: A held button refreshes far faster than this; one missed refresh
+    #: should not stop the robot, several in a row should.
+    COMMAND_TTL_S = 0.60
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._halted = False
+        self._manual = False
+        self._command = "STOP"
+        self._command_at = 0.0
+
+    @property
+    def halted(self) -> bool:
+        with self._lock:
+            return self._halted
+
+    @property
+    def manual(self) -> bool:
+        with self._lock:
+            return self._manual
+
+    def halt(self) -> None:
+        with self._lock:
+            self._halted = True
+            self._command = "STOP"
+
+    def resume(self) -> None:
+        with self._lock:
+            self._halted = False
+
+    def set_manual(self, enabled: bool) -> None:
+        with self._lock:
+            self._manual = bool(enabled)
+            self._command = "STOP"
+            self._command_at = 0.0
+
+    def drive(self, command: str) -> bool:
+        command = command.upper()
+        if command not in ("F", "B", "L", "R", "STOP"):
+            return False
+        with self._lock:
+            if not self._manual:
+                return False
+            self._command = command
+            self._command_at = time.monotonic()
+        return True
+
+    def manual_command(self, now: float | None = None) -> str:
+        """The command to apply now, or STOP once it has gone stale."""
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            if not self._manual or self._command == "STOP":
+                return "STOP"
+            if now - self._command_at > self.COMMAND_TTL_S:
+                return "STOP"
+            return self._command
+
+    def state(self) -> dict:
+        with self._lock:
+            return {
+                "halted": self._halted,
+                "manual": self._manual,
+                "command": self._command,
+            }
+
 
 DEFAULT_PORT = 8080
 DEFAULT_FPS = 5.0
@@ -65,6 +152,25 @@ _PAGE = """<!doctype html>
         border-radius: 6px; background: #05080b; }
   .dim { opacity: 0.35; transition: opacity 0.3s; }
   .muted { color: #8fa3b5; }
+  #controls { display: flex; flex-direction: column; align-items: center;
+              gap: 10px; padding: 4px 12px 18px; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; }
+  button { font: inherit; font-weight: 600; color: #e6eef5; cursor: pointer;
+           background: #1b2735; border: 1px solid #2f4257; border-radius: 10px;
+           padding: 12px 18px; min-width: 96px; touch-action: manipulation;
+           -webkit-user-select: none; user-select: none; }
+  button:disabled { opacity: 0.35; cursor: not-allowed; }
+  #halt { background: #5a1420; border-color: #8d2032; }
+  #halt.active { background: #b3273f; border-color: #ff8ba0; }
+  #manual.active { background: #1d4a33; border-color: #3f9e6c; }
+  #pad { display: grid; grid-template-columns: repeat(3, 84px);
+         grid-template-rows: repeat(2, 72px); gap: 8px; justify-content: center; }
+  #pad button { min-width: 0; width: 100%; height: 100%; font-size: 22px; }
+  .pad-up { grid-column: 2; grid-row: 1; }
+  .pad-left { grid-column: 1; grid-row: 2; }
+  .pad-down { grid-column: 2; grid-row: 2; }
+  .pad-right { grid-column: 3; grid-row: 2; }
+  #mode { font-size: 13px; }
 </style>
 </head>
 <body>
@@ -75,6 +181,20 @@ _PAGE = """<!doctype html>
   <span id="version" class="muted"></span>
 </header>
 <div id="wrap"><img id="view" class="dim" alt="robot dashboard"></div>
+<div id="controls">
+  <div class="row">
+    <button id="halt" type="button">STOP</button>
+    <button id="resume" type="button">RESUME</button>
+    <button id="manual" type="button">MANUAL CONTROL</button>
+  </div>
+  <div id="mode" class="muted">autonomous</div>
+  <div id="pad">
+    <button class="pad-up" data-drive="F" type="button" disabled>&#9650;</button>
+    <button class="pad-left" data-drive="L" type="button" disabled>&#9664;</button>
+    <button class="pad-down" data-drive="B" type="button" disabled>&#9660;</button>
+    <button class="pad-right" data-drive="R" type="button" disabled>&#9654;</button>
+  </div>
+</div>
 <script>
 (function () {
   var view = document.getElementById('view');
@@ -129,8 +249,80 @@ _PAGE = """<!doctype html>
         view.classList.add('dim');
       });
   }
+  var haltButton = document.getElementById('halt');
+  var resumeButton = document.getElementById('resume');
+  var manualButton = document.getElementById('manual');
+  var modeLabel = document.getElementById('mode');
+  var padButtons = Array.prototype.slice.call(
+    document.querySelectorAll('#pad button'));
+  var manualOn = false;
+  var held = null;
+  var repeatTimer = null;
+
+  function post(body) {
+    return fetch('control', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    }).then(function (response) { return response.json(); })
+      .then(applyState)
+      .catch(function () { /* the status poll reports the outage */ });
+  }
+
+  function applyState(state) {
+    if (!state || typeof state.manual === 'undefined') { return; }
+    manualOn = state.manual;
+    haltButton.classList.toggle('active', !!state.halted);
+    manualButton.classList.toggle('active', manualOn);
+    padButtons.forEach(function (button) { button.disabled = !manualOn; });
+    modeLabel.textContent = state.halted
+      ? 'stopped by operator'
+      : (manualOn ? 'manual control' : 'autonomous');
+  }
+
+  // A held button refreshes faster than the robot's command expiry, so a
+  // dropped connection stops the robot on its own rather than leaving it
+  // driving on the last thing it heard.
+  function startDrive(direction) {
+    if (!manualOn) { return; }
+    held = direction;
+    post({ drive: direction });
+    if (repeatTimer) { clearInterval(repeatTimer); }
+    repeatTimer = setInterval(function () {
+      if (held) { post({ drive: held }); }
+    }, 200);
+  }
+  function stopDrive() {
+    held = null;
+    if (repeatTimer) { clearInterval(repeatTimer); repeatTimer = null; }
+    post({ drive: 'STOP' });
+  }
+
+  haltButton.addEventListener('click', function () { post({ halt: true }); });
+  resumeButton.addEventListener('click', function () { post({ resume: true }); });
+  manualButton.addEventListener('click', function () {
+    post({ manual: !manualOn });
+  });
+  padButtons.forEach(function (button) {
+    var direction = button.getAttribute('data-drive');
+    ['pointerdown'].forEach(function (name) {
+      button.addEventListener(name, function (event) {
+        event.preventDefault();
+        startDrive(direction);
+      });
+    });
+    ['pointerup', 'pointercancel', 'pointerleave'].forEach(function (name) {
+      button.addEventListener(name, function (event) {
+        event.preventDefault();
+        stopDrive();
+      });
+    });
+  });
+  window.addEventListener('blur', stopDrive);
+
   attach();
   poll();
+  post({});
   setInterval(poll, 1000);
 })();
 </script>
@@ -147,7 +339,9 @@ class DashboardStream:
         fps: float = DEFAULT_FPS,
         quality: int = DEFAULT_QUALITY,
         version: str = "",
+        control: RobotControl | None = None,
     ) -> None:
+        self.control = control
         self.fps = max(0.5, min(15.0, fps))
         self.quality = int(np.clip(quality, 30, 95))
         self.version = version
@@ -243,6 +437,7 @@ class DashboardStream:
             "published_fps": round(published_fps, 2),
             "stale_after_s": STALE_AFTER_S,
             "stale": (not has_frame) or frame_age > STALE_AFTER_S,
+            **(self.control.state() if self.control is not None else {}),
         }
 
     def close(self) -> None:
@@ -276,6 +471,8 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
                     "STALE_AFTER_PLACEHOLDER", repr(STALE_AFTER_S)
                 )
                 self._send_bytes(page.encode("utf-8"), "text/html; charset=utf-8")
+            elif path == "/control":
+                self._control()
             elif path == "/status.json":
                 payload = json.dumps(self.stream.status()).encode("utf-8")
                 self._send_bytes(payload, "application/json")
@@ -297,6 +494,49 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
                 self.send_error(500, "dashboard stream error")
             except Exception:
                 return
+
+    def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        if self.path.split("?", 1)[0] != "/control":
+            self.send_error(404, "not found")
+            return
+        try:
+            self._control()
+        except (BrokenPipeError, ConnectionResetError, socket.timeout):
+            return
+        except Exception:
+            try:
+                self.send_error(500, "control error")
+            except Exception:
+                return
+
+    def _control(self) -> None:
+        control = getattr(self.stream, "control", None)
+        if control is None:
+            self.send_error(503, "control is not enabled")
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        payload: dict = {}
+        if 0 < length <= 4096:
+            try:
+                payload = json.loads(self.rfile.read(length) or b"{}")
+            except (ValueError, UnicodeDecodeError):
+                payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        # A halt is honoured before anything else in the same request, and
+        # leaving manual mode always clears whatever was held.
+        if payload.get("halt"):
+            control.halt()
+        if payload.get("resume"):
+            control.resume()
+        if "manual" in payload:
+            control.set_manual(bool(payload["manual"]))
+        drive = payload.get("drive")
+        if isinstance(drive, str):
+            control.drive(drive)
+        self._send_bytes(
+            json.dumps(control.state()).encode("utf-8"), "application/json"
+        )
 
     def _stream(self) -> None:
         self.send_response(200)
@@ -396,13 +636,16 @@ def start_dashboard_server(
     quality: int = DEFAULT_QUALITY,
     version: str = "",
     host: str = "0.0.0.0",
+    control: RobotControl | None = None,
 ) -> tuple[DashboardStream, DashboardWebServer] | None:
     """Start streaming, or return None if the port cannot be bound.
 
     A dashboard viewer is a convenience. Failing to bind (port in use, no
     network yet) must degrade to "no remote view", never to "no robot".
     """
-    stream = DashboardStream(fps=fps, quality=quality, version=version)
+    stream = DashboardStream(
+        fps=fps, quality=quality, version=version, control=control
+    )
     try:
         server = DashboardWebServer(stream, host=host, port=port)
     except OSError:

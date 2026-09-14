@@ -69,6 +69,38 @@ class ArcChoice:
     path_xy: tuple[tuple[float, float], ...] = ()
 
 
+@dataclass(frozen=True)
+class Footprint:
+    """Two-circle cover of a rectangular chassis.
+
+    A single circumscribed circle is the cheap way to model a rectangle, but
+    for a 23 x 27 cm chassis its radius is 17.6 cm against a true half-width
+    of 11.4 cm - the robot would refuse gaps it fits through easily. Two
+    circles placed along the length cover the same rectangle with a radius of
+    13.2 cm, which is both more accurate and less timid, at the cost of one
+    extra distance evaluation per sampled pose.
+    """
+
+    radius_m: float
+    offset_m: float
+
+    @classmethod
+    def from_rectangle(cls, width_m: float, length_m: float) -> "Footprint":
+        offset = length_m / 4.0
+        return cls(radius_m=math.hypot(width_m / 2.0, offset), offset_m=offset)
+
+
+@dataclass(frozen=True)
+class GapChoice:
+    """One opening measured directly from the scan, in robot-frame degrees."""
+
+    found: bool = False
+    bearing_deg: float = 0.0
+    width_deg: float = 0.0
+    clearance_m: float = 0.0
+    score: float = 0.0
+
+
 @dataclass
 class PlannerLimits:
     """Physical and timing limits the arc search has to respect.
@@ -89,6 +121,13 @@ class PlannerLimits:
     braking_mps2: float = 0.85
     # Never plan to pass closer than this to a remembered or measured return.
     safety_margin_m: float = 0.10
+    # Chassis footprint used for every collision check.
+    footprint: Footprint = field(
+        default_factory=lambda: Footprint.from_rectangle(0.2286, 0.2667)
+    )
+    # An opening has to be at least this deep before it is worth turning
+    # toward; shallower than this is an alcove, not a route.
+    min_gap_depth_m: float = 0.70
     # Headroom an arc must have beyond its own stopping distance before it
     # counts as drivable. Without it the planner will happily commit to a
     # level whose whole usable arc is braking distance.
@@ -97,7 +136,11 @@ class PlannerLimits:
     # almost nothing at this chassis's speed and cannot plan around anything.
     min_lookahead_m: float = 1.60
     max_lookahead_m: float = 2.40
-    horizon_steps: int = 8
+    # Six samples over the lookahead leaves 27 cm between poses, and each
+    # pose covers footprint radius plus margin - about 23 cm - so consecutive
+    # samples still overlap and nothing can slip between them. Eight was
+    # simply paying for resolution the collision check does not need.
+    horizon_steps: int = 6
     # Degrees per second of yaw at a full-scale steering command.
     #
     # This is not a free parameter: it follows from how the chassis actually
@@ -234,7 +277,7 @@ def stopping_distance_m(speed_mps: float, limits: PlannerLimits) -> float:
 def reduce_obstacles(
     x: np.ndarray,
     y: np.ndarray,
-    bins: int = 180,
+    bins: int = 144,
     max_range_m: float = 3.2,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Collapse the obstacle set to the nearest return per angular bin.
@@ -361,8 +404,22 @@ class ArcBank:
         self.arc_y = np.cumsum(
             np.cos(headings) * step_distance[None, :], axis=1
         ).astype(np.float32)
-        self.pose_x = self.arc_x.reshape(-1)
-        self.pose_y = self.arc_y.reshape(-1)
+        self.arc_heading = headings.astype(np.float32)
+        # Two footprint circles per sampled pose, offset along the chassis
+        # axis, so a turning robot's trailing corner is checked as well as its
+        # leading one. Front circles first, then rear, so a reshape can take
+        # the worse of the two per pose.
+        offset = limits.footprint.offset_m
+        lead_x = self.arc_x + np.sin(self.arc_heading) * offset
+        lead_y = self.arc_y + np.cos(self.arc_heading) * offset
+        trail_x = self.arc_x - np.sin(self.arc_heading) * offset
+        trail_y = self.arc_y - np.cos(self.arc_heading) * offset
+        self.pose_x = np.concatenate(
+            (lead_x.reshape(-1), trail_x.reshape(-1))
+        ).astype(np.float32)
+        self.pose_y = np.concatenate(
+            (lead_y.reshape(-1), trail_y.reshape(-1))
+        ).astype(np.float32)
 
     def matches(
         self,
@@ -386,7 +443,6 @@ def evaluate_arcs(
     obstacle_x: np.ndarray,
     obstacle_y: np.ndarray,
     bank: ArcBank,
-    body_radius_m: float,
     goal_heading_deg: float | None,
     current_steering_deg: float,
     reduce: bool = True,
@@ -424,7 +480,10 @@ def evaluate_arcs(
         delta_y = obstacle_y[None, :] - bank.pose_y[:, None]
         squared = delta_x * delta_x + delta_y * delta_y
         nearest = np.sqrt(squared.min(axis=1))
-        margins = (nearest - body_radius_m).reshape(-1, bank.steps)
+        # Lead and trail circles were stacked in that order; a pose is only as
+        # clear as its worse circle.
+        per_circle = nearest.reshape(2, len(bank.candidates), bank.steps)
+        margins = per_circle.min(axis=0) - limits.footprint.radius_m
     else:
         margins = np.full(
             (len(bank.candidates), bank.steps),
@@ -522,6 +581,112 @@ def evaluate_arcs(
                     for px, py in zip(bank.arc_x[index], bank.arc_y[index])
                 ),
             )
+    return best
+
+
+def find_gap(
+    obstacle_x: np.ndarray,
+    obstacle_y: np.ndarray,
+    limits: PlannerLimits,
+    goal_heading_deg: float | None = None,
+    held_bearing_deg: float | None = None,
+    bins: int = 72,
+    max_range_m: float = 3.2,
+) -> GapChoice:
+    """Find the widest usable opening anywhere around the robot.
+
+    The arc search only considers headings the chassis can reach while still
+    rolling forward, roughly plus or minus 36 degrees. When every one of
+    those is blocked - which is what being surrounded by furniture looks like
+    - the old answer was a fixed-size blind pivot, re-evaluated on arrival,
+    which in a cluttered room produced repeated pivots that never committed
+    to anything. This looks at the whole revolution instead and names a real
+    measured opening to turn toward.
+
+    This is the gap-selection stage of the Follow-The-Gap family. The known
+    failure of that family is that two similar gaps swap rank between scans
+    and the robot zigzags, so ``held_bearing_deg`` applies hysteresis toward
+    the opening already being followed.
+    """
+    span_deg = 360.0 / bins
+    clearance = np.full(bins, max_range_m, dtype=np.float32)
+    if obstacle_x.size:
+        ranges = np.hypot(obstacle_x, obstacle_y)
+        keep = ranges <= max_range_m
+        if np.any(keep):
+            angles = np.degrees(
+                np.arctan2(obstacle_x[keep], obstacle_y[keep])
+            ) % 360.0
+            index = np.minimum((angles / span_deg).astype(np.int32), bins - 1)
+            np.minimum.at(clearance, index, ranges[keep].astype(np.float32))
+    # A direction is usable when the chassis plus its margin fits, with
+    # enough room beyond to be worth committing to.
+    needed = limits.footprint.radius_m + limits.safety_margin_m
+    passable = clearance >= max(limits.min_gap_depth_m, needed * 2.0)
+    if not np.any(passable):
+        return GapChoice()
+    # Walk contiguous runs on the circle by rotating the mask so a run that
+    # straddles the zero crossing is not split into two.
+    start = 0
+    if passable[0] and passable[-1]:
+        blocked = np.nonzero(~passable)[0]
+        if blocked.size == 0:
+            # Every direction is open; straight ahead is as good as any.
+            return GapChoice(
+                found=True,
+                bearing_deg=0.0,
+                width_deg=360.0,
+                clearance_m=float(clearance.min()),
+                score=float(clearance.min()),
+            )
+        start = int(blocked[0])
+    rolled = np.roll(passable, -start)
+    rolled_clearance = np.roll(clearance, -start)
+    best = GapChoice()
+    index = 0
+    while index < bins:
+        if not rolled[index]:
+            index += 1
+            continue
+        end = index
+        while end + 1 < bins and rolled[end + 1]:
+            end += 1
+        run = slice(index, end + 1)
+        width_deg = (end - index + 1) * span_deg
+        depth_m = float(rolled_clearance[run].min())
+        # The opening has to be physically wide enough at its own depth, not
+        # merely wide in angle: a narrow slot far away subtends the same
+        # angle as a doorway nearby.
+        if math.radians(width_deg) * depth_m >= needed * 2.0:
+            centre_bin = (start + index + end) / 2.0 + 0.5
+            bearing = (centre_bin * span_deg + 180.0) % 360.0 - 180.0
+            score = (
+                min(depth_m, 2.5) * 0.9
+                + min(width_deg, 90.0) / 90.0 * 1.1
+                - abs(bearing) / 180.0 * 0.85
+            )
+            if goal_heading_deg is not None:
+                error = abs(
+                    (bearing - goal_heading_deg + 180.0) % 360.0 - 180.0
+                )
+                score += max(0.0, 1.0 - error / 90.0) * 0.9
+            if held_bearing_deg is not None:
+                held_error = abs(
+                    (bearing - held_bearing_deg + 180.0) % 360.0 - 180.0
+                )
+                # Hysteresis toward the opening already being followed. Two
+                # similar gaps swapping rank between scans is the classic
+                # Follow-The-Gap zigzag.
+                score += max(0.0, 1.0 - held_error / 45.0) * 0.75
+            if score > best.score or not best.found:
+                best = GapChoice(
+                    found=True,
+                    bearing_deg=float(bearing),
+                    width_deg=float(width_deg),
+                    clearance_m=depth_m,
+                    score=float(score),
+                )
+        index = end + 1
     return best
 
 

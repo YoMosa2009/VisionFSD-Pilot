@@ -24,6 +24,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from robot_web import (
     STALE_AFTER_S,
     DashboardStream,
+    RobotControl,
     local_ip_address,
     start_dashboard_server,
 )
@@ -112,6 +113,96 @@ class DashboardStreamTests(unittest.TestCase):
         self.assertIsNotNone(_wait_for_encoded(self.stream))
 
 
+class DashboardControlEndpointTests(unittest.TestCase):
+    """The one non-read-only part of the dashboard. It has to fail safe and
+    must never be reachable by accident."""
+
+    def setUp(self) -> None:
+        self.control = RobotControl()
+        started = start_dashboard_server(
+            port=0, fps=15.0, version="test", control=self.control
+        )
+        if started is None:
+            self.skipTest("could not bind a dashboard port")
+        self.stream, self.server = started
+        self.addCleanup(self.server.close)
+        self.port = self.server._server.server_address[1]
+
+    def _post(self, payload: dict):
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}/control",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=5.0) as response:
+            return json.loads(response.read())
+
+    def test_halt_and_resume_round_trip(self) -> None:
+        self.assertTrue(self._post({"halt": True})["halted"])
+        self.assertTrue(self.control.halted)
+        self.assertFalse(self._post({"resume": True})["halted"])
+        self.assertFalse(self.control.halted)
+
+    def test_manual_mode_gates_driving(self) -> None:
+        self._post({"drive": "F"})
+        self.assertEqual(self.control.manual_command(), "STOP")
+        self._post({"manual": True})
+        self._post({"drive": "F"})
+        self.assertEqual(self.control.manual_command(), "F")
+
+    def test_leaving_manual_mode_clears_the_command(self) -> None:
+        self._post({"manual": True})
+        self._post({"drive": "B"})
+        self._post({"manual": False})
+        self.assertEqual(self.control.manual_command(), "STOP")
+
+    def test_a_garbage_body_does_not_crash_the_server(self) -> None:
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}/control",
+            data=b"not json at all",
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=5.0) as response:
+            self.assertEqual(response.status, 200)
+        self.assertFalse(self.control.halted)
+
+    def test_status_reports_the_control_state(self) -> None:
+        self._post({"halt": True})
+        url = f"http://127.0.0.1:{self.port}/status.json"
+        with urllib.request.urlopen(url, timeout=5.0) as response:
+            payload = json.loads(response.read())
+        self.assertTrue(payload["halted"])
+        self.assertFalse(payload["manual"])
+
+    def test_posting_anywhere_else_is_rejected(self) -> None:
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}/motors",
+            data=b"{}",
+            method="POST",
+        )
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(request, timeout=5.0)
+        self.assertEqual(caught.exception.code, 404)
+
+
+class DashboardControlDisabledTests(unittest.TestCase):
+    def test_control_is_unavailable_without_a_bridge(self) -> None:
+        started = start_dashboard_server(port=0, fps=15.0, version="test")
+        if started is None:
+            self.skipTest("could not bind a dashboard port")
+        _stream, server = started
+        self.addCleanup(server.close)
+        port = server._server.server_address[1]
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{port}/control", data=b"{}", method="POST"
+        )
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(request, timeout=5.0)
+        self.assertEqual(caught.exception.code, 503)
+
+
 class DashboardServerTests(unittest.TestCase):
     def setUp(self) -> None:
         started = start_dashboard_server(port=0, fps=15.0, version="9.9.9")
@@ -131,6 +222,10 @@ class DashboardServerTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn("text/html", headers["Content-Type"])
         self.assertIn(b"VisionFSD robot", body)
+        # The operator controls ship with the page.
+        self.assertIn(b'id="halt"', body)
+        self.assertIn(b'id="manual"', body)
+        self.assertIn(b'data-drive="F"', body)
         # The staleness threshold is substituted into the page, never left
         # as the literal placeholder.
         self.assertNotIn(b"STALE_AFTER_PLACEHOLDER", body)

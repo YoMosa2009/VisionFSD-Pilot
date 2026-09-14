@@ -724,6 +724,92 @@ discarded entirely by the angular-support noise filter until the robot was
 within 0.75 m, and the planner had no way to express "go around this" because
 it had no lookahead. Neither needed to know that the object was a table leg.
 
+### v1.9.20: measured chassis, gap seeking, per-second ramps, operator control
+
+Reported from driving v1.9.19: pathfinding was much better - smooth through a
+cluttered living room and between rooms - but it still touched a wall once or
+twice, felt laggy, and span in place when surrounded. Plus a request for
+manual control from the phone dashboard.
+
+**The chassis was never the size the software thought it was.** The measured
+robot is 9 x 10.5 inches (0.229 x 0.267 m). The code had 0.14 x 0.15 m - about
+60% narrow and 80% short. Every corridor width, every footprint check and
+every arc collision test was therefore computed for a substantially smaller
+robot than the one driving, which is the most likely remaining cause of
+clipping furniture: the geometry genuinely said the gap fit. The measured
+values are now used throughout. Collision checks also moved from a single
+circumscribed circle to a **two-circle cover** of the rectangle: one circle
+around a 23 x 27 cm body has a 17.6 cm radius against a true 11.4 cm
+half-width, which would have made the robot refuse gaps it fits through
+easily. Two circles cover the same rectangle at 13.2 cm and check the
+trailing corner as well as the leading one. With the honest footprint the
+planner refuses a head-on wall at about 0.6 m rather than 0.45 m.
+
+**Spinning when surrounded** came from the arc search's field of view. It only
+considers headings the chassis can reach while still rolling - about plus or
+minus 36 degrees - so in a cluttered corner every candidate is blocked, and
+the fallback was a fixed-size blind pivot re-decided on arrival. That is a
+loop, not a plan. The runtime now asks the whole revolution where the real
+openings are (`find_gap`), turns to face the best one, and **commits** to it
+for a couple of seconds. Committing is the point: the documented failure of
+gap-following methods is two similar gaps swapping rank between scans and the
+robot zigzagging, so the choice is deliberately sticky, biased toward the
+opening already being followed and toward the exploration goal. An opening
+must be genuinely deep (0.7 m) and physically wide enough *at its own depth* -
+angular width alone would treat a distant slot like a near doorway.
+
+**The endless sharp turn** on entering a room was the pure-pursuit lookahead.
+The waypoint is chased, so the lookahead sets how hard the chassis is asked
+to turn; at 0.85 m the target sat close and off to the side, holding a large
+heading error the whole way round a bend. It was also short relative to this
+chassis's ~1 m turn radius, so the robot was being asked to cut inside a
+circle it cannot physically follow and simply saturated. Now 1.30 m.
+
+**Latency.** Two causes, both structural. The drive and steering ramps were
+per *tick*, so a tick spent rendering the dashboard or replanning a route
+advanced the wheels no further than an idle one - the chassis felt laggiest
+exactly when the scene was busiest. They are now per *second*
+(`MAX_PWM_RATE_PER_S`, `MAX_STEERING_RATE_DPS`), set to the previous values
+times the nominal 30 Hz loop, so nominal behaviour is unchanged and a slow
+tick catches up instead of falling behind. Second, the loop slept a fixed
+30 ms *on top of* however long the work took; it now sleeps the remainder of
+a fixed control period. Serial was already immediate: `publish_drive` writes
+a changed command straight away rather than waiting for the heartbeat.
+
+Planner cost was re-tuned to pay for the two-circle footprint: six arc samples
+instead of eight (27 cm between poses against a 23 cm capture radius, so
+nothing can slip between them) and two drive levels instead of three, since
+the band between the motor deadband and cruise is only a few PWM wide. About
+1.2 ms per search on this desktop, roughly 12% of one Pi 3B core at the
+replan rate.
+
+Desktop tests only (394 pass). **Nothing here has run on the robot.** They do
+not verify the real turn radius, stopping distance, LD19 timing, or Pi 3B
+load.
+
+### Dashboard operator controls
+
+The phone dashboard now carries **STOP**, **RESUME** and **MANUAL CONTROL**
+buttons plus a four-way pad. Manual driving is deliberately modest - forward
+at the movement floor, pivots at the escape-pivot level - because it exists to
+nudge the robot out of somewhere, not to race it.
+
+It fails safe in every direction:
+
+* a manual command **expires after 0.6 s**, so a dropped phone, a closed tab
+  or a walk out of Wi-Fi range stops the robot rather than leaving it driving;
+  a held button refreshes five times faster than that;
+* leaving manual mode clears any held command, and a halt drops it too;
+* the halt is sticky, has to be released explicitly, and outranks every
+  autonomous behaviour including recovery; and
+* manual **forward** is still refused by the LD19 near-field check and by the
+  Uno's own ultrasonic stop. Reverse and pivots stay free, because driving out
+  of somewhere the planner could not is the whole point.
+
+> **The control endpoint is not authenticated.** Anyone who can reach the port
+> on the network can stop or drive the robot. Keep it on a trusted network.
+> `VISIONFSD_NO_WEB=1` disables the page entirely.
+
 ### Speed
 
 The robot's minimum sustained speed is set by the motor deadband, not by

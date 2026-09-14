@@ -16,7 +16,10 @@ import numpy as np
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from robot_autonomy import (
+    CORRIDOR_HALF_WIDTH_M,
+    FRONT_OVERHANG_M,
     MAX_PWM,
+    MAX_PWM_RATE_PER_S,
     MIN_MOVE_PWM,
     RUNTIME_VERSION,
     STEER_HEADINGS,
@@ -359,11 +362,20 @@ class AutonomousPolicyTests(unittest.TestCase):
     def test_acceleration_rises_in_small_steps_after_the_floor(self) -> None:
         policy = AutonomousPolicy(0.0, 118)
         clear = SectorClearance(2.0, 2.0, 2.0, True)
-        policy.decide(clear, self.status, False, time.monotonic())
+        # One base timestamp: the ramp is now a rate, so two separate
+        # time.monotonic() reads would make the elapsed interval depend on
+        # the host clock's granularity rather than on the 0.04 s under test.
+        now = time.monotonic()
+        policy.decide(clear, self.status, False, now)
         first = policy.left_pwm
-        policy.decide(clear, self.status, False, time.monotonic() + 0.04)
+        policy.decide(clear, self.status, False, now + 0.04)
         self.assertGreaterEqual(policy.left_pwm, first)
-        self.assertLessEqual(policy.left_pwm - first, 4)
+        # The ramp is a rate, not a per-tick step, so a longer gap between
+        # decisions is allowed to advance proportionally further. This is what
+        # keeps responsiveness from degrading when a tick is busy.
+        self.assertLessEqual(
+            policy.left_pwm - first, math.ceil(MAX_PWM_RATE_PER_S * 0.04)
+        )
 
     def test_camera_person_flag_is_ignored_in_navigation_only_mode(self) -> None:
         policy = AutonomousPolicy(0.0, 118)
@@ -874,7 +886,11 @@ class CorridorProfileTests(unittest.TestCase):
     def test_wall_limits_travel_to_the_bumper(self) -> None:
         profile = corridor_profile(wall_scene(1.20))
         straight = profile[int(np.argmin(np.abs(STEER_HEADINGS)))]
-        self.assertAlmostEqual(float(straight), 1.20 - 0.075, places=2)
+        # Travel is measured from the bumper, so the clear distance is the
+        # wall range less the chassis front overhang.
+        self.assertAlmostEqual(
+            float(straight), 1.20 - FRONT_OVERHANG_M, places=2
+        )
 
     def test_a_gap_the_body_fits_is_seen_as_open(self) -> None:
         """The five-sector summary cannot express "there is a gap 20 deg right"."""
@@ -892,11 +908,19 @@ class CorridorProfileTests(unittest.TestCase):
         self.assertGreater(float(straight), 2.0)
 
     def test_rear_corridor_ignores_obstacle_outside_robot_width(self) -> None:
+        """An obstacle clear of the swept body must not shorten the rear
+        corridor. The offending angle is derived from the measured chassis so
+        this keeps testing the intent rather than one hard-coded geometry."""
+        reach_m = 0.40
+        clear_of_body = math.degrees(
+            math.asin(min(1.0, CORRIDOR_HALF_WIDTH_M * 1.6 / reach_m))
+        )
+        beside = 180.0 - clear_of_body
         points = [
             (0, _Return(180, 1200)),
             (1, _Return(177, 1200)),
-            (2, _Return(135, 220)),
-            (3, _Return(138, 225)),
+            (2, _Return(round(beside), int(reach_m * 1000))),
+            (3, _Return(round(beside) + 3, int(reach_m * 1000) + 5)),
         ]
         rear = corridor_profile(points, np.array([180.0], dtype=np.float32))[0]
         self.assertGreater(float(rear), 1.0)
