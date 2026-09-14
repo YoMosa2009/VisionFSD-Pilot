@@ -643,6 +643,107 @@ the chassis mid-run and seeing `REORIENTING` with the map rebuilt; the route
 polyline matching where it actually goes; and the phone view staying live
 while walking the robot around.
 
+### v1.9.19: a planner with lookahead and memory, and a speed governor
+
+Reported from supervised driving of v1.9.18: the chassis moved too fast for
+the room, made contact with walls that the ultrasonic did not stop, and still
+could not plan through a cluttered space.
+
+**Why the ultrasonic could not save it.** The Uno guard is not a fast sensor.
+It samples every 60 ms, filters a median of three, and requires two confirmed
+readings, so detection takes roughly 240 ms from the moment something enters
+its 18 cm trigger. It is also a narrow cone aimed straight ahead, and an
+HC-SR04 pointed at a wall well off-normal reflects the pulse away instead of
+back - so an angled wall approach often produces `NO_ECHO` and no block at
+all. The ultrasonic is a last-resort near-field guard and always was; it
+cannot be the thing that keeps the robot off walls. The LD19 has to be.
+
+**Why the LD19 was not doing it either.** The planner scored *headings*, not
+*motion*: it asked which direction had the most room right now, from a single
+revolution, and re-answered from scratch every tick. It had no model of how
+far the chassis travels before it can stop, no memory of anything out of the
+current scan, and no way to notice that a heading was a dead end a metre
+before arriving. v1.9.18's steer-around band made this worse by letting the
+robot keep rolling on as little as 0.22 m of swept clearance, which is under
+a second of travel at cruise. That threshold is raised to 0.34 m here, and
+the band is now a fallback rather than the main path.
+
+Forward motion is now chosen by an arc planner (`robot_local_planner.py`),
+the cheap form of the approach standard for this class of robot - a rolling
+local obstacle set plus a dynamic window of candidate trajectories:
+
+* **Memory.** A decaying, motion-compensated obstacle buffer in the robot's
+  own frame, holding about 1.5 s of returns, shifted every tick by commanded
+  travel and measured IMU yaw. The planner reasons about the union of what
+  the LD19 sees now and what it saw recently, so an obstacle behind the
+  chassis or briefly occluded does not vanish. This is a local costmap, not
+  localisation: it is dead reckoning over fractions of a second, deliberately
+  short enough that the error stays small and a moved object cannot linger.
+* **Lookahead.** 27 candidate (steering, drive-level) arcs are simulated
+  1.6 m ahead and scored on distance made good along the heading, clearance,
+  goal alignment, and closeness to the steering already applied. Lookahead is
+  a *distance*, not a time: a 1.3 s window at this chassis's speed sees 33 cm,
+  which cannot plan around anything.
+* **A speed governor.** An arc is admissible only if the chassis could still
+  stop inside the clearance that arc actually has - reaction distance at full
+  speed, plus braking, plus a 0.25 m buffer. This is what ties commanded
+  speed to measured room, and it is why the planner now refuses a wall at
+  0.45 m instead of driving at it and hoping the ultrasonic fires.
+* **Progress, not arc length.** Scoring arc length rewards the arc that curls
+  tightly away from everything, staying clear for its whole length while
+  going nowhere. Scoring distance made good is what stops the robot orbiting
+  local objects instead of crossing the floor.
+
+Supporting changes: recovery now **brakes before maneuvering** (a pivot begun
+at cruise swings the outside corner into whatever the robot was avoiding);
+strong LD19 returns are trusted at any range rather than only inside 0.75 m,
+so a table or chair leg is visible at its real distance instead of appearing
+as an emergency; and `MAX_TURN_SPLIT_PWM` rises 28 → 34, because turn radius
+is what decides how far ahead an obstacle must be seen to be driven around at
+all (roughly 1.2 m of run at 28, 1.0 m at 34).
+
+Cost on a Pi 3B was the binding constraint throughout. The first working
+version took 14 ms per call, which a 30 Hz control loop cannot absorb. The
+arc bank is precomputed once, obstacles are reduced to the nearest return per
+angular bin, distances are compared squared, and the search runs at roughly
+the LD19 revolution rate rather than every tick. On this desktop it is about
+1.6 ms per search; the tests bound it well below the 0.5 s Uno command lease.
+
+**On the camera and a VLM.** Not on this hardware, and not for this job. A
+Pi 3B has 1 GB of RAM shared with the GPU and no accelerator, and is already
+running LiDAR parsing, optical flow, the planner and the dashboard. The
+smallest practical vision-language models do not fit: Moondream2 needs about
+1.2 GB quantised, and even a 256M-parameter model would take seconds per
+frame on this CPU while evicting everything else. A planner that pauses for
+seconds is more dangerous than one with no semantics at all.
+
+The underlying complaint was right, though, and had a geometric cause rather
+than a semantic one: a thin pole *was* being treated as a bigger obstruction
+than it is. Two reasons, both now addressed - distant thin returns were being
+discarded entirely by the angular-support noise filter until the robot was
+within 0.75 m, and the planner had no way to express "go around this" because
+it had no lookahead. Neither needed to know that the object was a table leg.
+
+### Speed
+
+The robot's minimum sustained speed is set by the motor deadband, not by
+software: below roughly `--min-move-pwm` a loaded wheel buzzes without
+turning, so the usable band is narrow and the cruise default only moved
+118 → 112 here. If it is still too fast, in order of effect:
+
+1. Lower `VISIONFSD_ROBOT_SPEED`.
+2. Re-measure the real stall floor on a freshly charged pack and lower
+   `--min-move-pwm`. This is the high-value one: the inner wheel is pinned at
+   that floor during turns, so a lower floor buys turn authority from the slow
+   side instead of by speeding the outer wheel up.
+3. Reduce motor voltage. Software cannot fix a chassis geared to move faster
+   than its sensing latency supports.
+
+`--chassis-top-speed-mps` (default 0.55) tells the governor how fast the
+robot actually moves at full PWM. It is an estimate - there are no encoders -
+so measure it by timing the robot over a marked distance at a known PWM.
+Overestimating it only makes the robot more cautious.
+
 ### Remote dashboard view
 
 The runtime serves the same dashboard it draws on the Pi monitor as a

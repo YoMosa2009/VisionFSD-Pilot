@@ -615,6 +615,81 @@ class LidarSlamLite:
         self._translation_correction_m = 0.0
         self._translation_matched = False
 
+    def _arc_pixels(
+        self,
+        arc_xy: tuple[tuple[float, float], ...],
+        px: int,
+        py: int,
+        pixels_per_metre: float,
+    ) -> np.ndarray | None:
+        """Rotate a robot-frame arc into the world-aligned follow view."""
+        if len(arc_xy) < 2:
+            return None
+        radians = math.radians(self.heading)
+        cos = math.cos(radians)
+        sin = math.sin(radians)
+        points = [(float(px), float(py))]
+        for offset_x, offset_y in arc_xy:
+            # Robot frame is +y ahead, +x right; the panel is world-aligned
+            # with the heading arrow drawn at self.heading.
+            world_x = offset_x * cos + offset_y * sin
+            world_y = offset_x * sin - offset_y * cos
+            points.append(
+                (
+                    px + world_x * pixels_per_metre,
+                    py + world_y * pixels_per_metre,
+                )
+            )
+        return np.array(points, dtype=np.float32)
+
+    @staticmethod
+    def _draw_intent_ribbon(
+        panel: np.ndarray,
+        points: np.ndarray,
+        color: tuple[int, int, int],
+        clearance_m: float | None,
+    ) -> None:
+        """Draw the predicted trajectory as a tapering, fading ribbon.
+
+        Thickness falls along the arc because the near end is what the robot
+        is committed to and the far end is a prediction; a single flat line
+        gave both equal visual weight. When the planner reports how much room
+        the arc has, a tight one is tinted toward its warning colour so a
+        squeeze is legible at a glance rather than only in the text rows.
+        """
+        tint = 1.0
+        if clearance_m is not None:
+            tint = float(np.clip(clearance_m / 0.45, 0.25, 1.0))
+        drawn = (
+            int(color[0] * tint + 70 * (1.0 - tint)),
+            int(color[1] * tint + 120 * (1.0 - tint)),
+            int(color[2] * tint + 255 * (1.0 - tint)),
+        )
+        integer_points = np.rint(points).astype(np.int32)
+        segments = len(integer_points) - 1
+        for index in range(segments):
+            span = 1.0 - index / max(1, segments)
+            thickness = max(1, int(round(1.0 + 5.0 * span)))
+            shade = 0.45 + 0.55 * span
+            segment_color = tuple(int(channel * shade) for channel in drawn)
+            cv2.line(
+                panel,
+                tuple(integer_points[index]),
+                tuple(integer_points[index + 1]),
+                segment_color,
+                thickness,
+                cv2.LINE_AA,
+            )
+        cv2.arrowedLine(
+            panel,
+            tuple(integer_points[-2]),
+            tuple(integer_points[-1]),
+            drawn,
+            2,
+            cv2.LINE_AA,
+            tipLength=0.55,
+        )
+
     def render(
         self,
         size: int = 500,
@@ -623,6 +698,8 @@ class LidarSlamLite:
         path_xy: tuple[tuple[float, float], ...] = (),
         steering_deg: float | None = None,
         intent_color: tuple[int, int, int] = (120, 230, 255),
+        arc_xy: tuple[tuple[float, float], ...] = (),
+        arc_clearance_m: float | None = None,
     ) -> np.ndarray:
         # Keep the estimated chassis at the centre of a robot-following local
         # viewport. The underlying occupancy grid is a fixed-size sliding
@@ -709,10 +786,17 @@ class LidarSlamLite:
             cv2.polylines(
                 panel, [polyline], False, intent_color, 2, cv2.LINE_AA
             )
-        # The steering command actually being applied this tick, which can
-        # differ from the route while the local corridor planner curves around
-        # something the map has not resolved yet.
-        if steering_deg is not None:
+        # The trajectory the chassis is actually about to follow over the next
+        # planning horizon, drawn as a widening ribbon out of the robot
+        # marker. This is the arc the local planner selected and committed to,
+        # so it answers "what is it about to do" directly, where the old
+        # single steering ray only showed an instantaneous angle.
+        arc_points = self._arc_pixels(arc_xy, px, py, pixels_per_metre)
+        if arc_points is not None:
+            self._draw_intent_ribbon(
+                panel, arc_points, intent_color, arc_clearance_m
+            )
+        elif steering_deg is not None:
             steer_radians = math.radians(self.heading + steering_deg)
             steer_tip = (
                 int(px + math.sin(steer_radians) * 46),

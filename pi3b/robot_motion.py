@@ -66,15 +66,18 @@ class ScanMotionResult:
     displacement_m: float = 0.0
 
 
-def range_signature(points, bins: int = SIGNATURE_BINS) -> np.ndarray:
-    """Reduce one LD19 revolution to a fixed-length minimum-range vector.
+def scan_arrays(points) -> tuple[np.ndarray, np.ndarray]:
+    """One LD19 revolution as (angles_deg, ranges_m).
 
-    Bins without a usable return become NaN so a missing sector is treated as
-    "no information", never as a range of zero.
+    Shared so the control loop converts each revolution once and hands the
+    same arrays to the motion tracker and to the local planner's obstacle
+    memory, rather than walking the point list twice per tick on a Pi 3B.
     """
-    signature = np.full(bins, np.nan, dtype=np.float32)
     if not points:
-        return signature
+        return (
+            np.zeros(0, dtype=np.float32),
+            np.zeros(0, dtype=np.float32),
+        )
     angles = np.fromiter(
         (float(point.angle_deg) for _index, point in points),
         dtype=np.float32,
@@ -85,6 +88,25 @@ def range_signature(points, bins: int = SIGNATURE_BINS) -> np.ndarray:
         dtype=np.float32,
         count=len(points),
     )
+    return angles, ranges
+
+
+def range_signature(points, bins: int = SIGNATURE_BINS) -> np.ndarray:
+    """Reduce one LD19 revolution to a fixed-length minimum-range vector.
+
+    Bins without a usable return become NaN so a missing sector is treated as
+    "no information", never as a range of zero.
+    """
+    angles, ranges = scan_arrays(points)
+    return signature_from_arrays(angles, ranges, bins)
+
+
+def signature_from_arrays(
+    angles: np.ndarray, ranges: np.ndarray, bins: int = SIGNATURE_BINS
+) -> np.ndarray:
+    signature = np.full(bins, np.nan, dtype=np.float32)
+    if angles.size == 0:
+        return signature
     valid = (ranges >= MIN_VALID_RANGE_M) & (ranges <= MAX_VALID_RANGE_M)
     if not np.any(valid):
         return signature

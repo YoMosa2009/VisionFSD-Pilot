@@ -958,12 +958,20 @@ class SpeedGovernorTests(unittest.TestCase):
             if policy.left_pwm == policy.right_pwm:
                 self.assertLessEqual(policy.left_pwm, 118)
 
-    def test_turning_adds_yaw_without_increasing_average_speed(self) -> None:
+    def test_turning_adds_yaw_without_running_away_with_speed(self) -> None:
+        """A turn must stay near cruise, not become an acceleration.
+
+        The bound moved from 119 to 123 when MAX_TURN_SPLIT_PWM rose from 28
+        to 34 to give the chassis a turn radius tight enough to actually go
+        around an obstacle. With the inner wheel pinned at the stall floor,
+        extra split can only come from the outer wheel, so a slightly higher
+        average during turns is the deliberate cost of that agility.
+        """
         policy = AutonomousPolicy(0.0, 118)
         clearance = SectorClearance(0.80, 2.0, 2.0, True, 2.0, 2.0,
                                     corridor_profile(wall_scene(0.80, gap=(12, 28))))
         settle(policy, clearance, self.status)
-        self.assertLessEqual((policy.left_pwm + policy.right_pwm) / 2.0, 119.0)
+        self.assertLessEqual((policy.left_pwm + policy.right_pwm) / 2.0, 123.0)
         self.assertNotEqual(policy.left_pwm, policy.right_pwm)
 
     def test_governed_output_still_clears_the_stall_floor(self) -> None:

@@ -33,7 +33,18 @@ from lidar_visualizer import LD19Parser, LivePolarMap
 from robot_camera_motion import CameraMotionState, estimate_motion
 from robot_explorer import ExplorationState, FrontierExplorer
 from robot_imu import AsyncIMULink, IMUState, LSM6DS3MCP2221Link
-from robot_motion import ScanMotionResult, ScanMotionTracker, range_signature
+from robot_local_planner import (
+    ArcChoice,
+    LocalPlanner,
+    PlannerLimits,
+    evaluate_arcs,
+)
+from robot_motion import (
+    ScanMotionResult,
+    ScanMotionTracker,
+    scan_arrays,
+    signature_from_arrays,
+)
 from robot_slam_lite import LidarSlamLite, SlamLiteState
 from robot_web import start_dashboard_server
 from visionfsd_pi import (
@@ -64,7 +75,12 @@ MAX_PWM = 255
 # on/off torque pulses below it: a small robot has too little inertia to make
 # that feel smooth, and the pulses are audible as stop-start motion.
 MIN_MOVE_PWM = 105
-DEFAULT_CRUISE_PWM = 118
+# Lowered from 118 after v1.9.18 testing reported the chassis moving too
+# fast to react in an indoor room. Software cannot slow it much further: a
+# loaded wheel stalls below MIN_MOVE_PWM, so the usable band is narrow and
+# the real levers are motor voltage and re-measuring the stall floor on a
+# freshly charged pack. See the README speed section.
+DEFAULT_CRUISE_PWM = 112
 # Largest direct-PWM rise per planner decision after the initial non-stalling
 # floor.  The Uno applies its own 20 ms output ramp as the final authority.
 MAX_PWM_STEP = 4
@@ -72,7 +88,28 @@ MAX_PWM_STEP = 4
 # eight-PWM split.  Bounded outer-wheel headroom supplies yaw while the inside
 # wheel remains at the loaded floor; neither wheel counter-rotates.
 MAX_GENTLE_HEADING_DEG = 40.0
-MAX_TURN_SPLIT_PWM = 28
+# Raised from 28 after v1.9.18 testing reported contact with walls.
+#
+# The split sets the turn radius, and the turn radius sets how far ahead an
+# obstacle must be seen for the chassis to physically go around it. At 28 the
+# radius is about 1.0 m at cruise, so clearing an obstacle edge by a body
+# width takes roughly 1.2 m of run: anything seen closer than that could not
+# be steered around at all, only met head-on and then escaped from in place.
+# 34 brings that to roughly 1.0 m.
+#
+# It cannot be raised further for free. The inner wheel is already pinned at
+# min_move_pwm - below it a loaded wheel only buzzes - so every extra unit of
+# split has to come from raising the OUTER wheel, which makes turns faster at
+# exactly the moment the robot should be cautious. 34 is the compromise. The
+# way out is not a bigger split: it is measuring the real stall floor on a
+# freshly charged pack and lowering --min-move-pwm, which buys split from the
+# slow side instead of the fast side.
+MAX_TURN_SPLIT_PWM = 34
+# Chassis yaw rate at a full-scale wheel split, matching the turn model in
+# robot_slam_lite.integrate_motion(). The arc planner derives its own turn
+# model from this so the two cannot drift apart: a planner that believes it
+# turns harder than the wheels allow commits to arcs it cannot follow.
+CHASSIS_TURN_RATE_DPS_AT_FULL_SPLIT = 130.0
 MAX_STEERING_STEP_DEG = 2.5
 CORRIDOR_STEERING_GAIN = 1.6
 ESCAPE_TURN_MARGIN_PWM = 24
@@ -117,8 +154,42 @@ MIN_DRIVE_CORRIDOR_M = 0.40
 # recovery trigger, and the all-round CLOSE_LIDAR_M block check all still run
 # first and still force a real escape.
 STEER_AROUND_MIN_OPENING_M = 0.55
-STEER_AROUND_MIN_SWEPT_M = 0.22
+# Raised from 0.22 m after v1.9.18 testing. 0.22 m is under a second of
+# travel at this chassis's actual cruise, which is not enough room to be
+# committing to an arc past an obstacle.
+STEER_AROUND_MIN_SWEPT_M = 0.34
 STEER_AROUND_MIN_HEADING_DEG = 8.0
+# An LD19 return this strong is a real surface even without angular support
+# from its neighbours, so thin obstacles (table legs, chair legs, lamp poles)
+# become visible to the corridor at their true range instead of only inside
+# 0.75 m. See corridor_profile_arrays().
+THIN_OBSTACLE_CONFIDENCE = 200.0
+# Brake first, then maneuver.
+#
+# The escape state machine's first act was a reverse arc or a pivot, both of
+# which are issued while the chassis is still carrying forward momentum from
+# cruise. Commanding a stop for one control tick before any recovery gives
+# the wheels a chance to actually arrest that momentum, and makes the
+# subsequent geometry checks describe where the robot is rather than where it
+# was a moment ago.
+EMERGENCY_BRAKE_M = 0.30
+EMERGENCY_BRAKE_ULTRASONIC_CM = 30.0
+EMERGENCY_BRAKE_S = 0.22
+# Arc planner: candidate steering commands, in degrees.
+ARC_STEER_OPTIONS = np.arange(-36.0, 36.1, 9.0, dtype=np.float32)
+# Radius of the circle that covers the chassis footprint, used for the arc
+# collision check. Half the diagonal, so it is never optimistic.
+BODY_RADIUS_M = math.hypot(0.14, 0.15) / 2.0
+# Default estimate of chassis speed at full PWM. This robot has no encoders,
+# so it is an estimate and not a measurement; every distance the speed
+# governor computes scales with it, and setting it too high only makes the
+# robot more cautious. Override with --chassis-top-speed-mps after timing the
+# robot over a measured distance.
+DEFAULT_TOP_SPEED_MPS = 0.55
+# The arc search runs at roughly the LD19 revolution rate rather than every
+# control tick: re-deciding faster than the measurement updates spends Pi 3B
+# cycles without changing the answer.
+ARC_REPLAN_PERIOD_S = 0.07
 OPENING_HALF_WIDTH_DEG = 5
 DISPLAY_PERIOD_S = 0.10
 TELEMETRY_PERIOD_S = 1.0
@@ -307,6 +378,25 @@ def corridor_profile(
         dtype=np.float32,
         count=len(points),
     )
+    return corridor_profile_arrays(
+        raw_angles, raw_ranges, raw_confidences, candidate_headings
+    )
+
+
+def corridor_profile_arrays(
+    raw_angles: np.ndarray,
+    raw_ranges: np.ndarray,
+    raw_confidences: np.ndarray,
+    candidate_headings: np.ndarray = STEER_HEADINGS,
+) -> np.ndarray:
+    """corridor_profile() over plain arrays.
+
+    Split out so the local planner can evaluate the same body-swept geometry
+    over the union of the live scan and its short-term obstacle memory,
+    without fabricating point objects for remembered returns.
+    """
+    if raw_angles.size == 0:
+        return np.zeros(candidate_headings.size, dtype=np.float32)
     valid = (raw_ranges >= 0.08) & (raw_ranges <= 5.8)
     binned = np.full(360, np.inf, dtype=np.float32)
     if np.any(valid):
@@ -319,9 +409,19 @@ def corridor_profile(
     for offset in (-3, -2, -1, 1, 2, 3):
         neighbour = np.roll(binned, -offset)
         supported |= finite & np.isfinite(neighbour) & (np.abs(neighbour - binned) <= tolerance)
-    # Do not erase a high-confidence close return merely because the object is
+    # Do not erase a high-confidence return merely because the object is
     # narrower than the LD19's adjacent angular samples.
-    close_confirmed = valid & (raw_ranges <= 0.75) & (raw_confidences >= 180)
+    #
+    # The range cap here used to be 0.75 m, which made a genuinely thin
+    # obstacle - a table leg, a chair leg, a floor lamp pole - invisible to
+    # the corridor until the robot was already within 0.75 m of it. At cruise
+    # that is under a second of warning, so the planner met thin obstacles as
+    # emergencies rather than routing around them. A strong return is a real
+    # surface at any range; angular support is a noise filter, not evidence.
+    close_confirmed = valid & (
+        ((raw_ranges <= 0.75) & (raw_confidences >= 180))
+        | (raw_confidences >= THIN_OBSTACLE_CONFIDENCE)
+    )
     if np.any(close_confirmed):
         close_bins = np.rint(raw_angles[close_confirmed]).astype(np.int16) % 360
         supported[close_bins] = True
@@ -950,8 +1050,27 @@ class AutonomousPolicy:
     This is reactive local navigation, not a claim of room-scale SLAM.
     """
 
-    def __init__(self, standby_s: float, speed: int, min_move_pwm: int = MIN_MOVE_PWM) -> None:
+    def __init__(self, standby_s: float, speed: int, min_move_pwm: int = MIN_MOVE_PWM,
+                 top_speed_mps: float = DEFAULT_TOP_SPEED_MPS) -> None:
         self.started_at = time.monotonic()
+        self.local_planner = LocalPlanner(
+            limits=PlannerLimits(
+                top_speed_mps=top_speed_mps,
+                yaw_rate_dps_at_full_steer=(
+                    MAX_TURN_SPLIT_PWM
+                    / MAX_PWM
+                    * CHASSIS_TURN_RATE_DPS_AT_FULL_SPLIT
+                ),
+                full_steer_deg=MAX_GENTLE_HEADING_DEG,
+            )
+        )
+        self.arc = ArcChoice()
+        self._obstacle_x = np.zeros(0, dtype=np.float32)
+        self._obstacle_y = np.zeros(0, dtype=np.float32)
+        self._last_motion_track_at = 0.0
+        self._brake_until = 0.0
+        self._next_arc_search_at = 0.0
+        self._imu_yaw_reference_deg: float | None = None
         self.standby_s = standby_s
         self.speed = max(min_move_pwm, speed)
         self.min_move_pwm = min_move_pwm
@@ -1025,6 +1144,58 @@ class AutonomousPolicy:
         self.imu_still_energy_g = state.still_energy_g if ready else None
         self.imu_tilt_deg = state.tilt_deg if ready else None
         self.imu_handled = bool(ready and state.handled)
+
+    def observe_scan(
+        self,
+        angles_deg: np.ndarray,
+        ranges_m: np.ndarray,
+        scan_at: float | None,
+        now: float,
+    ) -> None:
+        """Fold the live revolution into the planner's obstacle memory.
+
+        The arc planner then reasons about the union of what the LD19 can see
+        right now and what it saw over the last second and a half. That union
+        is what lets a multi-stage maneuver work: the obstacle the robot is
+        backing away from stays in the set while it is behind the chassis and
+        invisible to the current scan.
+        """
+        self._track_local_motion(now)
+        if scan_at is not None:
+            self.local_planner.memory.add_scan(angles_deg, ranges_m, scan_at)
+        live_x = np.zeros(0, dtype=np.float32)
+        live_y = np.zeros(0, dtype=np.float32)
+        if angles_deg.size:
+            usable = (ranges_m >= 0.08) & (ranges_m <= 4.0)
+            if np.any(usable):
+                radians = np.radians(angles_deg[usable].astype(np.float32))
+                reach = ranges_m[usable].astype(np.float32)
+                live_x = np.sin(radians) * reach
+                live_y = np.cos(radians) * reach
+        memory_x, memory_y = self.local_planner.memory.cartesian()
+        self._obstacle_x = np.concatenate((live_x, memory_x))
+        self._obstacle_y = np.concatenate((live_y, memory_y))
+
+    def _track_local_motion(self, now: float) -> None:
+        """Shift remembered obstacles by the motion just commanded."""
+        previous = self._last_motion_track_at
+        self._last_motion_track_at = now
+        if previous <= 0.0:
+            return
+        yaw_delta: float | None = None
+        if self.imu_yaw_deg is not None:
+            if self._imu_yaw_reference_deg is not None:
+                # The mapper and this memory both treat clockwise as
+                # positive; robot-frame +Z gyro is counter-clockwise.
+                yaw_delta = -self._yaw_delta_deg(
+                    self.imu_yaw_deg, self._imu_yaw_reference_deg
+                )
+            self._imu_yaw_reference_deg = self.imu_yaw_deg
+        else:
+            self._imu_yaw_reference_deg = None
+        self.local_planner.track_motion(
+            self.left_pwm, self.right_pwm, now - previous, yaw_delta
+        )
 
     def observe_scan_motion(self, result: ScanMotionResult, now: float) -> None:
         """Accept whole-scan motion evidence from the LD19 signature tracker."""
@@ -1548,6 +1719,104 @@ class AutonomousPolicy:
         self.cruise_pwm = outer
         return self._set_output("F", left, right)
 
+    def _emergency_brake(
+        self, arduino: ArduinoStatus, straight_clearance: float, now: float
+    ) -> str | None:
+        """Arrest forward momentum before attempting any recovery.
+
+        Recovery used to begin with a reverse arc or a pivot issued while the
+        chassis was still carrying cruise momentum, and a pivot started at
+        speed swings the outside corner into whatever the robot was about to
+        hit. Stopping first costs a fraction of a second and makes every
+        clearance check below describe where the robot actually is.
+        """
+        if now < self._brake_until:
+            self.drive_confidence = 0.0
+            return self._hold_stop("STOP:EMERGENCY_BRAKE")
+        moving_forward = self.left_pwm > 0 and self.right_pwm > 0
+        if not moving_forward:
+            return None
+        too_close = straight_clearance < EMERGENCY_BRAKE_M or (
+            arduino.front_cm is not None
+            and arduino.front_cm < EMERGENCY_BRAKE_ULTRASONIC_CM
+        )
+        if not too_close:
+            return None
+        self._brake_until = now + EMERGENCY_BRAKE_S
+        self.drive_confidence = 0.0
+        return self._hold_stop("STOP:EMERGENCY_BRAKE")
+
+    def _speed_options(self) -> tuple[tuple[int, float], ...]:
+        """Candidate PWM levels paired with their estimated ground speed.
+
+        The usable PWM band is narrow - below min_move_pwm a loaded wheel
+        only buzzes - so the governor's real decision is how much room a
+        given level needs, not fine speed control. Pairing each level with an
+        estimated m/s is what lets the arc search reject a level the sensing
+        latency cannot support.
+        """
+        top = self.local_planner.limits.top_speed_mps
+        levels = [self.min_move_pwm]
+        middle = (self.min_move_pwm + self.speed) // 2
+        if middle > self.min_move_pwm:
+            levels.append(middle)
+        if self.speed > middle and not self.visual_caution:
+            levels.append(self.speed)
+        return tuple((pwm, top * pwm / 255.0) for pwm in sorted(set(levels)))
+
+    def _drive_arc(self, lidar: SectorClearance, now: float) -> str | None:
+        """Choose and apply a predicted arc, or hand back to the old paths.
+
+        Returns None when no scan has been folded into the obstacle memory
+        yet, so callers that supply only a SectorClearance keep the previous
+        instantaneous-corridor behaviour.
+        """
+        if self._obstacle_x.size == 0:
+            return None
+        goal_heading = None
+        if self.exploration.active:
+            goal_heading = float(np.clip(
+                self.exploration.heading_error_deg, -60.0, 60.0
+            ))
+        if now >= self._next_arc_search_at:
+            # The control loop runs faster than the LD19 produces new
+            # revolutions, so re-running the full arc search every tick spends
+            # Pi 3B cycles re-deciding on identical data. Searching at roughly
+            # the scan rate keeps the choice no staler than the measurement it
+            # came from, and the steering ramp smooths the gaps.
+            self._next_arc_search_at = now + ARC_REPLAN_PERIOD_S
+            self.arc = evaluate_arcs(
+                self._obstacle_x,
+                self._obstacle_y,
+                self.local_planner.bank(
+                    ARC_STEER_OPTIONS, self._speed_options()
+                ),
+                BODY_RADIUS_M,
+                goal_heading,
+                self._steering_deg,
+            )
+            self.local_planner.last_choice = self.arc
+        choice = self.arc
+        if not choice.admissible:
+            # Nothing the chassis could still stop inside. This is the
+            # condition the previous planner expressed as "drive anyway and
+            # hope", which is what produced contact with walls.
+            return self._start_escape(lidar, now, "NO_SAFE_ARC")
+        self._arc_active = abs(choice.steering_deg) > 6.0
+        self.drive_confidence = float(np.clip(choice.reachable_m / 2.0, 0.0, 1.0))
+        if self.exploration.active:
+            self.reason = (
+                f"EXPLORE_{self.exploration.mode}:{choice.steering_deg:+.0f}deg "
+                f"reach{choice.reachable_m:.2f}m pwm{choice.pwm}"
+            )
+        else:
+            self.reason = (
+                f"DRIVE:{choice.steering_deg:+.0f}deg "
+                f"reach{choice.reachable_m:.2f}m stop{choice.stopping_m:.2f}m "
+                f"pwm{choice.pwm}"
+            )
+        return self._differential(choice.pwm, choice.steering_deg)
+
     def _steer_around(
         self, lidar: SectorClearance, now: float
     ) -> str | None:
@@ -1845,9 +2114,18 @@ class AutonomousPolicy:
             )
             if recovery_command is not None:
                 return recovery_command
+        brake_command = self._emergency_brake(arduino, straight_clearance, now)
+        if brake_command is not None:
+            return brake_command
         if close_ultrasonic or blocked_everywhere:
             source = "ULTRASONIC" if close_ultrasonic else "LD19"
             return self._start_escape(lidar, now, source)
+        # The arc planner owns forward motion whenever it has obstacle data:
+        # it reasons over predicted trajectories against remembered geometry,
+        # where everything below it reasons over one instantaneous scan.
+        arc_command = self._drive_arc(lidar, now)
+        if arc_command is not None:
+            return arc_command
         if close_straight:
             # Short straight corridor, but the scan is not blocked all round.
             # Try to curve past while still rolling before giving the pivot
@@ -2128,6 +2406,16 @@ class AutonomousPolicy:
         self._displaced_until = now + DISPLACED_HOLD_S
         self._reset_escape()
         self._reset_stuck_state()
+        # The obstacle memory is a robot-frame buffer; after a displacement
+        # every point in it describes geometry relative to a pose the chassis
+        # no longer holds.
+        self.local_planner.reset()
+        self.arc = ArcChoice()
+        self._obstacle_x = np.zeros(0, dtype=np.float32)
+        self._obstacle_y = np.zeros(0, dtype=np.float32)
+        self._imu_yaw_reference_deg = None
+        self._brake_until = 0.0
+        self._next_arc_search_at = 0.0
         self._scan_motion = replace(self._scan_motion, displaced=False)
         self._heading_index = None
         self._steering_deg = 0.0
@@ -2446,7 +2734,7 @@ def draw_dashboard(local_map: np.ndarray, policy: AutonomousPolicy,
                    imu: IMUState, slam_lite: SlamLiteState,
                    camera_motion: CameraMotionState | None = None) -> np.ndarray:
     panel = local_map.copy()
-    cv2.rectangle(panel, (0, 0), (panel.shape[1], 206), (14, 22, 31), -1)
+    cv2.rectangle(panel, (0, 0), (panel.shape[1], 230), (14, 22, 31), -1)
     front = "--" if clearance.front_m is None else f"{clearance.front_m:.2f}m"
     front_left = "--" if clearance.front_left_m is None else f"{clearance.front_left_m:.2f}m"
     front_right = "--" if clearance.front_right_m is None else f"{clearance.front_right_m:.2f}m"
@@ -2529,6 +2817,19 @@ def draw_dashboard(local_map: np.ndarray, policy: AutonomousPolicy,
         1,
         cv2.LINE_AA,
     )
+    arc = policy.arc
+    if arc.admissible:
+        arc_text = (
+            f"PLAN arc {arc.steering_deg:+.0f}deg  reach {arc.reachable_m:.2f}m  "
+            f"stop {arc.stopping_m:.2f}m  gap {arc.clearance_m:.2f}m  "
+            f"pwm {arc.pwm}  memory {policy.local_planner.memory.size}"
+        )
+        arc_color = (150, 225, 255)
+    else:
+        arc_text = f"PLAN no admissible arc ({arc.reason})"
+        arc_color = (90, 165, 255)
+    cv2.putText(panel, arc_text, (12, 217), cv2.FONT_HERSHEY_SIMPLEX, 0.35,
+                arc_color, 1, cv2.LINE_AA)
     cv2.putText(
         panel,
         f"MOTION {policy.stuck_phase} [{votes}]",
@@ -2603,6 +2904,14 @@ def parse_args() -> argparse.Namespace:
                         help="Dashboard stream JPEG quality, 30..95")
     parser.add_argument("--no-web", action="store_true",
                         help="Disable the view-only dashboard stream")
+    parser.add_argument("--chassis-top-speed-mps", type=float,
+                        default=DEFAULT_TOP_SPEED_MPS,
+                        help="Estimated ground speed at full PWM. Used by the "
+                             "speed governor to decide how much room each "
+                             "drive level needs. This chassis has no encoders, "
+                             "so measure it by timing the robot over a marked "
+                             "distance at a known PWM; overestimating only "
+                             "makes it more cautious.")
     return parser.parse_args()
 
 
@@ -2636,7 +2945,10 @@ def main() -> int:
         f"VisionFSD Robot: Uno={arduino_port}, LD19={lidar_port}, "
         f"camera request={args.camera}, IMU={'disabled' if imu is None else 'USB LSM6DS3'}"
     )
-    policy = AutonomousPolicy(args.standby_seconds, args.speed, args.min_move_pwm)
+    policy = AutonomousPolicy(
+        args.standby_seconds, args.speed, args.min_move_pwm,
+        args.chassis_top_speed_mps,
+    )
     # The map supplies a long-horizon exploration heading.  Current LD19
     # geometry remains the authority that decides whether motion is safe.
     local_map = LidarSlamLite()
@@ -2785,12 +3097,19 @@ def main() -> int:
             control_now = time.monotonic()
             control_gap_ms = 0.0 if last_control_at == 0.0 else (control_now - last_control_at) * 1000.0
             last_control_at = control_now
+            # One conversion of the revolution, shared by the motion tracker
+            # and the local planner's obstacle memory.
+            scan_angles, scan_ranges = scan_arrays(points)
             # Whole-scan motion evidence. This runs before the decision so a
             # displacement is acted on in the same tick it is observed.
             scan_result = scan_motion.update(
-                range_signature(points), clearance.scan_at
+                signature_from_arrays(scan_angles, scan_ranges),
+                clearance.scan_at,
             )
             policy.observe_scan_motion(scan_result, control_now)
+            policy.observe_scan(
+                scan_angles, scan_ranges, clearance.scan_at, control_now
+            )
             command = policy.decide(
                 clearance,
                 status,
@@ -2916,6 +3235,12 @@ def main() -> int:
                         steering_deg=policy.steering_deg,
                         intent_color=_INTENT_COLOR.get(
                             policy.intent, (120, 230, 255)
+                        ),
+                        arc_xy=policy.arc.path_xy if policy.arc.admissible else (),
+                        arc_clearance_m=(
+                            policy.arc.clearance_m
+                            if policy.arc.admissible
+                            else None
                         ),
                     ),
                     policy,

@@ -88,15 +88,16 @@ fi
   fi
 } >> "$LOG"
 
-# 118 is a cautious clear-space ceiling.  The planner scales down only to the
+# 112 is a cautious clear-space ceiling.  The planner scales down only to the
 # loaded-wheel movement floor, never into the buzzing/no-motion PWM band.
 ARGS=(
   "$ROOT/robot_autonomy.py"
   --camera "${VISIONFSD_CAMERA:-auto}"
   --standby-seconds "${VISIONFSD_STANDBY_SECONDS:-25}"
-  --speed "${VISIONFSD_ROBOT_SPEED:-118}"
+  --speed "${VISIONFSD_ROBOT_SPEED:-112}"
   --lidar-front-offset-deg "${VISIONFSD_LIDAR_FRONT_OFFSET_DEG:-0}"
   --imu-mount-yaw-deg "${VISIONFSD_IMU_MOUNT_YAW_DEG:-180}"
+  --chassis-top-speed-mps "${VISIONFSD_TOP_SPEED_MPS:-0.55}"
   --web-port "${VISIONFSD_WEB_PORT:-8080}"
   --web-fps "${VISIONFSD_WEB_FPS:-5}"
 )

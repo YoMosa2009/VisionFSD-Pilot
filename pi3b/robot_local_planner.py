@@ -1,0 +1,585 @@
+"""Short-horizon obstacle memory and arc selection for the Pi robot runtime.
+
+Two problems in the previous planner motivated this module.
+
+**No memory.** Every steering decision was made from the single most recent
+LD19 revolution. An obstacle that passed out of view behind the chassis, or
+was briefly occluded by something nearer, simply ceased to exist. That is
+also why multi-stage maneuvers failed: backing out of a corner needs the
+robot to still know about the thing it just drove away from.
+
+**No lookahead.** The planner scored headings, not motion. It asked "which
+direction has the most room right now" and re-answered from scratch every
+tick, so it could commit to a heading, discover a metre later that the
+heading was a dead end, stop, and pivot - the observed drive/stop/drive.
+
+The approach here is the standard one for this class of robot: keep a small
+rolling, motion-compensated local obstacle set (a local costmap in all but
+name), then evaluate a dynamic window of feasible (speed, steering) arcs
+against it over a short horizon and pick the best-scoring admissible one.
+It is deliberately the cheap version - hundreds of arithmetic operations per
+tick, no grid inflation pass, no global search - because it has to share a
+Pi 3B with LiDAR parsing, optical flow and the dashboard.
+
+Nothing here is a localisation claim. The memory is a decaying buffer in the
+robot's own frame, dead-reckoned over fractions of a second, not a map.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+import math
+
+import numpy as np
+
+# Robot frame used throughout: +y is straight ahead, +x is to the robot's
+# right, angles are degrees clockwise from straight ahead. This matches the
+# convention corridor_profile() already uses for LD19 returns.
+
+# How long a remembered return stays usable. Long enough to cover the blind
+# arc behind the chassis during a turn and brief occlusions, short enough
+# that dead-reckoning error over the window stays small and a moved object
+# cannot haunt the map.
+MEMORY_HORIZON_S = 1.5
+MEMORY_MAX_POINTS = 1100
+MEMORY_MAX_RANGE_M = 4.0
+# Remembered returns are dead-reckoned, so they are less trustworthy than the
+# live scan. They can only ever *reduce* clearance, and they are held slightly
+# further away than measured so memory alone cannot manufacture a hard block.
+MEMORY_RANGE_BIAS_M = 0.04
+# Multiplier that packs an angular bin index and a range into one sortable
+# float64 key. Comfortably larger than any usable range in metres.
+_BIN_KEY_SCALE = 1000.0
+
+
+@dataclass(frozen=True)
+class ArcChoice:
+    """One evaluated (speed, steering) candidate."""
+
+    admissible: bool = False
+    steering_deg: float = 0.0
+    pwm: int = 0
+    speed_mps: float = 0.0
+    clearance_m: float = 0.0
+    reachable_m: float = 0.0
+    stopping_m: float = 0.0
+    score: float = 0.0
+    reason: str = "NONE"
+    # Sampled arc in robot-frame metres, for the dashboard overlay.
+    path_xy: tuple[tuple[float, float], ...] = ()
+
+
+@dataclass
+class PlannerLimits:
+    """Physical and timing limits the arc search has to respect.
+
+    ``top_speed_mps`` is the chassis speed at full PWM. It is an estimate,
+    not a measurement - this robot has no encoders - and it is deliberately
+    configurable, because every distance the governor computes scales with
+    it. Setting it too high only makes the robot more cautious.
+    """
+
+    top_speed_mps: float = 0.55
+    # LD19 revolution + control tick + serial + motor response. The distance
+    # covered during this is unavoidable: the robot is committed to it before
+    # any new measurement can change the command.
+    reaction_latency_s: float = 0.25
+    # Deceleration once the wheels are commanded to stop or reverse. Low
+    # because a light chassis on a hard floor coasts.
+    braking_mps2: float = 0.85
+    # Never plan to pass closer than this to a remembered or measured return.
+    safety_margin_m: float = 0.10
+    # Headroom an arc must have beyond its own stopping distance before it
+    # counts as drivable. Without it the planner will happily commit to a
+    # level whose whole usable arc is braking distance.
+    stop_buffer_m: float = 0.25
+    # Lookahead is a distance, not a time. A time horizon collapses to
+    # almost nothing at this chassis's speed and cannot plan around anything.
+    min_lookahead_m: float = 1.60
+    max_lookahead_m: float = 2.40
+    horizon_steps: int = 8
+    # Degrees per second of yaw at a full-scale steering command.
+    #
+    # This is not a free parameter: it follows from how the chassis actually
+    # steers. _differential() applies at most MAX_TURN_SPLIT_PWM (28) of wheel
+    # split, and the chassis turn model puts that at roughly
+    # 28 / 255 * 130 = 14 deg/s. Overstating it would make the planner believe
+    # it can dodge sideways far more sharply than the wheels allow, commit to
+    # an arc it cannot follow, and drive into the thing it meant to avoid.
+    yaw_rate_dps_at_full_steer: float = 14.0
+    # Steering command that counts as full scale, matching
+    # MAX_GENTLE_HEADING_DEG in the runtime.
+    full_steer_deg: float = 40.0
+
+
+class ObstacleMemory:
+    """A decaying, motion-compensated set of returns in the robot frame.
+
+    Points are stored as Cartesian robot-frame metres and shifted on every
+    control tick by the motion the robot believes it just made. Because the
+    window is short, the accumulated dead-reckoning error stays small even
+    though the underlying motion estimate is only commanded PWM plus, when
+    available, measured IMU yaw.
+    """
+
+    def __init__(
+        self,
+        horizon_s: float = MEMORY_HORIZON_S,
+        max_points: int = MEMORY_MAX_POINTS,
+        max_range_m: float = MEMORY_MAX_RANGE_M,
+    ) -> None:
+        self.horizon_s = horizon_s
+        self.max_points = max_points
+        self.max_range_m = max_range_m
+        self._x = np.zeros(0, dtype=np.float32)
+        self._y = np.zeros(0, dtype=np.float32)
+        self._stamp = np.zeros(0, dtype=np.float64)
+        self._last_scan_at: float | None = None
+
+    def reset(self) -> None:
+        self._x = np.zeros(0, dtype=np.float32)
+        self._y = np.zeros(0, dtype=np.float32)
+        self._stamp = np.zeros(0, dtype=np.float64)
+        self._last_scan_at = None
+
+    @property
+    def size(self) -> int:
+        return int(self._x.size)
+
+    def integrate_motion(self, forward_m: float, yaw_deg: float) -> None:
+        """Move stored points opposite to the robot's own motion."""
+        if self._x.size == 0:
+            return
+        if yaw_deg:
+            # yaw_deg is the robot's own rotation, clockwise-positive. In the
+            # robot frame (+x right, +y ahead) the surrounding points rotate
+            # by the same signed angle, not its negation: turning right by 90
+            # degrees puts what was ahead onto the robot's left.
+            radians = math.radians(yaw_deg)
+            cos = math.cos(radians)
+            sin = math.sin(radians)
+            x = cos * self._x - sin * self._y
+            y = sin * self._x + cos * self._y
+            self._x, self._y = x.astype(np.float32), y.astype(np.float32)
+        if forward_m:
+            self._y = (self._y - forward_m).astype(np.float32)
+
+    def add_scan(
+        self, angles_deg: np.ndarray, ranges_m: np.ndarray, now: float
+    ) -> None:
+        """Fold one LD19 revolution into the memory."""
+        if self._last_scan_at is not None and now <= self._last_scan_at:
+            # The control loop runs faster than the LD19; adding one cached
+            # revolution repeatedly would give it disproportionate weight.
+            return
+        self._last_scan_at = now
+        usable = (ranges_m >= 0.08) & (ranges_m <= self.max_range_m)
+        if not np.any(usable):
+            self._expire(now)
+            return
+        radians = np.radians(angles_deg[usable].astype(np.float32))
+        biased = ranges_m[usable].astype(np.float32) + MEMORY_RANGE_BIAS_M
+        x = np.sin(radians) * biased
+        y = np.cos(radians) * biased
+        stamp = np.full(x.size, now, dtype=np.float64)
+        self._x = np.concatenate((self._x, x))
+        self._y = np.concatenate((self._y, y))
+        self._stamp = np.concatenate((self._stamp, stamp))
+        self._expire(now)
+
+    def _expire(self, now: float) -> None:
+        keep = self._stamp >= now - self.horizon_s
+        if not np.all(keep):
+            self._x = self._x[keep]
+            self._y = self._y[keep]
+            self._stamp = self._stamp[keep]
+        if self._x.size > self.max_points:
+            # Drop the oldest first; the newest returns describe where the
+            # robot is about to be.
+            surplus = self._x.size - self.max_points
+            self._x = self._x[surplus:]
+            self._y = self._y[surplus:]
+            self._stamp = self._stamp[surplus:]
+
+    def cartesian(self) -> tuple[np.ndarray, np.ndarray]:
+        """Remembered returns as robot-frame (x, y) metres."""
+        return self._x, self._y
+
+    def polar(self) -> tuple[np.ndarray, np.ndarray]:
+        """Remembered returns as (angles_deg, ranges_m)."""
+        if self._x.size == 0:
+            return (
+                np.zeros(0, dtype=np.float32),
+                np.zeros(0, dtype=np.float32),
+            )
+        ranges = np.hypot(self._x, self._y)
+        angles = np.degrees(np.arctan2(self._x, self._y)) % 360.0
+        keep = ranges >= 0.08
+        return angles[keep].astype(np.float32), ranges[keep].astype(np.float32)
+
+
+def stopping_distance_m(speed_mps: float, limits: PlannerLimits) -> float:
+    """Distance covered before the chassis can be stopped.
+
+    Reaction distance is travelled at full speed because no decision made
+    during it can change the outcome; braking distance follows.
+    """
+    if speed_mps <= 0.0:
+        return 0.0
+    reaction = speed_mps * limits.reaction_latency_s
+    braking = (speed_mps * speed_mps) / (2.0 * max(0.05, limits.braking_mps2))
+    return reaction + braking
+
+
+def reduce_obstacles(
+    x: np.ndarray,
+    y: np.ndarray,
+    bins: int = 180,
+    max_range_m: float = 3.2,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Collapse the obstacle set to the nearest return per angular bin.
+
+    Collision checking only ever cares about the closest thing in a given
+    direction, so a few thousand raw returns carry no more information than
+    one per two-degree bin. On a Pi 3B this is the difference between a
+    planner that fits in the control loop and one that does not: it shrinks
+    the distance computation by roughly an order of magnitude without
+    changing any decision.
+    """
+    if x.size == 0:
+        return x, y
+    ranges = np.hypot(x, y)
+    keep = (ranges >= 0.05) & (ranges <= max_range_m)
+    if not np.any(keep):
+        return np.zeros(0, dtype=np.float32), np.zeros(0, dtype=np.float32)
+    ranges = ranges[keep]
+    angles = np.arctan2(x[keep], y[keep])
+    index = np.floor((angles + np.pi) / (2.0 * np.pi) * bins).astype(np.int32)
+    np.clip(index, 0, bins - 1, out=index)
+    # Per-bin minimum without a scatter. np.minimum.at is an unbuffered
+    # scatter and np.lexsort makes two passes; packing the bin and the range
+    # into one sortable key needs a single sort, which is the cheapest of the
+    # three and the one that fits a Pi 3B control loop. The key is exact in
+    # float64 for these magnitudes, and sorting it ascending puts each bin's
+    # nearest return first.
+    key = index.astype(np.float64) * _BIN_KEY_SCALE + ranges
+    key.sort()
+    sorted_index = (key * (1.0 / _BIN_KEY_SCALE)).astype(np.int32)
+    first = np.empty(sorted_index.size, dtype=bool)
+    first[0] = True
+    np.not_equal(sorted_index[1:], sorted_index[:-1], out=first[1:])
+    bin_index = sorted_index[first]
+    reach = (key[first] - bin_index * _BIN_KEY_SCALE).astype(np.float32)
+    centres = ((bin_index + 0.5) / bins * 2.0 * np.pi - np.pi).astype(np.float32)
+    return (
+        (np.sin(centres) * reach).astype(np.float32),
+        (np.cos(centres) * reach).astype(np.float32),
+    )
+
+
+class ArcBank:
+    """Precomputed candidate arcs for one fixed set of planner options.
+
+    The arc geometry depends only on the steering options, the speed options
+    and the lookahead - all constant from tick to tick - so building it once
+    and reusing it removes the dominant cost of the search. Constructing the
+    27 small arcs per call cost more than the collision check itself, which
+    is the sort of overhead a Pi 3B cannot absorb inside a control loop.
+
+    Sampling by distance rather than by time is what fixes the lookahead. A
+    1.3 s window at this chassis's 0.25 m/s sees 33 cm ahead, which cannot
+    plan around anything; a distance horizon looks the same distance ahead
+    regardless of how fast the robot happens to be going. Speed still enters,
+    through curvature: a differential chassis turning at a given yaw rate
+    carves a tighter radius the slower it travels.
+    """
+
+    def __init__(
+        self,
+        limits: PlannerLimits,
+        steering_options_deg: np.ndarray,
+        speed_options: tuple[tuple[int, float], ...],
+    ) -> None:
+        self.limits = limits
+        self.steering_options_deg = np.asarray(
+            steering_options_deg, dtype=np.float32
+        )
+        self.speed_options = tuple(speed_options)
+        self.candidates = [
+            (float(steering), int(pwm), float(mps))
+            for steering in self.steering_options_deg
+            for pwm, mps in self.speed_options
+            if mps > 0.0
+        ]
+        self.fastest_mps = max(
+            (mps for _pwm, mps in self.speed_options), default=1.0
+        )
+        self.horizon_m = float(
+            np.clip(
+                max(
+                    limits.min_lookahead_m,
+                    3.0 * stopping_distance_m(self.fastest_mps, limits),
+                ),
+                limits.min_lookahead_m,
+                limits.max_lookahead_m,
+            )
+        )
+        self.steps = max(2, limits.horizon_steps)
+        self.distance = np.linspace(
+            self.horizon_m / self.steps,
+            self.horizon_m,
+            self.steps,
+            dtype=np.float32,
+        )
+        if not self.candidates:
+            self.pose_x = np.zeros(0, dtype=np.float32)
+            self.pose_y = np.zeros(0, dtype=np.float32)
+            self.arc_x = np.zeros((0, self.steps), dtype=np.float32)
+            self.arc_y = np.zeros((0, self.steps), dtype=np.float32)
+            return
+        steering = np.array(
+            [item[0] for item in self.candidates], dtype=np.float32
+        )
+        speeds = np.array(
+            [item[2] for item in self.candidates], dtype=np.float32
+        )
+        yaw_rate_dps = (
+            steering / limits.full_steer_deg * limits.yaw_rate_dps_at_full_steer
+        )
+        yaw_per_metre = yaw_rate_dps / np.maximum(0.05, speeds)
+        headings = np.radians(
+            yaw_per_metre[:, None] * self.distance[None, :]
+        )
+        step_distance = np.diff(
+            np.concatenate((np.zeros(1, dtype=np.float32), self.distance))
+        )
+        # Integrate along each arc rather than assuming a straight line at
+        # the final heading: the near part of the trajectory is what collides.
+        self.arc_x = np.cumsum(
+            np.sin(headings) * step_distance[None, :], axis=1
+        ).astype(np.float32)
+        self.arc_y = np.cumsum(
+            np.cos(headings) * step_distance[None, :], axis=1
+        ).astype(np.float32)
+        self.pose_x = self.arc_x.reshape(-1)
+        self.pose_y = self.arc_y.reshape(-1)
+
+    def matches(
+        self,
+        steering_options_deg: np.ndarray,
+        speed_options: tuple[tuple[int, float], ...],
+    ) -> bool:
+        return (
+            self.speed_options == tuple(speed_options)
+            and self.steering_options_deg.shape
+            == np.shape(steering_options_deg)
+            and bool(
+                np.array_equal(
+                    self.steering_options_deg,
+                    np.asarray(steering_options_deg, dtype=np.float32),
+                )
+            )
+        )
+
+
+def evaluate_arcs(
+    obstacle_x: np.ndarray,
+    obstacle_y: np.ndarray,
+    bank: ArcBank,
+    body_radius_m: float,
+    goal_heading_deg: float | None,
+    current_steering_deg: float,
+    reduce: bool = True,
+) -> ArcChoice:
+    """Pick the best admissible (speed, steering) arc from a prebuilt bank.
+
+    Scoring balances four things the previous heading-only chooser could not
+    trade off against each other at all:
+
+    * how much room the whole predicted arc has, not just its final heading,
+    * progress toward the exploration goal,
+    * staying near the currently commanded steering, which is what removes
+      the tick-to-tick weaving, and
+    * preferring speed, but only among arcs that are already safe.
+
+    An arc is admissible only when the chassis could still stop inside the
+    clearance that arc actually has. That single rule ties commanded speed to
+    measured room, and is why this cannot select a speed the sensing latency
+    does not support.
+    """
+    best = ArcChoice(reason="NO_ADMISSIBLE_ARC")
+    if not bank.candidates:
+        return best
+    if reduce:
+        obstacle_x, obstacle_y = reduce_obstacles(obstacle_x, obstacle_y)
+    limits = bank.limits
+    distance = bank.distance
+    if obstacle_x.size:
+        # One batched distance computation for every candidate pose against
+        # the reduced obstacle set. Squared distances keep this out of
+        # np.hypot, whose overflow-safe path costs several times more than
+        # the arithmetic it protects; the square root is then taken over the
+        # few hundred per-pose minima rather than the whole matrix.
+        delta_x = obstacle_x[None, :] - bank.pose_x[:, None]
+        delta_y = obstacle_y[None, :] - bank.pose_y[:, None]
+        squared = delta_x * delta_x + delta_y * delta_y
+        nearest = np.sqrt(squared.min(axis=1))
+        margins = (nearest - body_radius_m).reshape(-1, bank.steps)
+    else:
+        margins = np.full(
+            (len(bank.candidates), bank.steps),
+            limits.safety_margin_m * 4.0,
+            dtype=np.float32,
+        )
+    blocked = margins < limits.safety_margin_m
+    any_blocked = blocked.any(axis=1)
+    first_blocked = blocked.argmax(axis=1)
+    reachable = np.where(
+        any_blocked,
+        np.where(first_blocked > 0, distance[first_blocked - 1], 0.0),
+        distance[-1],
+    )
+    # Report clearance over the part of the arc the robot can actually use.
+    # Including samples past the block point produced negative "gaps" for
+    # arcs that were never going to travel that far.
+    steps_index = np.arange(bank.steps)[None, :]
+    usable = np.where(
+        any_blocked[:, None], steps_index < first_blocked[:, None], True
+    )
+    worst_margin = np.where(usable, margins, np.inf).min(axis=1)
+    # Progress is distance made good along the current heading, not arc
+    # length. Scoring arc length rewards the arc that curls tightly away from
+    # everything - it stays "clear" for its whole length while going nowhere -
+    # which is what made the robot orbit local objects instead of crossing
+    # open floor and driving through a gap.
+    last_usable = np.where(any_blocked, first_blocked - 1, bank.steps - 1)
+    rows = np.arange(len(bank.candidates))
+    progress = np.where(
+        last_usable >= 0, bank.arc_y[rows, np.maximum(last_usable, 0)], 0.0
+    )
+
+    best_score = -np.inf
+    for index, (steering_deg, pwm, speed_mps) in enumerate(bank.candidates):
+        reachable_m = float(reachable[index])
+        required = stopping_distance_m(speed_mps, limits)
+        # Require real headroom beyond the bare stopping distance. Bare
+        # equality means committing to a drive level whose entire usable arc
+        # is consumed by braking, with nothing left for the braking model
+        # being optimistic - which on a smooth floor it will be.
+        if reachable_m < required + limits.stop_buffer_m:
+            continue
+        clearance_m = float(worst_margin[index])
+        if not np.isfinite(clearance_m):
+            clearance_m = limits.safety_margin_m
+        goal_term = 0.0
+        if goal_heading_deg is not None:
+            # Falls off over 45 degrees rather than 90. A gentler curve leaves
+            # the goal nearly flat across the whole candidate set, so forward
+            # progress decides everything and the robot drives straight past
+            # the direction it meant to explore.
+            error = abs(steering_deg - goal_heading_deg)
+            goal_term = max(0.0, 1.0 - error / 45.0) * 1.40
+        # An arc that runs into something is categorically worse than one that
+        # does not, and more so the sooner it happens. Without this an arc
+        # blocked at half a metre scores about the same as a clear one that
+        # merely curves more, because progress and clearance alone are too
+        # close together to separate them.
+        obstruction = 0.0
+        if bool(any_blocked[index]):
+            obstruction = 0.35 + 0.45 * (
+                1.0 - min(1.0, reachable_m / max(0.05, bank.horizon_m))
+            )
+        # Staying near the steering already applied is what removes the
+        # tick-to-tick weaving; without it the search re-answers from scratch
+        # every cycle and two near-tied arcs alternate.
+        smoothness = -abs(steering_deg - current_steering_deg) / 90.0 * 0.85
+        straightness = -abs(steering_deg) / 90.0 * 0.30
+        room = min(float(progress[index]), 2.0) * 0.80
+        margin_term = min(max(clearance_m, 0.0), 0.60) * 0.55
+        score = (
+            room
+            + margin_term
+            + goal_term
+            + smoothness
+            + straightness
+            - obstruction
+            + (speed_mps / bank.fastest_mps) * 0.45
+        )
+        if score > best_score:
+            best_score = score
+            best = ArcChoice(
+                admissible=True,
+                steering_deg=steering_deg,
+                pwm=pwm,
+                speed_mps=speed_mps,
+                clearance_m=clearance_m,
+                reachable_m=reachable_m,
+                stopping_m=required,
+                score=float(score),
+                reason="ARC",
+                path_xy=tuple(
+                    (float(px), float(py))
+                    for px, py in zip(bank.arc_x[index], bank.arc_y[index])
+                ),
+            )
+    return best
+
+
+@dataclass
+class LocalPlanner:
+    """Obstacle memory plus arc selection, with the state the UI needs."""
+
+    limits: PlannerLimits = field(default_factory=PlannerLimits)
+    memory: ObstacleMemory = field(default_factory=ObstacleMemory)
+    last_choice: ArcChoice = field(default_factory=ArcChoice)
+    _bank: ArcBank | None = field(default=None, repr=False)
+
+    def bank(
+        self,
+        steering_options_deg: np.ndarray,
+        speed_options: tuple[tuple[int, float], ...],
+    ) -> ArcBank:
+        """Cached candidate arcs, rebuilt only when the options change."""
+        if self._bank is None or not self._bank.matches(
+            steering_options_deg, speed_options
+        ):
+            self._bank = ArcBank(
+                self.limits, steering_options_deg, speed_options
+            )
+        return self._bank
+
+    def reset(self) -> None:
+        self.memory.reset()
+        self.last_choice = ArcChoice()
+
+    def commanded_speed_mps(self, left_pwm: int, right_pwm: int) -> float:
+        """Best available estimate of current travel speed.
+
+        Commanded PWM is all there is without encoders. It over-reports
+        during a stall, which is the safe direction here: it makes the
+        governor demand more room, and the stuck detector owns the stall.
+        """
+        forward = (left_pwm + right_pwm) * 0.5
+        return max(0.0, forward / 255.0) * self.limits.top_speed_mps
+
+    def track_motion(
+        self,
+        left_pwm: int,
+        right_pwm: int,
+        elapsed_s: float,
+        measured_yaw_delta_deg: float | None,
+    ) -> None:
+        elapsed_s = min(0.25, max(0.0, elapsed_s))
+        if elapsed_s <= 0.0:
+            return
+        forward_m = self.commanded_speed_mps(left_pwm, right_pwm) * elapsed_s
+        if measured_yaw_delta_deg is not None:
+            yaw_deg = measured_yaw_delta_deg
+        else:
+            yaw_deg = (
+                (left_pwm - right_pwm) / 255.0
+                * self.limits.yaw_rate_dps_at_full_steer
+                * 2.1
+                * elapsed_s
+            )
+        self.memory.integrate_motion(forward_m, yaw_deg)
