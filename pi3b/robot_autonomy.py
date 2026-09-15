@@ -39,6 +39,7 @@ from robot_local_planner import (
     GapChoice,
     LocalPlanner,
     PlannerLimits,
+    ProgressWatchdog,
     evaluate_arcs,
     find_gap,
 )
@@ -196,6 +197,12 @@ ARC_REPLAN_PERIOD_S = 0.07
 # and how close the heading has to get before forward planning resumes.
 GAP_COMMIT_S = 2.60
 GAP_ALIGNED_DEG = 14.0
+# After a gap pivot completes, keep steering the arc planner toward that
+# opening for a moment. Without it the robot turns to face a gap, immediately
+# finds some forward arc admissible, re-decides on its own merits, and the
+# pivot it just performed is wasted - which from outside looks like turning
+# at random and never going anywhere.
+GAP_FOLLOW_S = 2.20
 # Rate limits are expressed per second, not per control tick.
 #
 # Per-tick limits silently couple responsiveness to loop rate: a tick spent
@@ -1118,10 +1125,16 @@ class AutonomousPolicy:
         self._next_arc_search_at = 0.0
         self._imu_yaw_reference_deg: float | None = None
         self.gap = GapChoice()
-        self._gap_bearing_deg: float | None = None
+        self.watchdog = ProgressWatchdog()
+        self._gap_aligned = False
+        # The direction the robot has committed to, kept in the current robot
+        # frame by _track_local_motion.
+        self._committed_bearing_deg: float | None = None
         self._gap_commit_until = 0.0
-        self._gap_started_yaw_deg: float | None = None
-        self._gap_yaw_source = "TIME"
+        # Bias applied to the arc planner just after a gap pivot, so the robot
+        # drives down the opening it turned toward instead of re-deciding the
+        # moment a forward arc becomes available again.
+        self._gap_follow_until = 0.0
         self._last_output_at = 0.0
         self._output_elapsed_s = CONTROL_PERIOD_S
         self.control: RobotControl | None = None
@@ -1231,25 +1244,60 @@ class AutonomousPolicy:
         self._obstacle_y = np.concatenate((live_y, memory_y))
 
     def _track_local_motion(self, now: float) -> None:
-        """Shift remembered obstacles by the motion just commanded."""
+        """Advance everything held in the robot frame by the motion just made.
+
+        The obstacle memory, the committed gap bearing and the oscillation
+        watchdog are all expressed relative to the chassis, so they all have
+        to be moved by the same step. Keeping one source for it is what stops
+        them drifting out of agreement with each other.
+        """
         previous = self._last_motion_track_at
         self._last_motion_track_at = now
         if previous <= 0.0:
             return
-        yaw_delta: float | None = None
+        elapsed = min(0.25, max(0.0, now - previous))
+        measured_yaw: float | None = None
         if self.imu_yaw_deg is not None:
             if self._imu_yaw_reference_deg is not None:
                 # The mapper and this memory both treat clockwise as
                 # positive; robot-frame +Z gyro is counter-clockwise.
-                yaw_delta = -self._yaw_delta_deg(
+                measured_yaw = -self._yaw_delta_deg(
                     self.imu_yaw_deg, self._imu_yaw_reference_deg
                 )
             self._imu_yaw_reference_deg = self.imu_yaw_deg
         else:
             self._imu_yaw_reference_deg = None
         self.local_planner.track_motion(
-            self.left_pwm, self.right_pwm, now - previous, yaw_delta
+            self.left_pwm, self.right_pwm, elapsed, measured_yaw
         )
+        yaw_step = (
+            measured_yaw
+            if measured_yaw is not None
+            else (self.left_pwm - self.right_pwm)
+            / MAX_PWM
+            * CHASSIS_TURN_RATE_DPS_AT_FULL_SPLIT
+            * elapsed
+        )
+        forward_step = (
+            self.local_planner.commanded_speed_mps(self.left_pwm, self.right_pwm)
+            * elapsed
+        )
+        # A committed bearing was measured in the robot frame of the tick it
+        # was chosen in. Rotating it by the yaw just turned keeps it pointing
+        # at the same place in the world. Without this the commitment drags
+        # the robot back toward where the opening used to be relative to the
+        # chassis, which is itself a way to spin on the spot.
+        if self._committed_bearing_deg is not None:
+            self._committed_bearing_deg = (
+                self._committed_bearing_deg - yaw_step + 180.0
+            ) % 360.0 - 180.0
+        commanding = self.left_pwm != 0 or self.right_pwm != 0
+        if self.watchdog.update(now, forward_step, yaw_step, commanding):
+            print(
+                "NAV_EVENT reason=OSCILLATION_LOCK "
+                f"sign={self.watchdog.locked_sign} "
+                f"count={self.watchdog.oscillations}"
+            )
 
     def observe_scan_motion(self, result: ScanMotionResult, now: float) -> None:
         """Accept whole-scan motion evidence from the LD19 signature tracker."""
@@ -1441,6 +1489,14 @@ class AutonomousPolicy:
         if left is None and right is None:
             return None
         scores = {"L": left, "R": right}
+        forced = self.watchdog.locked_sign
+        if forced:
+            # Honour an oscillation lock here as well, or the escape machine
+            # simply reintroduces the flip-flop the lock exists to stop.
+            side = "R" if forced > 0 else "L"
+            if scores.get(side) is not None:
+                self.turn_command = side
+                return side, scores[side] or 0.0
         locked = scores.get(self.turn_command)
         exploration_turn: str | None = None
         if self.exploration.active and abs(self.exploration.heading_error_deg) >= 12.0:
@@ -1892,6 +1948,13 @@ class AutonomousPolicy:
             goal_heading = float(np.clip(
                 self.exploration.heading_error_deg, -60.0, 60.0
             ))
+        if now < self._gap_follow_until and self._committed_bearing_deg is not None:
+            # Follow through on the opening just turned toward, rather than
+            # letting the frontier route pull the chassis straight back out
+            # of it.
+            goal_heading = float(np.clip(
+                self._committed_bearing_deg, -60.0, 60.0
+            ))
         if now >= self._next_arc_search_at:
             # The control loop runs faster than the LD19 produces new
             # revolutions, so re-running the full arc search every tick spends
@@ -1906,7 +1969,13 @@ class AutonomousPolicy:
                     ARC_STEER_OPTIONS, self._speed_options()
                 ),
                 goal_heading,
-                self._steering_deg,
+                # Anchor hysteresis on the steering last *chosen*, not the
+                # ramped value on its way there. The ramp passes through zero
+                # when reversing a turn, and at zero the two competing
+                # directions look equally attractive again - the anchor was
+                # feeding the very oscillation it was meant to damp.
+                self.arc.steering_deg if self.arc.admissible else self._steering_deg,
+                direction_lock=self.watchdog.locked_sign,
             )
             self.local_planner.last_choice = self.arc
         choice = self.arc
@@ -1938,23 +2007,24 @@ class AutonomousPolicy:
         """Pivot toward a measured opening and commit to it.
 
         The arc search only sees headings the chassis can reach while still
-        rolling, roughly plus or minus 36 degrees. Surrounded by furniture,
-        every one of those is blocked and the old answer was a fixed-size
-        blind pivot re-decided on arrival - which in a cluttered room is
-        exactly the repeated spinning that never commits to anything.
+        rolling, roughly plus or minus 36 degrees. Surrounded by furniture
+        every one of those is blocked, and a fixed-size blind pivot re-decided
+        on arrival is a loop rather than a plan.
 
         This asks the whole revolution where the real openings are, turns to
-        face the best one, and holds that commitment until the heading is
-        reached or the opening stops existing. Committing is the point: the
-        known failure of gap-following is two similar gaps swapping rank
-        between scans, so the choice is deliberately sticky.
+        face the best one, and holds that commitment. The commitment is kept
+        in the robot frame and rotated by _track_local_motion as the chassis
+        turns, so "the gap I chose" keeps meaning the same physical place
+        rather than the same angle off the bumper.
         """
+        self._gap_aligned = False
         if self._obstacle_x.size == 0:
             return None
-        if now < self._gap_commit_until and self._gap_bearing_deg is not None:
-            held = self._gap_bearing_deg
-        else:
-            held = None
+        committed = (
+            self._committed_bearing_deg
+            if now < self._gap_commit_until
+            else None
+        )
         goal_heading = (
             self.exploration.heading_error_deg
             if self.exploration.active
@@ -1965,32 +2035,31 @@ class AutonomousPolicy:
             self._obstacle_y,
             self.local_planner.limits,
             goal_heading,
-            held if held is not None else self._gap_bearing_deg,
+            committed,
+            direction_lock=self.watchdog.locked_sign,
         )
         self.gap = gap
         if not gap.found:
-            self._gap_bearing_deg = None
+            self._committed_bearing_deg = None
+            self._gap_commit_until = 0.0
             return None
-        if held is None:
+        if committed is None:
             # A fresh commitment. Hold it long enough for the chassis to make
             # real progress toward the opening rather than re-deciding on the
             # next revolution.
-            self._gap_bearing_deg = gap.bearing_deg
             self._gap_commit_until = now + GAP_COMMIT_S
-            self._gap_started_yaw_deg, self._gap_yaw_source = (
-                self._turn_reference_yaw_deg()
-            )
+        # Steer on the freshly measured bearing of the opening the hysteresis
+        # selected, not on the angle recorded when it was chosen; the scan
+        # reports it in the current frame every revolution anyway.
+        self._committed_bearing_deg = gap.bearing_deg
         remaining = gap.bearing_deg
-        turned = self._gap_turned_deg()
-        if turned is not None:
-            remaining = (
-                self._gap_bearing_deg - turned + 180.0
-            ) % 360.0 - 180.0
         if abs(remaining) <= GAP_ALIGNED_DEG:
-            # Facing the opening. Hand back to the arc planner, which can now
-            # find a forward trajectory down it.
+            # Facing the opening. Hand back to the arc planner, and keep
+            # biasing it toward this heading for a moment so it drives down
+            # the gap instead of immediately re-deciding.
             self._gap_commit_until = 0.0
-            self._gap_bearing_deg = None
+            self._gap_follow_until = now + GAP_FOLLOW_S
+            self._gap_aligned = True
             return None
         direction = "L" if remaining < 0.0 else "R"
         self.turn_command = direction
@@ -1998,24 +2067,9 @@ class AutonomousPolicy:
         self.drive_confidence = 0.25
         self.reason = (
             f"GAP_SEEK:{direction} bearing{gap.bearing_deg:+.0f}deg "
-            f"width{gap.width_deg:.0f} depth{gap.clearance_m:.2f}m "
-            f"left{remaining:+.0f}deg"
+            f"width{gap.width_deg:.0f} depth{gap.clearance_m:.2f}m"
         )
         return self._center_pivot_crawl(direction)
-
-    def _gap_turned_deg(self) -> float | None:
-        """Yaw turned clockwise since the current gap commitment began.
-
-        Gap bearings are robot-frame, clockwise-positive. The two yaw sources
-        do not agree on that: the mapper's heading also increases clockwise,
-        but IMU yaw comes from a counter-clockwise-positive gyro, so it has to
-        be negated before the two can be compared.
-        """
-        current = self._yaw_for_source(self._gap_yaw_source)
-        if current is None or self._gap_started_yaw_deg is None:
-            return None
-        delta = self._yaw_delta_deg(current, self._gap_started_yaw_deg)
-        return -delta if self._gap_yaw_source == "IMU" else delta
 
     def _steer_around(
         self, lidar: SectorClearance, now: float
@@ -2315,15 +2369,48 @@ class AutonomousPolicy:
         # corridors or the independent ultrasonic near-field trigger.
         blocked_everywhere = best_clearance < CLOSE_LIDAR_M
         close_straight = straight_clearance < CLOSE_FRONT_TURN_M
+        brake_command = self._emergency_brake(arduino, straight_clearance, now)
+        if brake_command is not None:
+            return brake_command
+        # A measured opening outranks the escape state machine.
+        #
+        # Escape is a blind reactive loop: it picks a side from fixed sector
+        # scores, pivots a fixed amount, re-decides on arrival, and knows
+        # nothing about where the room actually opens. Once entered it owned
+        # the chassis for hundreds of ticks, which is what the spinning in a
+        # cluttered room actually was - not gap seeking failing, but gap
+        # seeking never getting a turn. Gap selection sees the whole
+        # revolution, including behind, and commits; escape is now only for
+        # when there is genuinely no opening to see.
+        crowded = (
+            close_ultrasonic
+            or blocked_everywhere
+            or close_straight
+            or self._escape_phase != "IDLE"
+            or now < self._gap_commit_until
+        )
+        if crowded:
+            gap_command = self._seek_gap(lidar, now)
+            if gap_command is not None:
+                self._reset_escape()
+                return gap_command
+            if self._gap_aligned:
+                # Already facing the chosen opening. Clear any escape phase so
+                # the arc planner drives down it; leaving escape running here
+                # is what let a blind ESCAPE_COMMIT arc pull the chassis back
+                # off an opening it had just lined up on.
+                self._reset_escape()
+            elif self.watchdog.locked_sign and not self.gap.found:
+                # Turning hard, going nowhere, and no opening anywhere in the
+                # revolution. More pivoting cannot discover one; this is a
+                # genuine dead end and saying so is more useful than spinning.
+                return self._mark_escape_blocked(lidar, now)
         if self._escape_phase != "IDLE":
             recovery_command = self._continue_escape(
                 lidar, arduino, straight_clearance, now
             )
             if recovery_command is not None:
                 return recovery_command
-        brake_command = self._emergency_brake(arduino, straight_clearance, now)
-        if brake_command is not None:
-            return brake_command
         if close_ultrasonic or blocked_everywhere:
             source = "ULTRASONIC" if close_ultrasonic else "LD19"
             return self._start_escape(lidar, now, source)
@@ -2623,8 +2710,10 @@ class AutonomousPolicy:
         self._imu_yaw_reference_deg = None
         self._brake_until = 0.0
         self._next_arc_search_at = 0.0
-        self._gap_bearing_deg = None
+        self._committed_bearing_deg = None
         self._gap_commit_until = 0.0
+        self._gap_follow_until = 0.0
+        self.watchdog.reset()
         self._scan_motion = replace(self._scan_motion, displaced=False)
         self._heading_index = None
         self._steering_deg = 0.0
@@ -3037,6 +3126,15 @@ def draw_dashboard(local_map: np.ndarray, policy: AutonomousPolicy,
     else:
         arc_text = f"PLAN no admissible arc ({arc.reason})"
         arc_color = (90, 165, 255)
+    lock = policy.watchdog.locked_sign
+    if lock:
+        arc_text += f"  LOCK {'RIGHT' if lock > 0 else 'LEFT'}"
+        arc_color = (120, 200, 255)
+    elif policy.gap.found and policy.reason.startswith("GAP_SEEK"):
+        arc_text += (
+            f"  GAP {policy.gap.bearing_deg:+.0f}deg "
+            f"{policy.gap.width_deg:.0f}wide"
+        )
     cv2.putText(panel, arc_text, (12, 217), cv2.FONT_HERSHEY_SIMPLEX, 0.35,
                 arc_color, 1, cv2.LINE_AA)
     cv2.putText(
@@ -3422,6 +3520,9 @@ def main() -> int:
                     f"imu_yaw_1s={imu_state.yaw_delta_1s_deg:+.0f} "
                     f"handled={int(imu_state.handled)} "
                     f"displaced={policy.displacement_count} "
+                    f"osc={policy.watchdog.oscillations} "
+                    f"lock={policy.watchdog.locked_sign} "
+                    f"gap={policy.gap.bearing_deg:+.0f}/{policy.gap.width_deg:.0f} "
                     f"intent={policy.intent} "
                     f"recenter={slam_lite.recenter_count}"
                 )

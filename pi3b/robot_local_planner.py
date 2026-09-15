@@ -446,6 +446,7 @@ def evaluate_arcs(
     goal_heading_deg: float | None,
     current_steering_deg: float,
     reduce: bool = True,
+    direction_lock: int = 0,
 ) -> ArcChoice:
     """Pick the best admissible (speed, steering) arc from a prebuilt bank.
 
@@ -519,6 +520,11 @@ def evaluate_arcs(
 
     best_score = -np.inf
     for index, (steering_deg, pwm, speed_mps) in enumerate(bank.candidates):
+        if direction_lock and steering_deg * direction_lock < 0.0:
+            # Oscillation was detected and this turn is against the locked
+            # direction. Removing the option outright is the point: leaving
+            # it available at a penalty is what let the tie keep flipping.
+            continue
         reachable_m = float(reachable[index])
         required = stopping_distance_m(speed_mps, limits)
         # Require real headroom beyond the bare stopping distance. Bare
@@ -551,7 +557,7 @@ def evaluate_arcs(
         # Staying near the steering already applied is what removes the
         # tick-to-tick weaving; without it the search re-answers from scratch
         # every cycle and two near-tied arcs alternate.
-        smoothness = -abs(steering_deg - current_steering_deg) / 90.0 * 0.85
+        smoothness = -abs(steering_deg - current_steering_deg) / 90.0 * 1.05
         straightness = -abs(steering_deg) / 90.0 * 0.30
         room = min(float(progress[index]), 2.0) * 0.80
         margin_term = min(max(clearance_m, 0.0), 0.60) * 0.55
@@ -584,6 +590,123 @@ def evaluate_arcs(
     return best
 
 
+class ProgressWatchdog:
+    """Detect turning without getting anywhere, then lock a turn direction.
+
+    Two similar openings score almost identically, so a planner that
+    re-decides every cycle can swap between them indefinitely: turn left,
+    which makes the right gap look better, turn right, repeat. The robot is
+    moving the whole time, so no stall detector fires, and it never leaves
+    the spot. That is the classic local-planner limit cycle.
+
+    The established remedies agree on the shape of the answer. Nav2's
+    OscillationCritic keeps a watchdog and refuses the opposite sign of
+    motion until the robot has actually travelled a minimum distance or
+    turned a minimum angle. TEB detects the same condition and responds by
+    weighting the optimiser toward "prefer the current turning direction".
+    Both are: notice the indecision, then remove the choice until real
+    progress happens.
+
+    The signature used here is deliberately different from TEB's
+    velocity-epsilon test, which assumes an oscillating robot is nearly
+    stationary. This one spins briskly. What distinguishes it is that a lot
+    of *absolute* yaw accumulates while *net* yaw and forward travel stay
+    near zero.
+    """
+
+    def __init__(
+        self,
+        window_s: float = 3.0,
+        abs_yaw_deg: float = 70.0,
+        net_yaw_deg: float = 30.0,
+        advance_m: float = 0.25,
+        lock_s: float = 4.0,
+        release_advance_m: float = 0.45,
+    ) -> None:
+        self.window_s = window_s
+        self.abs_yaw_deg = abs_yaw_deg
+        self.net_yaw_deg = net_yaw_deg
+        self.advance_m = advance_m
+        self.lock_s = lock_s
+        self.release_advance_m = release_advance_m
+        self._history: list[tuple[float, float, float]] = []
+        self._locked_sign = 0
+        self._lock_until = 0.0
+        self._lock_advance_m = 0.0
+        self.oscillations = 0
+
+    def reset(self) -> None:
+        self._history.clear()
+        self._locked_sign = 0
+        self._lock_until = 0.0
+        self._lock_advance_m = 0.0
+
+    @property
+    def locked_sign(self) -> int:
+        """-1 to allow only left turns, +1 only right, 0 for no lock."""
+        return self._locked_sign
+
+    def update(
+        self,
+        now: float,
+        forward_step_m: float,
+        yaw_step_deg: float,
+        commanding: bool,
+    ) -> bool:
+        """Fold one control tick in. Returns True when oscillation is new."""
+        if self._locked_sign:
+            self._lock_advance_m += max(0.0, forward_step_m)
+            released = (
+                now >= self._lock_until
+                or self._lock_advance_m >= self.release_advance_m
+            )
+            if released:
+                self._locked_sign = 0
+                self._lock_advance_m = 0.0
+        if not commanding:
+            self._history.clear()
+            return False
+        self._history.append((now, forward_step_m, yaw_step_deg))
+        cutoff = now - self.window_s
+        while self._history and self._history[0][0] < cutoff:
+            self._history.pop(0)
+        if len(self._history) < 4:
+            return False
+        elapsed = now - self._history[0][0]
+        if elapsed < self.window_s * 0.8:
+            return False
+        advance = sum(step for _t, step, _yaw in self._history)
+        yaw_steps = [yaw for _t, _step, yaw in self._history]
+        absolute_yaw = sum(abs(value) for value in yaw_steps)
+        net_yaw = abs(sum(yaw_steps))
+        oscillating = (
+            absolute_yaw >= self.abs_yaw_deg
+            and net_yaw <= self.net_yaw_deg
+            and advance <= self.advance_m
+        )
+        if not oscillating or self._locked_sign:
+            return False
+        # Commit to the direction the robot has net-turned toward, or, with
+        # no net preference at all, simply to the most recent one. Breaking a
+        # symmetric tie arbitrarily and then sticking to it beats re-deciding
+        # it every cycle; which way is chosen matters far less than that the
+        # choice stops changing.
+        total = sum(yaw_steps)
+        if abs(total) > 1e-6:
+            self._locked_sign = 1 if total > 0.0 else -1
+        else:
+            recent = next(
+                (value for value in reversed(yaw_steps) if abs(value) > 1e-6),
+                1.0,
+            )
+            self._locked_sign = 1 if recent > 0.0 else -1
+        self._lock_until = now + self.lock_s
+        self._lock_advance_m = 0.0
+        self.oscillations += 1
+        self._history.clear()
+        return True
+
+
 def find_gap(
     obstacle_x: np.ndarray,
     obstacle_y: np.ndarray,
@@ -592,6 +715,7 @@ def find_gap(
     held_bearing_deg: float | None = None,
     bins: int = 72,
     max_range_m: float = 3.2,
+    direction_lock: int = 0,
 ) -> GapChoice:
     """Find the widest usable opening anywhere around the robot.
 
@@ -654,15 +778,44 @@ def find_gap(
         run = slice(index, end + 1)
         width_deg = (end - index + 1) * span_deg
         depth_m = float(rolled_clearance[run].min())
-        # The opening has to be physically wide enough at its own depth, not
-        # merely wide in angle: a narrow slot far away subtends the same
-        # angle as a doorway nearby.
-        if math.radians(width_deg) * depth_m >= needed * 2.0:
+        # Physical width is the chord between the two returns that bound the
+        # opening - the classic Follow-The-Gap definition - not the arc length
+        # at the gap's own depth.
+        #
+        # Measuring at the depth is wrong in the direction that matters: a
+        # doorway reads as deep because the room beyond it is deep, so a 30
+        # degree slot between walls half a metre away scored as if it were
+        # 1.4 m wide when its actual mouth is 29 cm, and the robot committed
+        # to turning toward openings it cannot fit through. The arc planner
+        # then refused to drive, and the two disagreed forever.
+        left_edge = (index - 1) % bins
+        right_edge = (end + 1) % bins
+        edge_left_m = float(rolled_clearance[left_edge])
+        edge_right_m = float(rolled_clearance[right_edge])
+        separation = math.radians(width_deg + span_deg)
+        mouth_m = math.sqrt(
+            max(
+                0.0,
+                edge_left_m * edge_left_m
+                + edge_right_m * edge_right_m
+                - 2.0 * edge_left_m * edge_right_m * math.cos(separation),
+            )
+        )
+        if width_deg >= 180.0:
+            # More than half the circle is open; there are no bounding edges
+            # to take a chord between.
+            mouth_m = max(mouth_m, depth_m)
+        if mouth_m >= needed * 2.0:
             centre_bin = (start + index + end) / 2.0 + 0.5
             bearing = (centre_bin * span_deg + 180.0) % 360.0 - 180.0
+            if direction_lock and bearing * direction_lock < 0.0:
+                # Turning the other way is exactly what the lock exists to
+                # stop; an opening behind that turn is not an option yet.
+                index = end + 1
+                continue
             score = (
                 min(depth_m, 2.5) * 0.9
-                + min(width_deg, 90.0) / 90.0 * 1.1
+                + min(mouth_m, 1.5) / 1.5 * 1.1
                 - abs(bearing) / 180.0 * 0.85
             )
             if goal_heading_deg is not None:

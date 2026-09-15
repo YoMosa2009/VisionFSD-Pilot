@@ -32,7 +32,7 @@ from robot_autonomy import (
     AutonomousPolicy,
     SectorClearance,
 )
-from robot_local_planner import PlannerLimits, find_gap
+from robot_local_planner import PlannerLimits, ProgressWatchdog, find_gap
 from robot_web import RobotControl
 
 
@@ -41,7 +41,13 @@ def _status(now: float, front_cm: float | None = None) -> ArduinoStatus:
 
 
 def _ring(clearance_m: float, openings: tuple[tuple[float, float, float], ...] = ()):
-    """A 360-degree scan at a fixed range, with optional deeper sectors."""
+    """A 360-degree scan at a fixed range, with optional deeper sectors.
+
+    Opening sectors have to be wide enough that the *mouth* - the chord
+    between the returns bounding them - actually admits the chassis. An
+    opening that is merely deep is not a route: see
+    test_a_deep_narrow_slot_is_rejected.
+    """
     angles = np.arange(0.0, 360.0, 2.0, dtype=np.float32)
     ranges = np.full(angles.size, clearance_m, dtype=np.float32)
     for start, end, depth in openings:
@@ -96,7 +102,7 @@ class GapFindingTests(unittest.TestCase):
     def test_an_opening_behind_the_robot_is_found(self) -> None:
         """The arc search only sees plus or minus 36 degrees. Surrounded by
         furniture, the only way out may be well outside that."""
-        x, y = _ring(0.45, ((100.0, 150.0, 2.6),))
+        x, y = _ring(0.45, ((95.0, 165.0, 2.6),))
         gap = find_gap(x, y, self.limits)
         self.assertTrue(gap.found)
         self.assertGreater(gap.bearing_deg, 90.0)
@@ -116,8 +122,40 @@ class GapFindingTests(unittest.TestCase):
         x, y = _ring(0.40, ((88.0, 92.0, 3.0),))
         self.assertFalse(find_gap(x, y, self.limits).found)
 
+    def test_a_deep_narrow_slot_is_rejected(self) -> None:
+        """Width is the chord between the returns bounding the opening, not
+        the arc length at the opening's own depth.
+
+        Measuring at the depth fails in the direction that matters: a doorway
+        reads as deep because the room beyond it is deep, so a 32 degree slot
+        between walls half a metre away scored as if it were 1.4 m wide when
+        its real mouth is 29 cm. The robot then committed to turning toward
+        openings it could not fit through, the arc planner refused to drive,
+        and the two disagreed indefinitely - which is what the spinning was.
+        """
+        walls_m = 0.5
+        half_angle_deg = 16.0
+        mouth_m = 2.0 * walls_m * math.tan(math.radians(half_angle_deg))
+        needed_m = 2.0 * (
+            ROBOT_FOOTPRINT.radius_m + self.limits.safety_margin_m
+        )
+        self.assertLess(mouth_m, needed_m)
+
+        x, y = _ring(
+            walls_m,
+            ((90.0 - half_angle_deg, 90.0 + half_angle_deg, 2.8),),
+        )
+        self.assertFalse(find_gap(x, y, self.limits).found)
+
+    def test_a_real_doorway_between_the_same_walls_is_accepted(self) -> None:
+        """The companion to the test above: same wall distance, an opening
+        wide enough for the chassis, and it is a route."""
+        x, y = _ring(0.5, ((53.0, 127.0, 2.8),))
+        gap = find_gap(x, y, self.limits)
+        self.assertTrue(gap.found)
+
     def test_the_wider_of_two_openings_wins(self) -> None:
-        x, y = _ring(0.40, ((85.0, 95.0, 2.0), (200.0, 260.0, 2.0)))
+        x, y = _ring(0.40, ((80.0, 100.0, 2.0), (190.0, 270.0, 2.0)))
         gap = find_gap(x, y, self.limits)
         self.assertTrue(gap.found)
         self.assertGreater(gap.width_deg, 30.0)
@@ -125,7 +163,7 @@ class GapFindingTests(unittest.TestCase):
     def test_hysteresis_holds_the_opening_already_being_followed(self) -> None:
         """Two similar gaps swapping rank between scans is the classic
         Follow-The-Gap zigzag, and is what spinning in place looked like."""
-        x, y = _ring(0.40, ((60.0, 100.0, 2.0), (260.0, 300.0, 2.0)))
+        x, y = _ring(0.40, ((45.0, 115.0, 2.0), (245.0, 315.0, 2.0)))
         left = find_gap(x, y, self.limits, held_bearing_deg=-80.0)
         right = find_gap(x, y, self.limits, held_bearing_deg=80.0)
         self.assertTrue(left.found and right.found)
@@ -133,7 +171,7 @@ class GapFindingTests(unittest.TestCase):
         self.assertGreater(right.bearing_deg, 0.0)
 
     def test_the_goal_direction_influences_the_choice(self) -> None:
-        x, y = _ring(0.40, ((60.0, 100.0, 2.0), (260.0, 300.0, 2.0)))
+        x, y = _ring(0.40, ((45.0, 115.0, 2.0), (245.0, 315.0, 2.0)))
         toward_left = find_gap(x, y, self.limits, goal_heading_deg=-80.0)
         toward_right = find_gap(x, y, self.limits, goal_heading_deg=80.0)
         self.assertLess(toward_left.bearing_deg, 0.0)
@@ -153,8 +191,8 @@ class GapSeekingPolicyTests(unittest.TestCase):
     def _boxed_policy(self) -> AutonomousPolicy:
         policy = AutonomousPolicy(0.0, 112)
         angles = np.arange(0.0, 360.0, 2.0, dtype=np.float32)
-        ranges = np.full(angles.size, 0.42, dtype=np.float32)
-        ranges[(angles >= 100.0) & (angles <= 150.0)] = 2.6
+        ranges = np.full(angles.size, 0.45, dtype=np.float32)
+        ranges[(angles >= 95.0) & (angles <= 165.0)] = 2.6
         policy.observe_scan(angles, ranges, 1.0, 1.0)
         return policy
 
@@ -162,7 +200,7 @@ class GapSeekingPolicyTests(unittest.TestCase):
         policy = self._boxed_policy()
         now = time.monotonic()
         clearance = SectorClearance(
-            0.42, 0.42, 0.42, True, 0.42, 0.42, rear_m=0.42, scan_at=now
+            0.45, 0.45, 0.45, True, 0.45, 0.45, rear_m=0.45, scan_at=now
         )
 
         policy.decide(clearance, _status(now), False, now)
@@ -176,7 +214,7 @@ class GapSeekingPolicyTests(unittest.TestCase):
         policy = self._boxed_policy()
         now = time.monotonic()
         clearance = SectorClearance(
-            0.42, 0.42, 0.42, True, 0.42, 0.42, rear_m=0.42, scan_at=now
+            0.45, 0.45, 0.45, True, 0.45, 0.45, rear_m=0.45, scan_at=now
         )
         policy.decide(clearance, _status(now), False, now)
         self.assertTrue(policy.gap.found)
@@ -428,6 +466,102 @@ class OperatorControlPolicyTests(unittest.TestCase):
         self.assertEqual(MANUAL_DRIVE["F"], (MIN_MOVE_PWM, MIN_MOVE_PWM))
         self.assertEqual(MANUAL_DRIVE["STOP"], (0, 0))
         self.assertGreater(MANUAL_FORWARD_MIN_M, 0.0)
+
+
+class ProgressWatchdogTests(unittest.TestCase):
+    """Turning hard while going nowhere.
+
+    Two similar openings score almost identically, so a planner that
+    re-decides every cycle can swap between them forever: the robot moves the
+    whole time, so no stall detector fires, and it never leaves the spot.
+    Nav2's OscillationCritic and TEB's oscillation recovery both answer this
+    the same way - notice it, then take the opposite turn away until real
+    progress happens.
+    """
+
+    def _spin(self, watchdog: ProgressWatchdog, ticks: int = 200) -> float | None:
+        """Alternate the turn direction without advancing.
+
+        Stops at the moment of detection and returns that timestamp, so a
+        test can inspect the lock before it has had a chance to expire.
+        """
+        for index in range(ticks):
+            now = index * 0.05
+            yaw = 6.0 if (index // 10) % 2 == 0 else -6.0
+            if watchdog.update(now, 0.0, yaw, True):
+                return now
+        return None
+
+    def test_spinning_without_progress_is_detected(self) -> None:
+        watchdog = ProgressWatchdog()
+        self.assertIsNotNone(self._spin(watchdog))
+        self.assertIn(watchdog.locked_sign, (-1, 1))
+
+    def test_driving_straight_is_never_flagged(self) -> None:
+        watchdog = ProgressWatchdog()
+        for index in range(200):
+            self.assertFalse(
+                watchdog.update(index * 0.05, 0.02, 0.0, True)
+            )
+        self.assertEqual(watchdog.locked_sign, 0)
+
+    def test_a_sustained_turn_that_gets_somewhere_is_not_flagged(self) -> None:
+        """A long committed turn accumulates absolute yaw, but its net yaw
+        matches - that is progress, not indecision."""
+        watchdog = ProgressWatchdog()
+        for index in range(200):
+            self.assertFalse(
+                watchdog.update(index * 0.05, 0.01, 5.0, True)
+            )
+
+    def test_a_stopped_robot_is_not_flagged(self) -> None:
+        watchdog = ProgressWatchdog()
+        for index in range(200):
+            self.assertFalse(
+                watchdog.update(index * 0.05, 0.0, 0.0, False)
+            )
+
+    def test_the_lock_releases_once_the_robot_travels(self) -> None:
+        watchdog = ProgressWatchdog()
+        fired_at = self._spin(watchdog)
+        self.assertIsNotNone(fired_at)
+        self.assertNotEqual(watchdog.locked_sign, 0)
+        for index in range(60):
+            watchdog.update(fired_at + index * 0.02, 0.02, 0.0, True)
+        self.assertEqual(watchdog.locked_sign, 0)
+
+    def test_the_lock_expires_on_its_own(self) -> None:
+        watchdog = ProgressWatchdog(lock_s=1.0)
+        fired_at = self._spin(watchdog)
+        self.assertIsNotNone(fired_at)
+        self.assertNotEqual(watchdog.locked_sign, 0)
+        watchdog.update(fired_at + 1.5, 0.0, 0.0, True)
+        self.assertEqual(watchdog.locked_sign, 0)
+
+    def test_reset_clears_the_lock(self) -> None:
+        watchdog = ProgressWatchdog()
+        self.assertIsNotNone(self._spin(watchdog))
+        watchdog.reset()
+        self.assertEqual(watchdog.locked_sign, 0)
+
+    def test_a_symmetric_tie_is_still_broken(self) -> None:
+        """Which way it goes matters far less than that the choice stops
+        changing."""
+        watchdog = ProgressWatchdog()
+        for index in range(200):
+            yaw = 6.0 if index % 2 == 0 else -6.0
+            watchdog.update(index * 0.05, 0.0, yaw, True)
+        self.assertIn(watchdog.locked_sign, (-1, 1))
+
+
+class DirectionLockTests(unittest.TestCase):
+    def test_a_locked_direction_removes_the_opposite_gap(self) -> None:
+        x, y = _ring(0.40, ((45.0, 115.0, 2.0), (245.0, 315.0, 2.0)))
+        limits = PlannerLimits(footprint=ROBOT_FOOTPRINT)
+        right_only = find_gap(x, y, limits, direction_lock=1)
+        left_only = find_gap(x, y, limits, direction_lock=-1)
+        self.assertGreater(right_only.bearing_deg, 0.0)
+        self.assertLess(left_only.bearing_deg, 0.0)
 
 
 if __name__ == "__main__":

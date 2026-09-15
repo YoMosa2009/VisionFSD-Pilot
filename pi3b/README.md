@@ -787,6 +787,77 @@ Desktop tests only (394 pass). **Nothing here has run on the robot.** They do
 not verify the real turn radius, stopping distance, LD19 timing, or Pi 3B
 load.
 
+### v1.9.21: openings the robot actually fits through, and a commitment
+
+Reported from driving v1.9.20: with two safe openings available it would not
+settle on either - random driving, spinning, staying in one place.
+
+This reproduces in simulation, and the numbers name the fault. Boxed in with
+two equal openings, the robot accumulated **1119 degrees** of absolute yaw for
+**77 degrees** of net yaw over twenty seconds: it was turning almost
+continuously and going nowhere. Reproducing it first is what made the real
+cause findable, because the first two explanations were both wrong.
+
+**The actual bug: gap width was measured in the wrong place.** `find_gap`
+scored an opening by its angular width times its own *depth*. A doorway reads
+as deep because the room beyond it is deep, so a 32-degree slot between walls
+half a metre away scored as though it were 1.4 m wide - when the real mouth is
+**29 cm**, and this chassis needs 46 cm. So the gap finder kept committing to
+openings the robot cannot fit through, the arc planner kept refusing to drive
+into them, and the two disagreed forever. That disagreement *is* the spinning.
+Width is now the chord between the two returns bounding the opening - the
+classic Follow-The-Gap definition - so the two layers finally agree on what
+counts as a route.
+
+**Gap seeking never got a turn.** The escape state machine ran first and,
+once entered, owned the chassis for hundreds of consecutive ticks - 556 of 700
+in the simulation - pivoting a fixed amount from fixed sector scores and
+re-deciding on arrival, with no knowledge of where the room actually opens.
+Escape is now the last resort rather than the first: a measured opening
+outranks it, and clearing an escape phase when the robot lines up on a gap
+stops a blind `ESCAPE_COMMIT` arc from dragging the chassis back off an
+opening it had just aimed at.
+
+**A commitment that pointed at where the gap used to be.** The chosen bearing
+was recorded in the robot frame of the tick that chose it and then compared
+against later scans without being rotated, so as the robot turned, the
+hysteresis pulled it back toward the old angle. The commitment is now rotated
+by the same yaw step that moves the obstacle memory, and the arc planner's
+own hysteresis anchors on the steering last *chosen* rather than the ramped
+value on its way there - the ramp passes through zero when reversing a turn,
+and at zero both directions look equally good again, so the anchor was feeding
+the oscillation it was meant to damp.
+
+**A watchdog as a backstop.** Following Nav2's OscillationCritic and TEB's
+oscillation recovery, which both answer this by noticing the indecision and
+then removing the choice: a lot of absolute yaw with little net yaw and no
+forward travel is flagged as oscillation, and the opposite turn direction is
+then barred until the robot has actually travelled. The signature is
+deliberately not TEB's velocity-epsilon test, which assumes an oscillating
+robot is nearly stationary - this one spins briskly. With the width bug fixed
+the watchdog rarely needs to fire; it stays as insurance.
+
+Measured over twenty simulated seconds, boxed in with two equal doorways:
+
+| | before | after |
+| --- | --- | --- |
+| turn-direction reversals | 33 | 2 |
+| absolute yaw | 1119 deg | 57 deg |
+| net / absolute yaw (1.0 = committed) | 0.03 | 0.83 |
+| ticks spent driving forward | 0 | 685 / 700 |
+
+The same holds for one opening (0.88) and for an opening directly behind, which
+it turns 163 degrees to face and then drives through (0.94). Fully enclosed
+with no opening at all, it now tries briefly and then holds `STOP:BOXED_IN`
+rather than spinning indefinitely - a sealed box has no answer, and saying so
+is more useful than turning forever.
+
+Cost is about 0.9 ms per arc search plus 0.6 ms for gap finding when crowded,
+roughly 15% of one Pi 3B core at the replan rate.
+
+Desktop tests and simulation only (405 pass). **Nothing here has run on the
+robot.**
+
 ### Dashboard operator controls
 
 The phone dashboard now carries **STOP**, **RESUME** and **MANUAL CONTROL**
