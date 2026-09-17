@@ -58,8 +58,26 @@ class LidarSlamLite:
     # pinned at the array edge while it kept moving physically, so every new
     # scan projected onto a stale position and the map stopped updating.
     RECENTER_MARGIN_FRACTION = 0.20
+    # Fold at most one LD19 revolution (about 100 ms) into the map at a time.
+    #
+    # The live scan is a sliding window refreshed every packet batch, so the
+    # previous 35 ms gate let the same returns be integrated two or three
+    # times per revolution. That spent Pi 3B time re-deskewing and re-matching
+    # identical data, and it made occupancy evidence grow with the control
+    # loop rate rather than with independent observations.
+    SCAN_INTEGRATION_PERIOD_S = 0.085
+    # Occupancy evidence outside the current view fades with this half-life.
+    #
+    # Fading used to be applied once per integration, so the effective memory
+    # depended on how often the loop happened to integrate - about 3.4 s at the
+    # old rate. Walls that briefly left the LD19's view were forgotten before
+    # the planner could route around them again. Time-based fading keeps a
+    # deliberate, rate-independent memory: long enough to plan multi-turn
+    # routes through space not currently in view, short enough that
+    # dead-reckoning drift cannot accumulate into a permanently wrong map.
+    MEMORY_HALF_LIFE_S = 12.0
 
-    def __init__(self, cells: int = 384, metres: float = 8.0) -> None:
+    def __init__(self, cells: int = 576, metres: float = 12.0) -> None:
         self.cells = cells
         self.metres = metres
         self.grid = np.zeros((cells, cells), dtype=np.uint8)
@@ -84,6 +102,8 @@ class LidarSlamLite:
         self._translation_confidence = 0.0
         self._translation_correction_m = 0.0
         self._translation_matched = False
+        self._last_decay_at: float | None = None
+        self.last_shift_cells = (0, 0)
 
     @staticmethod
     def _signed_angle(angle: float) -> float:
@@ -282,6 +302,7 @@ class LidarSlamLite:
         self.y += shift_row / scale
         self.x += shift_col / scale
         self._recenter_count += 1
+        self.last_shift_cells = (shift_row, shift_col)
         return True
 
     @staticmethod
@@ -355,17 +376,26 @@ class LidarSlamLite:
         if base_rows.size < 30:
             return 0.0, 0.0, 0.0, False
 
-        candidates: list[tuple[float, int, int]] = []
-        for row_offset in range(-5, 6):
-            for col_offset in range(-5, 6):
-                score = float(np.mean(
-                    self.grid[
-                        base_rows + row_offset,
-                        base_cols + col_offset,
-                    ]
-                ))
-                candidates.append((score, row_offset, col_offset))
-        candidates.sort(reverse=True)
+        # Score all 121 candidate offsets with one gather instead of 121
+        # separate fancy-index operations; on a Pi 3B the Python loop cost
+        # dominated the actual arithmetic.
+        offsets = np.arange(-5, 6, dtype=np.int32)
+        row_offsets = np.repeat(offsets, offsets.size)
+        col_offsets = np.tile(offsets, offsets.size)
+        gathered = self.grid[
+            base_rows[None, :] + row_offsets[:, None],
+            base_cols[None, :] + col_offsets[:, None],
+        ]
+        scores = gathered.mean(axis=1, dtype=np.float32)
+        candidates: list[tuple[float, int, int]] = sorted(
+            (
+                (float(score), int(row_offset), int(col_offset))
+                for score, row_offset, col_offset in zip(
+                    scores, row_offsets, col_offsets
+                )
+            ),
+            reverse=True,
+        )
         best_score, best_row, best_col = candidates[0]
         zero_score = next(
             score
@@ -395,10 +425,89 @@ class LidarSlamLite:
             True,
         )
 
-    def _integrate_points(self, points: Iterable[tuple[int, object]]) -> None:
+    #: Consecutive returns closer together than this, in degrees, are treated
+    #: as sampling one continuous surface, so the wedge between them is
+    #: observed free space. The LD19 samples every 0.8 degrees at 10 Hz; a
+    #: wider gap is missing returns (dark or distant surfaces), which say
+    #: nothing about the space in between.
+    FREE_WEDGE_MAX_GAP_DEG = 2.5
+    #: Range ratio beyond which two adjacent returns are different surfaces.
+    FREE_WEDGE_MAX_RANGE_RATIO = 1.25
+
+    def _trace_visible(
+        self,
+        visible: np.ndarray,
+        robot_row: int,
+        robot_col: int,
+        rows: np.ndarray,
+        cols: np.ndarray,
+        angles_deg: np.ndarray,
+        distances: np.ndarray,
+    ) -> None:
+        """Mark everything the scan saw through as observed.
+
+        Previously at most 240 rays were drawn one ``cv2.line`` call at a time,
+        so on a 450-return revolution about half the measured free space was
+        never marked, and the Python loop cost scaled with the scan. Here every
+        return contributes: adjacent returns on one continuous surface fill
+        the wedge between them in a single ``cv2.fillPoly`` call, and every
+        ray is drawn in a single ``cv2.polylines`` call. Wedges are not filled
+        across a depth jump or a run of missing returns, so a doorway's far
+        side is not claimed as seen through its frame.
+        """
+        count = rows.size
+        if count == 0:
+            return
+        origin = np.array([robot_col, robot_row], dtype=np.int32)
+        ends = np.column_stack((cols, rows)).astype(np.int32)
+        segments = np.stack(
+            (np.broadcast_to(origin, ends.shape), ends), axis=1
+        )
+        cv2.polylines(visible, list(segments), False, 255, 1, cv2.LINE_8)
+        if count < 2:
+            return
+        order = np.argsort(angles_deg)
+        ordered_angles = angles_deg[order]
+        ordered_ranges = distances[order]
+        ordered_ends = ends[order]
+        gap = np.diff(ordered_angles)
+        near = np.minimum(ordered_ranges[:-1], ordered_ranges[1:])
+        far = np.maximum(ordered_ranges[:-1], ordered_ranges[1:])
+        continuous = (
+            (gap <= self.FREE_WEDGE_MAX_GAP_DEG)
+            & (far <= near * self.FREE_WEDGE_MAX_RANGE_RATIO)
+        )
+        if not np.any(continuous):
+            return
+        first = ordered_ends[:-1][continuous]
+        second = ordered_ends[1:][continuous]
+        wedges = np.stack(
+            (np.broadcast_to(origin, first.shape), first, second), axis=1
+        )
+        cv2.fillPoly(visible, list(wedges), 255)
+
+    def _decay_factor(self, now: float | None) -> float:
+        """Fraction of occupancy evidence to keep since the last fade."""
+        if now is None:
+            # Direct callers without a clock (tests, tools) get one nominal
+            # revolution of fading, matching the old per-call behaviour.
+            return 0.5 ** (self.SCAN_INTEGRATION_PERIOD_S / self.MEMORY_HALF_LIFE_S)
+        previous = self._last_decay_at
+        self._last_decay_at = now
+        if previous is None:
+            return 1.0
+        elapsed = min(2.0, max(0.0, now - previous))
+        return 0.5 ** (elapsed / self.MEMORY_HALF_LIFE_S)
+
+    def _integrate_points(
+        self, points: Iterable[tuple[int, object]], now: float | None = None
+    ) -> None:
         point_list = list(points)
         scale = self.cells / self.metres
-        accumulator = (self.grid.astype(np.uint16) * 248) // 250
+        keep = self._decay_factor(now)
+        accumulator = (
+            self.grid.astype(np.float32) * keep
+        ).astype(np.uint16)
         if point_list:
             distances = np.fromiter(
                 (float(point.distance_mm) / 1000.0 for _index, point in point_list),
@@ -435,19 +544,15 @@ class LidarSlamLite:
             visible = np.zeros_like(self.observed)
             robot_col = int(np.clip(round(self.x * scale), 0, self.cells - 1))
             robot_row = int(np.clip(round(self.y * scale), 0, self.cells - 1))
-            ray_count = hit_rows.size
-            ray_stride = max(1, math.ceil(ray_count / 240))
-            for hit_row, hit_col in zip(
-                hit_rows[::ray_stride], hit_cols[::ray_stride]
-            ):
-                cv2.line(
-                    visible,
-                    (robot_col, robot_row),
-                    (int(hit_col), int(hit_row)),
-                    255,
-                    1,
-                    cv2.LINE_8,
-                )
+            self._trace_visible(
+                visible,
+                robot_row,
+                robot_col,
+                rows,
+                cols,
+                angles[valid],
+                distances,
+            )
             self.observed[visible > 0] = 255
 
             endpoint_mask = np.zeros_like(self.observed)
@@ -511,6 +616,7 @@ class LidarSlamLite:
         camera_yaw_rate_dps: float | None = None,
         camera_translation_scale: float = 1.0,
         imu_yaw_deg: float | None = None,
+        scan_stamp_hint: float | None = None,
     ) -> SlamLiteState:
         self.integrate_motion(
             left_pwm,
@@ -521,12 +627,25 @@ class LidarSlamLite:
             camera_translation_scale,
             imu_yaw_deg,
         )
-        points = self.deskew_points(points, now, imu_yaw_rate_dps)
-        bins, scan_stamp = self.bins_from_points(points)
         self._matched = False
         self._translation_matched = False
         self._translation_correction_m = 0.0
-        new_scan = scan_stamp > self._last_scan_stamp + 0.035 and now - scan_stamp <= self.MAX_SCAN_AGE_S
+        if (
+            scan_stamp_hint is not None
+            and scan_stamp_hint
+            <= self._last_scan_stamp + self.SCAN_INTEGRATION_PERIOD_S
+        ):
+            # Nothing new enough to integrate. Deskewing and binning allocate
+            # a fresh object per return, so skipping them on unchanged data is
+            # most of the per-tick cost of keeping a map at all.
+            return self.state()
+        points = self.deskew_points(points, now, imu_yaw_rate_dps)
+        bins, scan_stamp = self.bins_from_points(points)
+        new_scan = (
+            scan_stamp
+            > self._last_scan_stamp + self.SCAN_INTEGRATION_PERIOD_S
+            and now - scan_stamp <= self.MAX_SCAN_AGE_S
+        )
         if new_scan:
             correction, confidence, accepted = self._align_yaw(bins, self._yaw_since_scan)
             self._yaw_confidence = self._yaw_confidence * 0.65 + confidence * 0.35
@@ -560,7 +679,7 @@ class LidarSlamLite:
             # Integrate once per physical LD19 update, not once per control
             # loop.  This reduces Pi work and prevents a single scan from
             # becoming artificially certain just because the planner runs fast.
-            self._integrate_points(points)
+            self._integrate_points(points, now)
         return self.state()
 
     def state(self) -> SlamLiteState:

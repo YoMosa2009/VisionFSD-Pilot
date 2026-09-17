@@ -248,6 +248,56 @@ class ObstacleMemory:
         """Remembered returns as robot-frame (x, y) metres."""
         return self._x, self._y
 
+    #: Angular resolution of the see-through test.
+    CLEAR_BIN_DEG = 2.0
+    #: A remembered return is cleared when the live beam in its direction
+    #: reaches at least this much further. Covers LD19 range noise and the
+    #: deliberate MEMORY_RANGE_BIAS_M on stored returns.
+    CLEAR_MARGIN_M = 0.20
+
+    def clear_seen_through(
+        self, angles_deg: np.ndarray, ranges_m: np.ndarray
+    ) -> int:
+        """Forget remembered returns the live scan has just seen past.
+
+        This is costmap raytrace clearing. Without it, a person walking across
+        the robot's view left a trail of remembered returns behind them for
+        the full memory window - a phantom wall the planner routed around, or
+        stopped for, after the person had gone. If the LD19 now measures a
+        return further out along the same bearing, the space where the old
+        return sat is demonstrably empty.
+
+        Bearings with no live return clear nothing: missing data is not
+        evidence of free space.
+        """
+        if self._x.size == 0 or angles_deg.size == 0:
+            return 0
+        bins = int(round(360.0 / self.CLEAR_BIN_DEG))
+        usable = (ranges_m >= 0.08) & (ranges_m <= self.max_range_m + 1.0)
+        if not np.any(usable):
+            return 0
+        live_bin = (
+            (angles_deg[usable] % 360.0) / self.CLEAR_BIN_DEG
+        ).astype(np.int32) % bins
+        live = np.full(bins, np.inf, dtype=np.float32)
+        np.minimum.at(live, live_bin, ranges_m[usable].astype(np.float32))
+        remembered_range = np.hypot(self._x, self._y)
+        remembered_bin = (
+            (np.degrees(np.arctan2(self._x, self._y)) % 360.0)
+            / self.CLEAR_BIN_DEG
+        ).astype(np.int32) % bins
+        seen_past = live[remembered_bin]
+        cleared = np.isfinite(seen_past) & (
+            seen_past > remembered_range + self.CLEAR_MARGIN_M
+        )
+        removed = int(np.count_nonzero(cleared))
+        if removed:
+            keep = ~cleared
+            self._x = self._x[keep]
+            self._y = self._y[keep]
+            self._stamp = self._stamp[keep]
+        return removed
+
     def polar(self) -> tuple[np.ndarray, np.ndarray]:
         """Remembered returns as (angles_deg, ranges_m)."""
         if self._x.size == 0:
@@ -439,6 +489,64 @@ class ArcBank:
         )
 
 
+def route_progress(
+    route_x: np.ndarray,
+    route_y: np.ndarray,
+    end_x: np.ndarray,
+    end_y: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Distance made good along a route, and distance off it, per endpoint.
+
+    This is the substance of Nav2 DWB's PathDist and PathAlign critics: score a
+    candidate by where its end lands relative to the global route, rather than
+    by how far it gets along the robot's current heading.
+
+    Heading-based progress is what fails at a turn. With the route bending
+    left a metre ahead, driving straight on makes excellent "forward progress"
+    and lands well off the route; the arc that starts turning early makes less
+    forward progress and lands on it. Measured along the route, the second arc
+    is correctly the better one - which is the whole difference between
+    reacting to the next waypoint and following the plan through a multi-turn
+    space.
+    """
+    count = route_x.size
+    if count < 2 or end_x.size == 0:
+        return (
+            np.zeros(end_x.size, dtype=np.float32),
+            np.zeros(end_x.size, dtype=np.float32),
+        )
+    ax = route_x[:-1]
+    ay = route_y[:-1]
+    sx = route_x[1:] - ax
+    sy = route_y[1:] - ay
+    length_sq = np.maximum(sx * sx + sy * sy, 1e-9)
+    length = np.sqrt(length_sq)
+    cumulative = np.concatenate(([0.0], np.cumsum(length)))
+
+    def project(px: np.ndarray, py: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        t = np.clip(
+            ((px[:, None] - ax) * sx + (py[:, None] - ay) * sy) / length_sq,
+            0.0,
+            1.0,
+        )
+        dx = px[:, None] - (ax + t * sx)
+        dy = py[:, None] - (ay + t * sy)
+        distance_sq = dx * dx + dy * dy
+        nearest = np.argmin(distance_sq, axis=1)
+        rows = np.arange(px.size)
+        along = cumulative[nearest] + t[rows, nearest] * length[nearest]
+        return along, np.sqrt(distance_sq[rows, nearest])
+
+    origin_along, _origin_cross = project(
+        np.zeros(1, dtype=np.float32), np.zeros(1, dtype=np.float32)
+    )
+    along, cross = project(end_x, end_y)
+    return (
+        (along - origin_along[0]).astype(np.float32),
+        cross.astype(np.float32),
+    )
+
+
 def evaluate_arcs(
     obstacle_x: np.ndarray,
     obstacle_y: np.ndarray,
@@ -447,6 +555,7 @@ def evaluate_arcs(
     current_steering_deg: float,
     reduce: bool = True,
     direction_lock: int = 0,
+    route_xy: np.ndarray | None = None,
 ) -> ArcChoice:
     """Pick the best admissible (speed, steering) arc from a prebuilt bank.
 
@@ -514,9 +623,18 @@ def evaluate_arcs(
     # open floor and driving through a gap.
     last_usable = np.where(any_blocked, first_blocked - 1, bank.steps - 1)
     rows = np.arange(len(bank.candidates))
+    usable_index = np.maximum(last_usable, 0)
     progress = np.where(
-        last_usable >= 0, bank.arc_y[rows, np.maximum(last_usable, 0)], 0.0
+        last_usable >= 0, bank.arc_y[rows, usable_index], 0.0
     )
+    following_route = route_xy is not None and len(route_xy) >= 2
+    if following_route:
+        route_along, route_cross = route_progress(
+            route_xy[:, 0].astype(np.float32),
+            route_xy[:, 1].astype(np.float32),
+            np.where(last_usable >= 0, bank.arc_x[rows, usable_index], 0.0),
+            np.where(last_usable >= 0, bank.arc_y[rows, usable_index], 0.0),
+        )
 
     best_score = -np.inf
     for index, (steering_deg, pwm, speed_mps) in enumerate(bank.candidates):
@@ -559,7 +677,18 @@ def evaluate_arcs(
         # every cycle and two near-tied arcs alternate.
         smoothness = -abs(steering_deg - current_steering_deg) / 90.0 * 1.05
         straightness = -abs(steering_deg) / 90.0 * 0.30
-        room = min(float(progress[index]), 2.0) * 0.80
+        if following_route:
+            # Guided by the route: reward distance made good along it and
+            # penalise ending up off it. Straight-ahead progress is kept only
+            # as a small tie-breaker, and the single-heading goal term is
+            # dropped - the route already says where to go, turn by turn.
+            room = min(float(progress[index]), 2.0) * 0.30
+            goal_term = (
+                float(np.clip(route_along[index], -0.5, 2.5)) * 1.40
+                - min(float(route_cross[index]), 1.5) * 1.10
+            )
+        else:
+            room = min(float(progress[index]), 2.0) * 0.80
         margin_term = min(max(clearance_m, 0.0), 0.60) * 0.55
         score = (
             room

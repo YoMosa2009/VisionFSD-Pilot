@@ -373,29 +373,29 @@ class OperatorControlPolicyTests(unittest.TestCase):
         self.assertEqual(policy.stuck_phase, "IDLE")
         self.assertEqual((policy.left_pwm, policy.right_pwm), (0, 0))
 
+    def _hold(self, policy, control, command, clearance_for, ticks=20, magnitude=1.0):
+        """Hold a button the way the page does: refresh it every tick."""
+        for index in range(ticks):
+            control.drive(command, magnitude)
+            tick = time.monotonic()
+            policy.decide(clearance_for(tick), _status(tick), False, tick)
+            time.sleep(0.002)
+
     def test_manual_reverse_is_applied(self) -> None:
         policy, control = self._policy()
-        now = time.monotonic()
         control.set_manual(True)
-        control.drive("B")
 
-        for index in range(20):
-            tick = now + index * 0.03
-            policy.decide(self._clear(tick), _status(tick), False, tick)
+        self._hold(policy, control, "B", self._clear)
 
-        self.assertEqual(policy.reason, "MANUAL:B")
+        self.assertTrue(policy.reason.startswith("MANUAL:B"))
         self.assertLess(policy.left_pwm, 0)
         self.assertLess(policy.right_pwm, 0)
 
     def test_manual_pivots_counter_rotate(self) -> None:
         policy, control = self._policy()
-        now = time.monotonic()
         control.set_manual(True)
-        control.drive("R")
 
-        for index in range(20):
-            tick = now + index * 0.03
-            policy.decide(self._clear(tick), _status(tick), False, tick)
+        self._hold(policy, control, "R", self._clear)
 
         self.assertGreater(policy.left_pwm, 0)
         self.assertLess(policy.right_pwm, 0)
@@ -419,18 +419,16 @@ class OperatorControlPolicyTests(unittest.TestCase):
 
     def test_manual_reverse_is_allowed_against_a_close_front_obstacle(self) -> None:
         policy, control = self._policy()
-        now = time.monotonic()
         control.set_manual(True)
-        control.drive("B")
-        blocked = SectorClearance(
-            0.20, 2.0, 2.0, True, 2.0, 2.0, rear_m=2.0, scan_at=now
-        )
 
-        for index in range(20):
-            tick = now + index * 0.03
-            policy.decide(blocked, _status(tick), False, tick)
+        def blocked(tick):
+            return SectorClearance(
+                0.20, 2.0, 2.0, True, 2.0, 2.0, rear_m=2.0, scan_at=tick
+            )
 
-        self.assertEqual(policy.reason, "MANUAL:B")
+        self._hold(policy, control, "B", blocked)
+
+        self.assertTrue(policy.reason.startswith("MANUAL:B"))
         self.assertLess(policy.left_pwm, 0)
 
     def test_manual_forward_is_refused_on_the_ultrasonic_alone(self) -> None:
@@ -447,15 +445,11 @@ class OperatorControlPolicyTests(unittest.TestCase):
 
     def test_an_expired_manual_command_stops_the_robot(self) -> None:
         policy, control = self._policy()
-        now = time.monotonic()
         control.set_manual(True)
-        control.drive("B")
-        for index in range(20):
-            tick = now + index * 0.03
-            policy.decide(self._clear(tick), _status(tick), False, tick)
+        self._hold(policy, control, "B", self._clear)
         self.assertLess(policy.left_pwm, 0)
 
-        stale = now + RobotControl.COMMAND_TTL_S + 1.0
+        stale = time.monotonic() + RobotControl.COMMAND_TTL_S + 1.0
         for index in range(40):
             tick = stale + index * 0.03
             policy.decide(self._clear(tick), _status(tick), False, tick)
@@ -562,6 +556,58 @@ class DirectionLockTests(unittest.TestCase):
         left_only = find_gap(x, y, limits, direction_lock=-1)
         self.assertGreater(right_only.bearing_deg, 0.0)
         self.assertLess(left_only.bearing_deg, 0.0)
+
+
+class ProportionalManualTests(unittest.TestCase):
+    """A turn should follow how long the button is held, not jump a fixed
+    amount per press."""
+
+    def test_magnitude_scales_forward_speed(self) -> None:
+        from robot_autonomy import manual_wheels
+
+        gentle = manual_wheels("F", 0.0, 112)
+        strong = manual_wheels("F", 1.0, 112)
+        self.assertEqual(gentle, (MIN_MOVE_PWM, MIN_MOVE_PWM))
+        self.assertEqual(strong, (112, 112))
+
+    def test_magnitude_scales_pivot_rate(self) -> None:
+        from robot_autonomy import MANUAL_PIVOT_MAX_PWM, manual_wheels
+
+        gentle = manual_wheels("L", 0.0, 112)
+        strong = manual_wheels("L", 1.0, 112)
+        self.assertEqual(gentle, (-MIN_MOVE_PWM, MIN_MOVE_PWM))
+        self.assertEqual(strong, (-MANUAL_PIVOT_MAX_PWM, MANUAL_PIVOT_MAX_PWM))
+        self.assertLess(abs(gentle[0]), abs(strong[0]))
+
+    def test_output_never_drops_below_the_movement_floor(self) -> None:
+        """Below the floor a loaded wheel only buzzes, so a light input is a
+        short press at the floor, never a weaker one."""
+        from robot_autonomy import manual_wheels
+
+        for command in ("F", "B", "L", "R"):
+            for magnitude in (0.0, 0.2, 0.7, 1.0):
+                left, right = manual_wheels(command, magnitude, 112)
+                self.assertGreaterEqual(abs(left), MIN_MOVE_PWM)
+                self.assertGreaterEqual(abs(right), MIN_MOVE_PWM)
+
+    def test_stop_and_unknown_commands_are_zero(self) -> None:
+        from robot_autonomy import manual_wheels
+
+        self.assertEqual(manual_wheels("STOP", 1.0, 112), (0, 0))
+        self.assertEqual(manual_wheels("?", 1.0, 112), (0, 0))
+
+    def test_magnitude_is_clamped(self) -> None:
+        control = RobotControl()
+        control.set_manual(True)
+        control.drive("F", 7.0)
+        self.assertEqual(control.manual_input()[1], 1.0)
+        control.drive("F", float("nan"))
+        self.assertEqual(control.manual_input()[1], 0.0)
+
+    def test_expiry_is_short_enough_to_feel_immediate(self) -> None:
+        """A lost connection or a missed release must stop the robot within a
+        few held-button refreshes, not after it has turned a large angle."""
+        self.assertLessEqual(RobotControl.COMMAND_TTL_S, 0.4)
 
 
 if __name__ == "__main__":

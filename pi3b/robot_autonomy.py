@@ -29,11 +29,12 @@ import numpy as np
 import serial
 from serial.tools import list_ports
 
-from lidar_visualizer import LD19Parser, LivePolarMap
+from lidar_visualizer import LD19_MAX_RANGE_MM, LD19Parser, LivePolarMap
 from robot_camera_motion import CameraMotionState, estimate_motion
-from robot_explorer import ExplorationState, FrontierExplorer
+from robot_explorer import AsyncExplorer, ExplorationState, FrontierExplorer
 from robot_imu import AsyncIMULink, IMUState, LSM6DS3MCP2221Link
 from robot_local_planner import (
+    reduce_obstacles,
     ArcChoice,
     Footprint,
     GapChoice,
@@ -43,14 +44,21 @@ from robot_local_planner import (
     evaluate_arcs,
     find_gap,
 )
+from robot_scan import EMPTY_FRAME, ScanFrame, frame_from_points
+from robot_tracking import (
+    to_robot_frame,
+    MovingObjectTracker,
+    TrackedObject,
+    closest_approach,
+    predicted_obstacles,
+)
 from robot_motion import (
     ScanMotionResult,
     ScanMotionTracker,
-    scan_arrays,
     signature_from_arrays,
 )
 from robot_slam_lite import LidarSlamLite, SlamLiteState
-from robot_web import RobotControl, start_dashboard_server
+from robot_web import RobotControl, TelemetryHub, start_dashboard_server
 from visionfsd_pi import (
     LatestCamera,
 )
@@ -203,6 +211,18 @@ GAP_ALIGNED_DEG = 14.0
 # pivot it just performed is wasted - which from outside looks like turning
 # at random and never going anywhere.
 GAP_FOLLOW_S = 2.20
+# Yielding to a moving object on a collision course. The robot holds still
+# while something is about to cross its path, but never for longer than
+# YIELD_MAX_S at a stretch: a person standing still in a doorway must not park
+# the robot indefinitely, and after the hold the arc planner routes around the
+# object's predicted positions instead.
+YIELD_HORIZON_S = 1.6
+# Beyond footprint and object radius. At 0.30 a person crossing about a hand's
+# width in front of the bumper causes a yield; much less and the robot would
+# carry on into a near miss it could have avoided by pausing.
+YIELD_CLEARANCE_M = 0.30
+YIELD_MAX_S = 2.0
+YIELD_COOLDOWN_S = 2.5
 # Rate limits are expressed per second, not per control tick.
 #
 # Per-tick limits silently couple responsiveness to loop rate: a tick spent
@@ -306,6 +326,12 @@ FRONT_OVERHANG_M = ROBOT_LENGTH_M / 2.0
 # fits through.
 ROBOT_FOOTPRINT = Footprint.from_rectangle(ROBOT_WIDTH_M, ROBOT_LENGTH_M)
 _MANUAL_PIVOT_PWM = min(MAX_PWM, MIN_MOVE_PWM + ESCAPE_PIVOT_BOOST_PWM)
+# The top of the manual range for pivots. A held turn builds from the floor up
+# to this, so turning is proportional to how long the button is held instead of
+# a fixed-rate spin.
+MANUAL_PIVOT_MAX_PWM = min(MAX_PWM, MIN_MOVE_PWM + 40)
+# Wheel commands at the *bottom* of the manual range, i.e. a light tap. The
+# held magnitude scales from here; see manual_wheels().
 MANUAL_DRIVE = {
     "F": (MIN_MOVE_PWM, MIN_MOVE_PWM),
     "B": (-MIN_MOVE_PWM, -MIN_MOVE_PWM),
@@ -798,6 +824,14 @@ class LD19Link:
         self._scan_history_s = LD19_MAX_SCAN_HISTORY_S
         self._clearance_stamp = -1.0
         self._clearance_cache: SectorClearance | None = None
+        # Incremented under the lock every time new packets land. Consumers
+        # key their caches on it so an unchanged scan window is never
+        # re-processed on a control tick.
+        self._seq = 0
+        self._snapshot_seq = -1
+        self._snapshot_points: list[tuple[int, object]] = []
+        self._frame_seq = -1
+        self._frame: ScanFrame = EMPTY_FRAME
         self._thread = threading.Thread(target=self._read_loop, name="ld19-reader", daemon=True)
         self._thread.start()
 
@@ -820,8 +854,17 @@ class LD19Link:
                 for point in points
             ]
             with self._lock:
-                self._map.update(rotated, min_confidence=8, min_range_mm=80, max_range_mm=6000)
+                # The LD19 is rated to 12 m. The previous 6 m cap threw away
+                # half of every revolution in a larger room - including the
+                # far walls exploration needs to see to plan past this one.
+                self._map.update(
+                    rotated,
+                    min_confidence=8,
+                    min_range_mm=80,
+                    max_range_mm=LD19_MAX_RANGE_MM,
+                )
                 self._last_packet_at = now
+                self._seq += 1
                 if self._parser.speed_dps > 0:
                     revolution_s = 360.0 / self._parser.speed_dps
                     self._scan_history_s = float(np.clip(
@@ -833,15 +876,36 @@ class LD19Link:
     def snapshot(self) -> tuple[list[tuple[int, object]], bool]:
         now = time.monotonic()
         with self._lock:
-            # Keep no more than a current, measured-speed scan history. Longer
-            # history makes the dashboard and controller react to where an
-            # obstacle was, rather than where it is now.
-            points = self._map.fresh(now, self._scan_history_s)
+            # Rebuild the point list only when packets have arrived since the
+            # last call. It used to be rebuilt on every call - several times
+            # per control tick - by walking all 720 angular bins in Python.
+            if self._seq != self._snapshot_seq:
+                # Keep no more than a current, measured-speed scan history.
+                # Longer history makes the dashboard and controller react to
+                # where an obstacle was, rather than where it is now.
+                self._snapshot_points = self._map.fresh(now, self._scan_history_s)
+                self._snapshot_seq = self._seq
+            points = self._snapshot_points
             fresh = (
                 bool(points)
                 and now - self._last_packet_at <= LD19_PACKET_STALE_S
             )
         return points, fresh
+
+    def scan_frame(self) -> ScanFrame:
+        """The current scan window as arrays, filtered for mixed pixels."""
+        points, _fresh = self.snapshot()
+        with self._lock:
+            seq = self._snapshot_seq
+            speed = float(self._parser.speed_dps)
+            if seq == self._frame_seq:
+                return self._frame
+        frame = frame_from_points(points, seq, speed)
+        with self._lock:
+            if seq >= self._frame_seq:
+                self._frame = frame
+                self._frame_seq = seq
+            return self._frame
 
     def clearance(self) -> SectorClearance:
         points, fresh = self.snapshot()
@@ -1124,6 +1188,12 @@ class AutonomousPolicy:
         self._brake_until = 0.0
         self._next_arc_search_at = 0.0
         self._imu_yaw_reference_deg: float | None = None
+        self.pose_x_m: float | None = None
+        self.pose_y_m: float | None = None
+        self.route_guided = False
+        self.movers: tuple[TrackedObject, ...] = ()
+        self._yield_started_at: float | None = None
+        self._yield_cooldown_until = 0.0
         self.gap = GapChoice()
         self.watchdog = ProgressWatchdog()
         self._gap_aligned = False
@@ -1229,6 +1299,9 @@ class AutonomousPolicy:
         """
         self._track_local_motion(now)
         if scan_at is not None:
+            # Clear first: a fresh revolution that sees past a remembered
+            # return proves that space is empty now.
+            self.local_planner.memory.clear_seen_through(angles_deg, ranges_m)
             self.local_planner.memory.add_scan(angles_deg, ranges_m, scan_at)
         live_x = np.zeros(0, dtype=np.float32)
         live_y = np.zeros(0, dtype=np.float32)
@@ -1299,6 +1372,48 @@ class AutonomousPolicy:
                 f"count={self.watchdog.oscillations}"
             )
 
+    def observe_movers(self, objects: tuple[TrackedObject, ...]) -> None:
+        """Accept the latest moving-object tracks from the LD19 tracker."""
+        self.movers = objects
+
+    def _yield_to_movers(self, now: float) -> str | None:
+        """Hold still briefly while a moving object is about to cross."""
+        if now < self._yield_cooldown_until:
+            return None
+        speed = max(
+            self.local_planner.commanded_speed_mps(self.left_pwm, self.right_pwm),
+            self.local_planner.commanded_speed_mps(self.min_move_pwm, self.min_move_pwm),
+        )
+        threat = None
+        for item in self.movers:
+            if not item.moving or item.robot_y_m < -0.3:
+                continue
+            seconds, distance = closest_approach(item, speed)
+            limit = (
+                self.local_planner.limits.footprint.radius_m
+                + item.radius_m
+                + YIELD_CLEARANCE_M
+            )
+            if 0.0 < seconds <= YIELD_HORIZON_S and distance <= limit:
+                if threat is None or seconds < threat[0]:
+                    threat = (seconds, item)
+        if threat is None:
+            self._yield_started_at = None
+            return None
+        if self._yield_started_at is None:
+            self._yield_started_at = now
+        if now - self._yield_started_at > YIELD_MAX_S:
+            # Held long enough. Let the arc planner route around the object's
+            # predicted positions rather than waiting on it indefinitely.
+            self._yield_started_at = None
+            self._yield_cooldown_until = now + YIELD_COOLDOWN_S
+            return None
+        seconds, item = threat
+        self.drive_confidence = 0.0
+        return self._hold_stop(
+            f"STOP:YIELD_MOVING_OBJECT {item.speed_mps:.1f}m/s in {seconds:.1f}s"
+        )
+
     def observe_scan_motion(self, result: ScanMotionResult, now: float) -> None:
         """Accept whole-scan motion evidence from the LD19 signature tracker."""
         if result.verdict != "UNKNOWN":
@@ -1324,6 +1439,44 @@ class AutonomousPolicy:
             state.heading_deg if state.map_updates >= 2 else None
         )
         self.pose_yaw_source = state.yaw_source
+        self.pose_x_m = state.x_m
+        self.pose_y_m = state.y_m
+
+    #: Route ahead handed to the arc planner, measured along the route.
+    ROUTE_GUIDANCE_M = 3.5
+
+    def _route_robot_frame(self) -> np.ndarray | None:
+        """The planned route ahead, in the robot frame, for the arc planner.
+
+        Map coordinates put +y down the grid with heading clockwise from up; the
+        robot frame is +x right, +y ahead. The route is cut to start at the
+        segment the robot is on and to extend only as far as the arc planner
+        can use, so a long plan does not dilute the part that matters now.
+        """
+        path = self.exploration.path_xy_m
+        if (
+            not self.exploration.active
+            or len(path) < 2
+            or self.pose_heading_deg is None
+            or self.pose_x_m is None
+        ):
+            return None
+        points = np.asarray(path, dtype=np.float32)
+        dx = points[:, 0] - self.pose_x_m
+        dy = points[:, 1] - self.pose_y_m
+        heading = math.radians(self.pose_heading_deg)
+        cos_h = math.cos(heading)
+        sin_h = math.sin(heading)
+        route = np.column_stack((dx * cos_h + dy * sin_h, dx * sin_h - dy * cos_h))
+        nearest = int(np.argmin(np.einsum("ij,ij->i", route, route)))
+        route = route[max(0, nearest - 1):]
+        if len(route) < 2:
+            return None
+        steps = np.hypot(np.diff(route[:, 0]), np.diff(route[:, 1]))
+        within = np.concatenate(([0.0], np.cumsum(steps))) <= self.ROUTE_GUIDANCE_M
+        within[: min(2, len(within))] = True
+        route = route[within]
+        return route if len(route) >= 2 else None
 
     def _turn_reference_yaw_deg(self) -> tuple[float | None, str]:
         if self.imu_yaw_deg is not None:
@@ -1429,8 +1582,10 @@ class AutonomousPolicy:
             return self._hold_stop(self.reason)
         if not control.manual:
             return None
-        command = control.manual_command(now)
-        left, right = MANUAL_DRIVE.get(command, (0, 0))
+        command, magnitude = control.manual_input(now)
+        left, right = manual_wheels(
+            command, magnitude, self.speed, self.min_move_pwm
+        )
         forward = left > 0 and right > 0
         if forward:
             straight = lidar.limit_at(0.0)
@@ -1444,7 +1599,9 @@ class AutonomousPolicy:
                 self.reason = "STOP:MANUAL_FORWARD_BLOCKED"
                 self.drive_confidence = 0.0
                 return self._set_output("STOP", 0, 0)
-        self.reason = f"MANUAL:{command}"
+        self.reason = (
+            f"MANUAL:{command}" if command == "STOP" else f"MANUAL:{command} {magnitude:.0%}"
+        )
         self.drive_confidence = 0.0
         self._arc_active = False
         return self._set_output(command if command != "STOP" else "STOP",
@@ -1955,6 +2112,11 @@ class AutonomousPolicy:
             goal_heading = float(np.clip(
                 self._committed_bearing_deg, -60.0, 60.0
             ))
+        following_gap = (
+            now < self._gap_follow_until and self._committed_bearing_deg is not None
+        )
+        route = None if following_gap else self._route_robot_frame()
+        self.route_guided = route is not None
         if now >= self._next_arc_search_at:
             # The control loop runs faster than the LD19 produces new
             # revolutions, so re-running the full arc search every tick spends
@@ -1962,9 +2124,16 @@ class AutonomousPolicy:
             # the scan rate keeps the choice no staler than the measurement it
             # came from, and the steering ramp smooths the gaps.
             self._next_arc_search_at = now + ARC_REPLAN_PERIOD_S
+            predicted_x, predicted_y = predicted_obstacles(self.movers)
+            obstacle_x = self._obstacle_x
+            obstacle_y = self._obstacle_y
+            if predicted_x.size:
+                # Where moving objects will be, not just where they are.
+                obstacle_x = np.concatenate((obstacle_x, predicted_x))
+                obstacle_y = np.concatenate((obstacle_y, predicted_y))
             self.arc = evaluate_arcs(
-                self._obstacle_x,
-                self._obstacle_y,
+                obstacle_x,
+                obstacle_y,
                 self.local_planner.bank(
                     ARC_STEER_OPTIONS, self._speed_options()
                 ),
@@ -1976,6 +2145,7 @@ class AutonomousPolicy:
                 # feeding the very oscillation it was meant to damp.
                 self.arc.steering_deg if self.arc.admissible else self._steering_deg,
                 direction_lock=self.watchdog.locked_sign,
+                route_xy=route,
             )
             self.local_planner.last_choice = self.arc
         choice = self.arc
@@ -2300,6 +2470,25 @@ class AutonomousPolicy:
     def _update_intent(self) -> None:
         head = self.reason.split(":", 1)[0].split("_", 1)[0].split(" ", 1)[0]
         self.intent = self.INTENT_LABELS.get(head, head)
+        if self.reason.startswith("MANUAL:"):
+            self.intent = "MANUAL"
+            self.intent_detail = "driven from the dashboard"
+            return
+        if self.reason.startswith("STOP:HALTED_BY_OPERATOR"):
+            self.intent = "HOLDING"
+            self.intent_detail = "stopped from the dashboard"
+            return
+        if self.reason.startswith("STOP:YIELD_MOVING_OBJECT"):
+            self.intent = "YIELDING"
+            self.intent_detail = "letting a moving object pass"
+            return
+        if self.reason.startswith("GAP_SEEK"):
+            self.intent = "TURNING TO OPENING"
+            self.intent_detail = (
+                f"committed to a {self.gap.width_deg:.0f} deg opening "
+                f"at {self.gap.bearing_deg:+.0f} deg"
+            )
+            return
         if self.reason.startswith("STOP:DISPLACED"):
             self.intent = "REORIENTING"
             self.intent_detail = "picked up or shoved; rebuilding the map here"
@@ -2372,6 +2561,9 @@ class AutonomousPolicy:
         brake_command = self._emergency_brake(arduino, straight_clearance, now)
         if brake_command is not None:
             return brake_command
+        yield_command = self._yield_to_movers(now)
+        if yield_command is not None:
+            return yield_command
         # A measured opening outranks the escape state machine.
         #
         # Escape is a blind reactive loop: it picks a side from fixed sector
@@ -2714,6 +2906,8 @@ class AutonomousPolicy:
         self._gap_commit_until = 0.0
         self._gap_follow_until = 0.0
         self.watchdog.reset()
+        self.movers = ()
+        self._yield_started_at = None
         self._scan_motion = replace(self._scan_motion, displaced=False)
         self._heading_index = None
         self._steering_deg = 0.0
@@ -3012,6 +3206,9 @@ def format_imu_calibration_diagnostic(imu: IMUState) -> str:
 
 
 _INTENT_COLOR = {
+    "MANUAL": (255, 212, 95),
+    "YIELDING": (61, 138, 255),
+    "TURNING TO OPENING": (154, 227, 87),
     "DRIVING": (110, 240, 150),
     "CRUISING": (110, 240, 150),
     "EXPLORING": (225, 190, 235),
@@ -3150,6 +3347,182 @@ def draw_dashboard(local_map: np.ndarray, policy: AutonomousPolicy,
     return panel
 
 
+def manual_wheels(
+    command: str, magnitude: float, cruise_pwm: int, min_move_pwm: int = MIN_MOVE_PWM
+) -> tuple[int, int]:
+    """Wheel PWM for a manual command held at a 0..1 magnitude.
+
+    PWM cannot go below the movement floor without the wheels simply
+    buzzing, so a gentle input is expressed as a short, low-level drive and a
+    strong one as a higher level - with the press duration, not the level,
+    doing most of the fine control. A tap therefore nudges; a long hold turns
+    or drives steadily faster up to the cap.
+    """
+    magnitude = min(1.0, max(0.0, float(magnitude)))
+    if command in ("F", "B"):
+        top = max(min_move_pwm, cruise_pwm)
+        level = int(round(min_move_pwm + magnitude * (top - min_move_pwm)))
+        return (level, level) if command == "F" else (-level, -level)
+    if command in ("L", "R"):
+        top = max(min_move_pwm, MANUAL_PIVOT_MAX_PWM)
+        level = int(round(min_move_pwm + magnitude * (top - min_move_pwm)))
+        return (-level, level) if command == "L" else (level, -level)
+    return 0, 0
+
+
+def _cm(values: np.ndarray) -> list[int]:
+    return np.rint(np.asarray(values, dtype=np.float32) * 100.0).astype(np.int32).tolist()
+
+
+def build_telemetry(
+    policy: "AutonomousPolicy",
+    scan: ScanFrame,
+    exploration: ExplorationState,
+    slam: SlamLiteState,
+    imu: IMUState,
+    status: ArduinoStatus,
+    clearance: SectorClearance,
+    camera_ready: bool,
+    differential_ready: bool,
+    local_map: LidarSlamLite,
+    now: float,
+    include_full: bool,
+) -> tuple[dict, dict | None]:
+    """Telemetry for the phone dashboard, as (light, full).
+
+    Light carries what an on-screen status needs. Full adds everything the
+    LiDAR visualiser draws: every LD19 return (with the mixed-pixel verdict so
+    the page can show what the filter removed), the obstacle memory, the arc,
+    the route, the goal and the tracked objects. Everything spatial is in the
+    robot frame in whole centimetres, which keeps a full message to a few
+    kilobytes.
+    """
+    if not imu.connected:
+        imu_state = "OFF"
+    elif not imu.calibrated:
+        imu_state = "CAL"
+    elif not imu.fresh:
+        imu_state = "STALE"
+    else:
+        imu_state = "LIVE"
+    arc = policy.arc
+    light = {
+        "v": RUNTIME_VERSION,
+        "intent": policy.intent,
+        "detail": policy.intent_detail,
+        "reason": policy.reason,
+        "pose": {
+            "x": round(slam.x_m, 3),
+            "y": round(slam.y_m, 3),
+            "h": round(slam.heading_deg, 1),
+        },
+        "drive": {
+            "cmd": [policy.left_pwm, policy.right_pwm],
+            "act": [status.left_pwm, status.right_pwm],
+            "steer": round(arc.steering_deg, 1),
+            "pwm": arc.pwm,
+            "arc_ok": bool(arc.admissible),
+        },
+        "health": {
+            "lidar": bool(clearance.fresh),
+            "camera": bool(camera_ready),
+            "imu": imu_state,
+            "uno": bool(differential_ready and now - status.received_at <= 1.5),
+            "lock": policy.watchdog.locked_sign,
+            "stuck": policy.stuck_phase,
+            "route": policy.route_guided,
+        },
+        "explore": {
+            "mode": exploration.mode,
+            "target_m": round(exploration.target_distance_m, 2) if exploration.active else 0.0,
+            "goal_age": round(exploration.goal_age_s, 1),
+            "progress": round(exploration.goal_progress_m, 2),
+            "route_m": round(exploration.route_length_m, 2),
+            "frontiers": exploration.frontier_count,
+            "coverage": round(exploration.coverage_ratio, 3),
+            "blacklisted": exploration.blacklisted,
+            "plan_ms": round(exploration.planning_ms, 1),
+        },
+        "control": None if policy.control is None else policy.control.state(),
+    }
+    if not include_full:
+        return light, None
+    full = dict(light)
+    if scan.size:
+        radians = np.radians(scan.angles_deg)
+        full["scan"] = {
+            "x": _cm(np.sin(radians) * scan.ranges_m),
+            "y": _cm(np.cos(radians) * scan.ranges_m),
+            "i": np.clip(scan.intensity, 0, 255).astype(np.int32).tolist(),
+            "k": scan.keep.astype(np.int8).tolist(),
+        }
+    memory_x, memory_y = policy.local_planner.memory.cartesian()
+    if memory_x.size:
+        reduced_x, reduced_y = reduce_obstacles(memory_x, memory_y, bins=240, max_range_m=4.0)
+        full["mem"] = {"x": _cm(reduced_x), "y": _cm(reduced_y)}
+    if arc.admissible and arc.path_xy:
+        full["arc"] = {
+            "p": [[int(round(x * 100)), int(round(y * 100))] for x, y in arc.path_xy],
+            "ok": True,
+            "gap": round(arc.clearance_m, 2),
+        }
+    route = policy._route_robot_frame()
+    if route is not None:
+        full["route"] = np.rint(route * 100.0).astype(np.int32).tolist()
+    if exploration.active and exploration.target_x_m is not None and policy.pose_heading_deg is not None:
+        tx, ty = to_robot_frame(
+            exploration.target_x_m - slam.x_m,
+            exploration.target_y_m - slam.y_m,
+            slam.heading_deg,
+        )
+        full["target"] = [int(round(tx * 100)), int(round(ty * 100))]
+    full["gap"] = {
+        "active": policy.reason.startswith("GAP_SEEK"),
+        "b": round(policy.gap.bearing_deg, 1),
+        "w": round(policy.gap.width_deg, 1),
+        "d": round(policy.gap.clearance_m, 2),
+    }
+    full["movers"] = [
+        {
+            "id": item.track_id,
+            "x": int(round(item.robot_x_m * 100)),
+            "y": int(round(item.robot_y_m * 100)),
+            "vx": int(round(item.robot_vx_mps * 100)),
+            "vy": int(round(item.robot_vy_mps * 100)),
+            "r": int(round(item.radius_m * 100)),
+            "m": bool(item.moving),
+        }
+        for item in policy.movers
+        if math.hypot(item.robot_x_m, item.robot_y_m) <= 6.0
+    ]
+    full["foot"] = {
+        "w": round(ROBOT_WIDTH_M * 100, 1),
+        "l": round(ROBOT_LENGTH_M * 100, 1),
+    }
+    full["map"] = {"metres": local_map.metres, "cells": local_map.cells}
+    return light, full
+
+
+def encode_map_png(local_map: LidarSlamLite) -> bytes | None:
+    """The occupancy map as a small greyscale PNG for the phone view.
+
+    Levels: 0 unknown, 60 seen and free, 90-255 occupied by evidence. The
+    phone colours it; the robot only has to downsample and compress, once a
+    second and only while someone is looking.
+    """
+    image = np.zeros(local_map.grid.shape, dtype=np.uint8)
+    seen = local_map.observed > 0
+    image[seen] = 60
+    occupied = local_map.grid >= 28
+    image[occupied] = (
+        90 + np.minimum(165, local_map.grid[occupied].astype(np.int32))
+    ).astype(np.uint8)
+    size = local_map.cells // 2
+    small = cv2.resize(image, (size, size), interpolation=cv2.INTER_NEAREST)
+    ok, buffer = cv2.imencode(".png", small, [int(cv2.IMWRITE_PNG_COMPRESSION), 3])
+    return buffer.tobytes() if ok else None
+
+
 def display_available() -> bool:
     """True when a desktop session exists to host the OpenCV window.
 
@@ -3211,6 +3584,9 @@ def parse_args() -> argparse.Namespace:
                         help="Dashboard stream JPEG quality, 30..95")
     parser.add_argument("--no-web", action="store_true",
                         help="Disable the view-only dashboard stream")
+    parser.add_argument("--camera-stream-fps", type=float, default=10.0,
+                        help="Frame rate of the phone dashboard's camera tab. "
+                             "Frames are only compressed while the tab is open.")
     parser.add_argument("--chassis-top-speed-mps", type=float,
                         default=DEFAULT_TOP_SPEED_MPS,
                         help="Estimated ground speed at full PWM. Used by the "
@@ -3259,8 +3635,10 @@ def main() -> int:
     # The map supplies a long-horizon exploration heading.  Current LD19
     # geometry remains the authority that decides whether motion is safe.
     local_map = LidarSlamLite()
-    explorer = FrontierExplorer()
+    # Global planning runs on its own thread; see AsyncExplorer.
+    explorer = AsyncExplorer(FrontierExplorer())
     scan_motion = ScanMotionTracker()
+    mover_tracker = MovingObjectTracker()
     slam_lite = local_map.state()
     exploration = ExplorationState()
     imu_state = IMUState(error="disabled") if imu is None else imu.state()
@@ -3279,6 +3657,7 @@ def main() -> int:
     imu_calibration_complete = False
     next_imu_calibration_diagnostic_at = 0.0
     last_displacement_count = policy.displacement_count
+    planner_resync = False
     keep_running = True
     # A desktop session is no longer required. Without one the runtime keeps
     # driving and keeps streaming; only the local window is skipped.
@@ -3289,6 +3668,7 @@ def main() -> int:
     dashboard_server = None
     robot_control = RobotControl()
     policy.control = robot_control
+    telemetry_hub = TelemetryHub()
     if not args.no_web:
         started = start_dashboard_server(
             port=args.web_port,
@@ -3296,6 +3676,8 @@ def main() -> int:
             quality=args.web_quality,
             version=RUNTIME_VERSION,
             control=robot_control,
+            camera_fps=args.camera_stream_fps,
+            telemetry=telemetry_hub,
         )
         if started is None:
             print(
@@ -3311,6 +3693,9 @@ def main() -> int:
                 "port can drive the robot."
             )
     next_web_render_at = 0.0
+    next_telemetry_publish_at = 0.0
+    next_map_publish_at = 0.0
+    next_camera_publish_at = 0.0
 
     def stop(_signum: int, _frame: object) -> None:
         nonlocal keep_running
@@ -3372,6 +3757,9 @@ def main() -> int:
             status = arduino.status()
             camera_ready = camera.ready(now)
             points, _fresh = lidar.snapshot()
+            # Arrays for every consumer below, built once per new packet batch
+            # rather than once per consumer per control tick.
+            scan = lidar.scan_frame()
             imu_yaw_rate = (
                 imu_state.gyro_z_dps
                 if imu_state.connected and imu_state.calibrated and imu_state.fresh
@@ -3397,15 +3785,22 @@ def main() -> int:
                 camera_motion.yaw_rate_dps if camera_flow_fresh else None,
                 camera_motion.translation_scale if camera_flow_fresh else 1.0,
                 imu_yaw,
+                scan_stamp_hint=scan.stamp if scan.size else None,
             )
             policy.observe_pose(slam_lite)
             if slam_lite.recenter_count != last_recenter_count:
                 # The occupancy grid just scrolled to keep the robot off its
-                # edge. Cached frontier/route cell indices point at the grid
-                # as it existed before the shift, so they now aim at the
-                # wrong physical place; drop them and force a fresh plan
-                # against the recentred grid rather than translating indices.
-                explorer.invalidate()
+                # edge. Move the goal and route by the same shift rather than
+                # discarding them: in a large room this happens every metre or
+                # two, and dropping the goal each time is what kept the robot
+                # re-choosing destinations and circling one area.
+                shift_rows, shift_cols = local_map.last_shift_cells
+                explorer.shift(
+                    shift_rows,
+                    shift_cols,
+                    local_map.cells / local_map.metres,
+                )
+                planner_resync = True
                 last_recenter_count = slam_lite.recenter_count
             # Make the safety decision and refresh the Uno watchdog before the
             # advisory global planner runs.  A bounded but non-trivial A* search
@@ -3415,7 +3810,9 @@ def main() -> int:
             last_control_at = control_now
             # One conversion of the revolution, shared by the motion tracker
             # and the local planner's obstacle memory.
-            scan_angles, scan_ranges = scan_arrays(points)
+            # Mixed-pixel-filtered returns for planning and motion evidence.
+            # Near-field returns are always retained, see robot_scan.
+            scan_angles, scan_ranges = scan.kept()
             # Whole-scan motion evidence. This runs before the decision so a
             # displacement is acted on in the same tick it is observed.
             scan_result = scan_motion.update(
@@ -3426,6 +3823,18 @@ def main() -> int:
             policy.observe_scan(
                 scan_angles, scan_ranges, clearance.scan_at, control_now
             )
+            if scan.size:
+                policy.observe_movers(
+                    mover_tracker.update(
+                        scan_angles,
+                        scan_ranges,
+                        scan.stamp,
+                        local_map.x,
+                        local_map.y,
+                        local_map.heading,
+                        imu_yaw_rate,
+                    )
+                )
             command = policy.decide(
                 clearance,
                 status,
@@ -3444,7 +3853,9 @@ def main() -> int:
                 last_displacement_count = policy.displacement_count
                 local_map.reset()
                 explorer.invalidate()
+                planner_resync = True
                 scan_motion.reset()
+                mover_tracker.reset()
                 print(
                     "NAV_EVENT reason=DISPLACED "
                     f"count={policy.displacement_count} "
@@ -3469,7 +3880,10 @@ def main() -> int:
                     f"recenter={slam_lite.recenter_count}"
                 )
                 last_policy_state = policy_state
-            exploration = explorer.update(
+            # Hand the planner the latest pose (and a map copy when due), then
+            # take whatever plan it has most recently finished. This never
+            # waits: a slow replan costs freshness, not control latency.
+            explorer.publish(
                 local_map.grid,
                 local_map.observed,
                 local_map.visits,
@@ -3479,7 +3893,10 @@ def main() -> int:
                 local_map.metres,
                 slam_lite.map_updates,
                 control_now,
+                force=planner_resync,
             )
+            planner_resync = False
+            exploration = explorer.state()
             policy.observe_exploration(exploration)
             if now >= next_telemetry_at:
                 next_telemetry_at = now + TELEMETRY_PERIOD_S
@@ -3526,9 +3943,40 @@ def main() -> int:
                     f"intent={policy.intent} "
                     f"recenter={slam_lite.recenter_count}"
                 )
+            # Phone dashboard. Each stream is only fed while it has viewers:
+            # the robot builds no telemetry, encodes no map and compresses no
+            # camera frame for a page nobody has open.
+            if telemetry_hub.wants("light") and now >= next_telemetry_publish_at:
+                wants_full = telemetry_hub.wants("full")
+                light, full = build_telemetry(
+                    policy, scan, exploration, slam_lite, imu_state, status,
+                    clearance, camera_ready, arduino.differential_ready,
+                    local_map, now, wants_full,
+                )
+                telemetry_hub.publish(light, full)
+                next_telemetry_publish_at = now + (0.1 if wants_full else 0.25)
+                if wants_full and now >= next_map_publish_at:
+                    png = encode_map_png(local_map)
+                    if png is not None:
+                        telemetry_hub.publish_map(png)
+                    next_map_publish_at = now + 1.0
+            camera_stream = (
+                None if dashboard_server is None else dashboard_server.camera
+            )
+            if (
+                camera_stream is not None
+                and camera_stream.viewers > 0
+                and now >= next_camera_publish_at
+            ):
+                frame = camera.annotated_frame()
+                if frame is not None:
+                    camera_stream.publish(frame)
+                next_camera_publish_at = now + camera_stream.publish_period_s
             window_due = show_window and now >= next_display_at
             stream_due = (
-                dashboard_stream is not None and now >= next_web_render_at
+                dashboard_stream is not None
+                and dashboard_stream.viewers > 0
+                and now >= next_web_render_at
             )
             if window_due or stream_due:
                 if window_due:
@@ -3594,6 +4042,7 @@ def main() -> int:
         camera.close()
         if imu is not None:
             imu.close()
+        explorer.close()
         if dashboard_server is not None:
             dashboard_server.close()
         if show_window:

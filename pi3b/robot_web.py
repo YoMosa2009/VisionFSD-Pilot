@@ -1,35 +1,49 @@
-"""View-only dashboard streaming for the Pi robot runtime.
+"""Phone and laptop dashboard for the Pi robot runtime.
 
-The Pi normally renders its dashboard into a fullscreen OpenCV window, which
-means watching the robot requires an HDMI monitor physically tethered to it.
-This module mirrors that same rendered dashboard over HTTP so a phone or
-laptop on the same network can watch it instead.
+Three views are served from one page on the robot's LAN address:
+
+* **LiDAR** - a live visualiser drawn by the browser from raw telemetry: every
+  LD19 return, the obstacle memory, the planned arc and route, moving objects
+  with their predicted paths, and the chassis at true scale.
+* **Camera** - the onboard USB webcam.
+* **Dashboard** - the same rendered panel the HDMI monitor shows.
+
+The LiDAR view is drawn client-side on purpose. Rendering and JPEG-encoding a
+detailed picture is exactly the work a Pi 3B cannot spare, while the phone
+showing it has a GPU sitting idle. The robot sends compact numbers; the phone
+does the drawing. That is how the view can carry far more detail than the old
+mirrored image and still cost the robot less.
 
 Design constraints, in priority order:
 
-1. **Never interfere with motor control.**  The control loop only ever hands
-   over a reference to an already-rendered frame under a short lock.  JPEG
-   encoding, socket writes and client handling all happen on other threads,
-   and every failure path is swallowed - a broken browser tab must never be
-   able to stop the robot loop or crash the runtime.
-2. **No accumulating backlog.**  Exactly one encoded frame is retained.  A
-   client on slow Wi-Fi simply misses intermediate frames; frames are never
-   queued per client, so memory and latency stay bounded.
-3. **Honest staleness.**  The viewer is told the age of what it is looking
-   at, so a frozen picture can never be mistaken for a live robot.
+1. **Never interfere with motor control.** The control loop only hands over
+   references and small dicts under short locks. Encoding, socket writes and
+   client handling all run on other threads, and every failure is swallowed:
+   a broken browser tab must never stop the robot loop or crash the runtime.
+2. **Do no work nobody is watching.** Every stream counts its viewers, and the
+   runtime asks before rendering, encoding or building telemetry.
+3. **No accumulating backlog.** Exactly one frame or telemetry message is
+   retained per stream. Slow Wi-Fi drops intermediate updates; nothing queues.
+4. **Honest staleness.** The viewer is always told how old what it sees is.
 
-The picture is read-only. There is one control endpoint, added deliberately:
-POST /control carries an operator halt, a resume, and a manual driving mode
-with a dead-man expiry. See RobotControl for how it fails safe. It cannot
-authenticate, so the port belongs on a trusted network only.
+Control - halt, resume and manual driving - travels over a WebSocket so a held
+button reaches the robot in tens of milliseconds, with an HTTP fallback. It
+fails safe: manual commands expire on their own. It cannot authenticate, so the
+port belongs on a trusted network only.
 """
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import http.server
 import json
+import math
+from pathlib import Path
+import select
 import socket
 import socketserver
+import struct
 import threading
 import time
 
@@ -40,31 +54,31 @@ import numpy as np
 class RobotControl:
     """Operator halt and manual driving, shared with the control loop.
 
-    This is the one part of the dashboard that is not read-only, so it is
-    built to fail safe in every direction:
+    Fails safe in every direction:
 
     * a manual command expires on its own after a fraction of a second, so a
       dropped phone, a closed tab or a walk out of Wi-Fi range stops the
       robot rather than leaving it driving;
-    * leaving manual mode clears any held command;
+    * leaving manual mode clears any held command, and so does a halt;
     * the halt is sticky and has to be released explicitly; and
     * nothing here can weaken the Uno's ultrasonic stop or the LD19 forward
       check in the policy, which both still apply to manual driving.
-
-    It cannot authenticate. Anyone who can reach the page on the network can
-    drive the robot, so treat the port as trusted-network-only.
     """
 
-    #: A held button refreshes far faster than this; one missed refresh
-    #: should not stop the robot, several in a row should.
-    COMMAND_TTL_S = 0.60
+    #: A held button is refreshed every 50 ms over the WebSocket. Several
+    #: consecutive refreshes have to go missing before the robot stops on its
+    #: own - long enough to ride out Wi-Fi jitter, short enough that a lost
+    #: connection is not felt as the robot carrying on.
+    COMMAND_TTL_S = 0.35
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._halted = False
         self._manual = False
         self._command = "STOP"
+        self._magnitude = 0.0
         self._command_at = 0.0
+        self.revision = 0
 
     @property
     def halted(self) -> bool:
@@ -80,37 +94,59 @@ class RobotControl:
         with self._lock:
             self._halted = True
             self._command = "STOP"
+            self._magnitude = 0.0
+            self.revision += 1
 
     def resume(self) -> None:
         with self._lock:
             self._halted = False
+            self.revision += 1
 
     def set_manual(self, enabled: bool) -> None:
         with self._lock:
             self._manual = bool(enabled)
             self._command = "STOP"
+            self._magnitude = 0.0
             self._command_at = 0.0
+            self.revision += 1
 
-    def drive(self, command: str) -> bool:
-        command = command.upper()
+    def drive(self, command: str, magnitude: float = 1.0) -> bool:
+        """Set the held manual command. ``magnitude`` is 0..1 of the range.
+
+        The page raises magnitude the longer a button is held, so a tap is a
+        small, precise nudge and a long press builds to full rate - which is
+        what makes a turn proportional to the press instead of a fixed jump.
+        """
+        command = str(command).upper()
         if command not in ("F", "B", "L", "R", "STOP"):
             return False
+        try:
+            magnitude = float(magnitude)
+        except (TypeError, ValueError):
+            magnitude = 0.0
+        if not math.isfinite(magnitude):
+            magnitude = 0.0
         with self._lock:
             if not self._manual:
                 return False
             self._command = command
+            self._magnitude = 0.0 if command == "STOP" else min(1.0, max(0.0, magnitude))
             self._command_at = time.monotonic()
         return True
 
     def manual_command(self, now: float | None = None) -> str:
         """The command to apply now, or STOP once it has gone stale."""
+        return self.manual_input(now)[0]
+
+    def manual_input(self, now: float | None = None) -> tuple[str, float]:
+        """(command, magnitude) to apply now; STOP once stale."""
         now = time.monotonic() if now is None else now
         with self._lock:
             if not self._manual or self._command == "STOP":
-                return "STOP"
+                return "STOP", 0.0
             if now - self._command_at > self.COMMAND_TTL_S:
-                return "STOP"
-            return self._command
+                return "STOP", 0.0
+            return self._command, self._magnitude
 
     def state(self) -> dict:
         with self._lock:
@@ -118,6 +154,7 @@ class RobotControl:
                 "halted": self._halted,
                 "manual": self._manual,
                 "command": self._command,
+                "magnitude": round(self._magnitude, 2),
             }
 
 
@@ -125,214 +162,33 @@ DEFAULT_PORT = 8080
 DEFAULT_FPS = 5.0
 DEFAULT_QUALITY = 70
 # The viewer marks the picture stale once the runtime has not published a new
-# dashboard frame for this long. Well above the normal publish period, low
-# enough that a hung render is obvious while walking beside the robot.
+# frame for this long. Well above the normal publish period, low enough that a
+# hung render is obvious while walking beside the robot.
 STALE_AFTER_S = 2.0
 _BOUNDARY = "visionfsdframe"
+_PAGE_PATH = Path(__file__).resolve().parent / "web" / "index.html"
+_WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
-_PAGE = """<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
+_FALLBACK_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>VisionFSD robot dashboard</title>
-<style>
-  :root { color-scheme: dark; }
-  body { margin: 0; background: #0a0f14; color: #e6eef5;
-         font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
-  header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
-           padding: 8px 12px; background: #0e1620; font-size: 14px; }
-  #badge { padding: 2px 10px; border-radius: 999px; font-weight: 600;
-           font-size: 12px; letter-spacing: 0.04em; }
-  .live { background: #12482a; color: #7cf0a6; }
-  .stale { background: #4d1d12; color: #ffb59b; }
-  .lost { background: #4a1020; color: #ff9bb5; }
-  #wrap { display: flex; justify-content: center; padding: 8px; }
-  img { max-width: 100%; height: auto; image-rendering: auto;
-        border-radius: 6px; background: #05080b; }
-  .dim { opacity: 0.35; transition: opacity 0.3s; }
-  .muted { color: #8fa3b5; }
-  #controls { display: flex; flex-direction: column; align-items: center;
-              gap: 10px; padding: 4px 12px 18px; }
-  .row { display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; }
-  button { font: inherit; font-weight: 600; color: #e6eef5; cursor: pointer;
-           background: #1b2735; border: 1px solid #2f4257; border-radius: 10px;
-           padding: 12px 18px; min-width: 96px; touch-action: manipulation;
-           -webkit-user-select: none; user-select: none; }
-  button:disabled { opacity: 0.35; cursor: not-allowed; }
-  #halt { background: #5a1420; border-color: #8d2032; }
-  #halt.active { background: #b3273f; border-color: #ff8ba0; }
-  #manual.active { background: #1d4a33; border-color: #3f9e6c; }
-  #pad { display: grid; grid-template-columns: repeat(3, 84px);
-         grid-template-rows: repeat(2, 72px); gap: 8px; justify-content: center; }
-  #pad button { min-width: 0; width: 100%; height: 100%; font-size: 22px; }
-  .pad-up { grid-column: 2; grid-row: 1; }
-  .pad-left { grid-column: 1; grid-row: 2; }
-  .pad-down { grid-column: 2; grid-row: 2; }
-  .pad-right { grid-column: 3; grid-row: 2; }
-  #mode { font-size: 13px; }
-</style>
-</head>
-<body>
-<header>
-  <strong>VisionFSD robot</strong>
-  <span id="badge" class="stale">CONNECTING</span>
-  <span id="detail" class="muted">waiting for first frame</span>
-  <span id="version" class="muted"></span>
-</header>
-<div id="wrap"><img id="view" class="dim" alt="robot dashboard"></div>
-<div id="controls">
-  <div class="row">
-    <button id="halt" type="button">STOP</button>
-    <button id="resume" type="button">RESUME</button>
-    <button id="manual" type="button">MANUAL CONTROL</button>
-  </div>
-  <div id="mode" class="muted">autonomous</div>
-  <div id="pad">
-    <button class="pad-up" data-drive="F" type="button" disabled>&#9650;</button>
-    <button class="pad-left" data-drive="L" type="button" disabled>&#9664;</button>
-    <button class="pad-down" data-drive="B" type="button" disabled>&#9660;</button>
-    <button class="pad-right" data-drive="R" type="button" disabled>&#9654;</button>
-  </div>
-</div>
-<script>
-(function () {
-  var view = document.getElementById('view');
-  var badge = document.getElementById('badge');
-  var detail = document.getElementById('detail');
-  var version = document.getElementById('version');
-  var staleAfter = STALE_AFTER_PLACEHOLDER;
+<title>VisionFSD robot</title></head><body style="background:#0a0f14;color:#e6eef5;
+font-family:system-ui,sans-serif"><h1>VisionFSD robot</h1>
+<p>The dashboard page is missing from this install (pi3b/web/index.html).</p>
+<p><button id="halt">STOP</button> <button id="manual">MANUAL CONTROL</button>
+<button data-drive="F">F</button></p><img src="stream.mjpg" alt="dashboard">
+</body></html>"""
 
-  function attach() {
-    view.src = 'stream.mjpg?t=' + Date.now();
-  }
-  view.addEventListener('error', function () {
-    badge.className = 'lost';
-    badge.textContent = 'DISCONNECTED';
-    detail.textContent = 'stream dropped, retrying';
-    view.classList.add('dim');
-    setTimeout(attach, 1500);
-  });
-  view.addEventListener('load', function () {
-    view.classList.remove('dim');
-  });
 
-  function poll() {
-    fetch('status.json', { cache: 'no-store' })
-      .then(function (response) { return response.json(); })
-      .then(function (status) {
-        version.textContent = 'v' + status.version;
-        if (!status.has_frame) {
-          badge.className = 'stale';
-          badge.textContent = 'NO FRAME';
-          detail.textContent = 'runtime has not rendered a dashboard yet';
-          return;
-        }
-        var age = status.frame_age_s;
-        if (age > staleAfter) {
-          badge.className = 'stale';
-          badge.textContent = 'STALE';
-          detail.textContent = 'last frame ' + age.toFixed(1) + 's ago';
-          view.classList.add('dim');
-        } else {
-          badge.className = 'live';
-          badge.textContent = 'LIVE';
-          detail.textContent = age.toFixed(1) + 's behind, '
-            + status.published_fps.toFixed(1) + ' fps';
-          view.classList.remove('dim');
-        }
-      })
-      .catch(function () {
-        badge.className = 'lost';
-        badge.textContent = 'OFFLINE';
-        detail.textContent = 'cannot reach the robot';
-        view.classList.add('dim');
-      });
-  }
-  var haltButton = document.getElementById('halt');
-  var resumeButton = document.getElementById('resume');
-  var manualButton = document.getElementById('manual');
-  var modeLabel = document.getElementById('mode');
-  var padButtons = Array.prototype.slice.call(
-    document.querySelectorAll('#pad button'));
-  var manualOn = false;
-  var held = null;
-  var repeatTimer = null;
-
-  function post(body) {
-    return fetch('control', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
-    }).then(function (response) { return response.json(); })
-      .then(applyState)
-      .catch(function () { /* the status poll reports the outage */ });
-  }
-
-  function applyState(state) {
-    if (!state || typeof state.manual === 'undefined') { return; }
-    manualOn = state.manual;
-    haltButton.classList.toggle('active', !!state.halted);
-    manualButton.classList.toggle('active', manualOn);
-    padButtons.forEach(function (button) { button.disabled = !manualOn; });
-    modeLabel.textContent = state.halted
-      ? 'stopped by operator'
-      : (manualOn ? 'manual control' : 'autonomous');
-  }
-
-  // A held button refreshes faster than the robot's command expiry, so a
-  // dropped connection stops the robot on its own rather than leaving it
-  // driving on the last thing it heard.
-  function startDrive(direction) {
-    if (!manualOn) { return; }
-    held = direction;
-    post({ drive: direction });
-    if (repeatTimer) { clearInterval(repeatTimer); }
-    repeatTimer = setInterval(function () {
-      if (held) { post({ drive: held }); }
-    }, 200);
-  }
-  function stopDrive() {
-    held = null;
-    if (repeatTimer) { clearInterval(repeatTimer); repeatTimer = null; }
-    post({ drive: 'STOP' });
-  }
-
-  haltButton.addEventListener('click', function () { post({ halt: true }); });
-  resumeButton.addEventListener('click', function () { post({ resume: true }); });
-  manualButton.addEventListener('click', function () {
-    post({ manual: !manualOn });
-  });
-  padButtons.forEach(function (button) {
-    var direction = button.getAttribute('data-drive');
-    ['pointerdown'].forEach(function (name) {
-      button.addEventListener(name, function (event) {
-        event.preventDefault();
-        startDrive(direction);
-      });
-    });
-    ['pointerup', 'pointercancel', 'pointerleave'].forEach(function (name) {
-      button.addEventListener(name, function (event) {
-        event.preventDefault();
-        stopDrive();
-      });
-    });
-  });
-  window.addEventListener('blur', stopDrive);
-
-  attach();
-  poll();
-  post({});
-  setInterval(poll, 1000);
-})();
-</script>
-</body>
-</html>
-"""
+def load_page() -> str:
+    try:
+        page = _PAGE_PATH.read_text(encoding="utf-8")
+    except OSError:
+        page = _FALLBACK_PAGE
+    return page.replace("STALE_AFTER_PLACEHOLDER", repr(STALE_AFTER_S))
 
 
 class DashboardStream:
-    """Hold the newest dashboard frame and encode it on a private thread."""
+    """Hold the newest image frame and encode it on a private thread."""
 
     def __init__(
         self,
@@ -340,6 +196,7 @@ class DashboardStream:
         quality: int = DEFAULT_QUALITY,
         version: str = "",
         control: RobotControl | None = None,
+        name: str = "dashboard-encoder",
     ) -> None:
         self.control = control
         self.fps = max(0.5, min(15.0, fps))
@@ -356,8 +213,9 @@ class DashboardStream:
         self._encode_started_at = time.monotonic()
         self._frame_ready = threading.Condition(self._lock)
         self._stop = threading.Event()
+        self._viewers = 0
         self._thread = threading.Thread(
-            target=self._encode_loop, name="dashboard-encoder", daemon=True
+            target=self._encode_loop, name=name, daemon=True
         )
         self._thread.start()
 
@@ -366,11 +224,21 @@ class DashboardStream:
         """How often the control loop needs to hand over a rendered frame."""
         return self._period_s
 
-    def publish(self, frame: np.ndarray) -> None:
-        """Accept the newest dashboard frame. Called from the control loop.
+    @property
+    def viewers(self) -> int:
+        """Clients currently streaming. Zero means no work is needed."""
+        with self._lock:
+            return self._viewers
 
-        This only stores a reference and returns, so the cost to the control
-        loop is a lock acquisition; encoding happens on the encoder thread.
+    def _add_viewer(self, delta: int) -> None:
+        with self._lock:
+            self._viewers = max(0, self._viewers + delta)
+
+    def publish(self, frame: np.ndarray) -> None:
+        """Accept the newest frame. Called from the control loop.
+
+        Only stores a reference and returns, so the cost to the control loop
+        is a lock acquisition; encoding happens on the encoder thread.
         Replacing an unencoded frame is intentional - the viewer always wants
         the newest picture, never a backlog of old ones.
         """
@@ -403,7 +271,7 @@ class DashboardStream:
                     self._encoded_count += 1
                     self._frame_ready.notify_all()
             # Pace encoding rather than the caller: the control loop stays
-            # free to render whenever it likes without paying for JPEG work.
+            # free to publish whenever it likes without paying for JPEG work.
             self._stop.wait(self._period_s)
 
     def latest(self) -> tuple[bytes | None, float]:
@@ -446,9 +314,144 @@ class DashboardStream:
             self._frame_ready.notify_all()
 
 
+class TelemetryHub:
+    """The latest telemetry message, encoded once however many clients watch.
+
+    Clients subscribe at one of two levels. ``full`` (the LiDAR tab) carries
+    every scan point, the memory, the arc, the route and the tracks. ``light``
+    (the camera and dashboard tabs) carries only what the on-screen status
+    needs. The runtime asks which levels are wanted before building anything.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._ready = threading.Condition(self._lock)
+        self._seq = 0
+        self._stamp = 0.0
+        self._full: dict | None = None
+        self._light: dict | None = None
+        self._encoded: dict[tuple[int, str], bytes] = {}
+        self._subscribers = {"full": 0, "light": 0}
+        self._map_png: bytes | None = None
+        self._map_seq = 0
+
+    def wants(self, level: str) -> bool:
+        with self._lock:
+            if level == "light":
+                return self._subscribers["light"] + self._subscribers["full"] > 0
+            return self._subscribers.get(level, 0) > 0
+
+    def _subscribe(self, old: str | None, new: str | None) -> None:
+        with self._lock:
+            if old in self._subscribers:
+                self._subscribers[old] = max(0, self._subscribers[old] - 1)
+            if new in self._subscribers:
+                self._subscribers[new] += 1
+
+    def publish(self, light: dict, full: dict | None = None) -> None:
+        """Replace the latest message. ``full`` extends ``light``."""
+        with self._lock:
+            self._seq += 1
+            self._stamp = time.monotonic()
+            self._light = light
+            self._full = full
+            self._encoded.clear()
+            self._ready.notify_all()
+
+    def publish_map(self, png: bytes) -> None:
+        with self._lock:
+            self._map_png = png
+            self._map_seq += 1
+
+    def map_png(self) -> tuple[bytes | None, int]:
+        with self._lock:
+            return self._map_png, self._map_seq
+
+    def wait(self, after_seq: int, timeout: float) -> int:
+        deadline = time.monotonic() + timeout
+        with self._lock:
+            while self._seq <= after_seq:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    break
+                self._ready.wait(remaining)
+            return self._seq
+
+    def encoded(self, level: str) -> tuple[int, bytes | None]:
+        with self._lock:
+            seq = self._seq
+            key = (seq, level)
+            if key in self._encoded:
+                return seq, self._encoded[key]
+            message = self._full if level == "full" and self._full is not None else self._light
+            if message is None:
+                return seq, None
+            payload = dict(message)
+            payload["type"] = "telemetry"
+            payload["level"] = "full" if level == "full" and self._full is not None else "light"
+            payload["age_ms"] = round((time.monotonic() - self._stamp) * 1000.0, 1)
+            payload["map_seq"] = self._map_seq
+            data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+            self._encoded[key] = data
+            return seq, data
+
+
+# ---------------------------------------------------------------------------
+# Minimal RFC 6455 WebSocket framing, enough for small JSON messages.
+
+
+def websocket_accept_key(client_key: str) -> str:
+    digest = hashlib.sha1((client_key.strip() + _WEBSOCKET_GUID).encode("ascii")).digest()
+    return base64.b64encode(digest).decode("ascii")
+
+
+def encode_frame(payload: bytes, opcode: int = 0x1) -> bytes:
+    """A single unmasked server-to-client frame."""
+    length = len(payload)
+    if length < 126:
+        header = struct.pack("!BB", 0x80 | opcode, length)
+    elif length < 65536:
+        header = struct.pack("!BBH", 0x80 | opcode, 126, length)
+    else:
+        header = struct.pack("!BBQ", 0x80 | opcode, 127, length)
+    return header + payload
+
+
+def _recv_exact(sock: socket.socket, count: int) -> bytes:
+    data = bytearray()
+    while len(data) < count:
+        chunk = sock.recv(count - len(data))
+        if not chunk:
+            raise ConnectionResetError("websocket closed")
+        data.extend(chunk)
+    return bytes(data)
+
+
+def read_frame(sock: socket.socket) -> tuple[int, bytes]:
+    """Read one client frame. Returns (opcode, unmasked payload)."""
+    first, second = _recv_exact(sock, 2)
+    opcode = first & 0x0F
+    masked = bool(second & 0x80)
+    length = second & 0x7F
+    if length == 126:
+        (length,) = struct.unpack("!H", _recv_exact(sock, 2))
+    elif length == 127:
+        (length,) = struct.unpack("!Q", _recv_exact(sock, 8))
+    if length > 65536:
+        raise ConnectionResetError("websocket frame too large")
+    mask = _recv_exact(sock, 4) if masked else b"\x00\x00\x00\x00"
+    payload = bytearray(_recv_exact(sock, length))
+    for index in range(length):
+        payload[index] ^= mask[index % 4]
+    return opcode, bytes(payload)
+
+
 class _DashboardHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     stream: DashboardStream
+    camera: DashboardStream | None = None
+    telemetry: TelemetryHub | None = None
+    page: str = _FALLBACK_PAGE
 
     def log_message(self, _format: str, *_args) -> None:
         # Per-request logging would interleave with the robot's own NAV
@@ -463,45 +466,72 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def _discard_body(self) -> None:
+        """Read an unwanted request body before answering.
+
+        Replying without reading it leaves unread bytes in the socket, and
+        some platforms then reset the connection before the client sees the
+        response.
+        """
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if 0 < length <= 65536:
+            try:
+                self.rfile.read(length)
+            except OSError:
+                pass
+
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         path = self.path.split("?", 1)[0]
         try:
             if path in ("/", "/index.html"):
-                page = _PAGE.replace(
-                    "STALE_AFTER_PLACEHOLDER", repr(STALE_AFTER_S)
-                )
-                self._send_bytes(page.encode("utf-8"), "text/html; charset=utf-8")
-            elif path == "/control":
-                self._control()
+                self._send_bytes(self.page.encode("utf-8"), "text/html; charset=utf-8")
+            elif path == "/ws":
+                self._websocket()
             elif path == "/status.json":
-                payload = json.dumps(self.stream.status()).encode("utf-8")
+                status = self.stream.status()
+                if self.camera is not None:
+                    status["camera_has_frame"] = self.camera.status()["has_frame"]
+                payload = json.dumps(status).encode("utf-8")
                 self._send_bytes(payload, "application/json")
             elif path == "/frame.jpg":
-                jpeg, _at = self.stream.latest()
-                if jpeg is None:
-                    self.send_error(503, "no dashboard frame yet")
-                    return
-                self._send_bytes(jpeg, "image/jpeg")
+                self._single(self.stream, "no dashboard frame yet")
             elif path == "/stream.mjpg":
-                self._stream()
+                self._stream(self.stream)
+            elif path == "/camera.jpg":
+                self._single(self.camera, "no camera frame yet")
+            elif path == "/camera.mjpg":
+                if self.camera is None:
+                    self.send_error(503, "camera stream is not enabled")
+                    return
+                self._stream(self.camera)
+            elif path == "/map.png":
+                png = None if self.telemetry is None else self.telemetry.map_png()[0]
+                if png is None:
+                    self.send_error(503, "no map yet")
+                    return
+                self._send_bytes(png, "image/png")
             else:
                 self.send_error(404, "not found")
-        except (BrokenPipeError, ConnectionResetError, socket.timeout):
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, socket.timeout):
             return
         except Exception:
             # A viewer must never be able to take the runtime down.
             try:
-                self.send_error(500, "dashboard stream error")
+                self.send_error(500, "dashboard error")
             except Exception:
                 return
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         if self.path.split("?", 1)[0] != "/control":
+            self._discard_body()
             self.send_error(404, "not found")
             return
         try:
             self._control()
-        except (BrokenPipeError, ConnectionResetError, socket.timeout):
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, socket.timeout):
             return
         except Exception:
             try:
@@ -509,21 +539,16 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
             except Exception:
                 return
 
-    def _control(self) -> None:
-        control = getattr(self.stream, "control", None)
-        if control is None:
-            self.send_error(503, "control is not enabled")
+    def _single(self, stream: DashboardStream | None, missing: str) -> None:
+        jpeg = None if stream is None else stream.latest()[0]
+        if jpeg is None:
+            self.send_error(503, missing)
             return
-        length = int(self.headers.get("Content-Length") or 0)
-        payload: dict = {}
-        if 0 < length <= 4096:
-            try:
-                payload = json.loads(self.rfile.read(length) or b"{}")
-            except (ValueError, UnicodeDecodeError):
-                payload = {}
-        if not isinstance(payload, dict):
-            payload = {}
-        # A halt is honoured before anything else in the same request, and
+        self._send_bytes(jpeg, "image/jpeg")
+
+    @staticmethod
+    def _apply_control(control: RobotControl, payload: dict) -> None:
+        # A halt is honoured before anything else in the same message, and
         # leaving manual mode always clears whatever was held.
         if payload.get("halt"):
             control.halt()
@@ -533,12 +558,32 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
             control.set_manual(bool(payload["manual"]))
         drive = payload.get("drive")
         if isinstance(drive, str):
-            control.drive(drive)
+            control.drive(drive, payload.get("mag", 1.0))
+
+    def _control(self) -> None:
+        control = getattr(self.stream, "control", None)
+        length = int(self.headers.get("Content-Length") or 0)
+        body = b""
+        if 0 < length <= 4096:
+            body = self.rfile.read(length)
+        elif length > 4096:
+            self._discard_body()
+        if control is None:
+            self.send_error(503, "control is not enabled")
+            return
+        payload: dict = {}
+        try:
+            payload = json.loads(body or b"{}")
+        except (ValueError, UnicodeDecodeError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        self._apply_control(control, payload)
         self._send_bytes(
             json.dumps(control.state()).encode("utf-8"), "application/json"
         )
 
-    def _stream(self) -> None:
+    def _stream(self, stream: DashboardStream) -> None:
         self.send_response(200)
         self.send_header("Age", "0")
         self.send_header("Cache-Control", "no-store, private")
@@ -548,27 +593,108 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
             f"multipart/x-mixed-replace; boundary={_BOUNDARY}",
         )
         self.end_headers()
-        last_at = 0.0
-        while True:
-            jpeg, frame_at = self.stream.wait_for_frame(last_at, timeout=1.0)
-            if jpeg is None:
-                # Nothing rendered yet. Keep the connection open so the page
-                # does not flap between reconnect attempts.
-                continue
-            if frame_at <= last_at:
-                # Timed out waiting for something new. Resend the last frame
-                # so an idle TCP connection cannot look identical to a dead
-                # one; the page's own status poll reports the real age.
-                pass
-            last_at = frame_at
-            header = (
-                f"--{_BOUNDARY}\r\n"
-                "Content-Type: image/jpeg\r\n"
-                f"Content-Length: {len(jpeg)}\r\n\r\n"
-            ).encode("ascii")
-            self.wfile.write(header)
-            self.wfile.write(jpeg)
-            self.wfile.write(b"\r\n")
+        stream._add_viewer(1)
+        try:
+            last_at = 0.0
+            while True:
+                jpeg, frame_at = stream.wait_for_frame(last_at, timeout=1.0)
+                if jpeg is None:
+                    # Nothing rendered yet. Keep the connection open so the
+                    # page does not flap between reconnect attempts; the
+                    # viewer count is already telling the runtime to render.
+                    continue
+                last_at = frame_at
+                header = (
+                    f"--{_BOUNDARY}\r\n"
+                    "Content-Type: image/jpeg\r\n"
+                    f"Content-Length: {len(jpeg)}\r\n\r\n"
+                ).encode("ascii")
+                self.wfile.write(header)
+                self.wfile.write(jpeg)
+                self.wfile.write(b"\r\n")
+        finally:
+            stream._add_viewer(-1)
+
+    def _websocket(self) -> None:
+        key = self.headers.get("Sec-WebSocket-Key")
+        if not key or "websocket" not in (self.headers.get("Upgrade") or "").lower():
+            self.send_error(400, "expected a websocket upgrade")
+            return
+        self.send_response(101, "Switching Protocols")
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", websocket_accept_key(key))
+        self.end_headers()
+        self.wfile.flush()
+        self.close_connection = True
+        sock = self.connection
+        sock.settimeout(2.0)
+        control: RobotControl | None = getattr(self.stream, "control", None)
+        hub = self.telemetry
+        level: str | None = None
+        last_seq = 0
+        last_control_revision = -1
+        light_period = 0.25
+        full_period = 0.10
+        next_send_at = 0.0
+
+        def send(message: dict) -> None:
+            sock.sendall(encode_frame(json.dumps(message, separators=(",", ":")).encode("utf-8")))
+
+        try:
+            send({"type": "hello", "version": self.stream.version,
+                  "control": None if control is None else control.state()})
+            while True:
+                readable, _w, _x = select.select([sock], [], [], 0.02)
+                if readable:
+                    opcode, payload = read_frame(sock)
+                    if opcode == 0x8:
+                        try:
+                            sock.sendall(encode_frame(payload[:2], 0x8))
+                        except OSError:
+                            pass
+                        return
+                    if opcode == 0x9:
+                        sock.sendall(encode_frame(payload, 0xA))
+                        continue
+                    if opcode != 0x1:
+                        continue
+                    try:
+                        message = json.loads(payload.decode("utf-8"))
+                    except (ValueError, UnicodeDecodeError):
+                        continue
+                    if not isinstance(message, dict):
+                        continue
+                    kind = message.get("type")
+                    if kind == "subscribe" and hub is not None:
+                        wanted = message.get("level")
+                        wanted = wanted if wanted in ("full", "light") else None
+                        hub._subscribe(level, wanted)
+                        level = wanted
+                        next_send_at = 0.0
+                    elif kind == "control" and control is not None:
+                        self._apply_control(control, message)
+                    elif kind == "ping":
+                        send({"type": "pong", "c": message.get("c")})
+                if control is not None and control.revision != last_control_revision:
+                    last_control_revision = control.revision
+                    send({"type": "control", **control.state()})
+                now = time.monotonic()
+                if hub is not None and level is not None and now >= next_send_at:
+                    seq, data = hub.encoded(level)
+                    if data is not None and seq != last_seq:
+                        last_seq = seq
+                        sock.sendall(encode_frame(data))
+                        next_send_at = now + (full_period if level == "full" else light_period)
+        except (OSError, ConnectionResetError, ValueError, struct.error):
+            return
+        finally:
+            if hub is not None:
+                hub._subscribe(level, None)
+            if control is not None:
+                # A closed control connection must not leave a held command
+                # running until it happens to expire.
+                control.drive("STOP")
 
 
 class _ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
@@ -579,19 +705,30 @@ class _ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 
 class DashboardWebServer:
-    """Serve the rendered dashboard read-only over HTTP."""
+    """Serve the dashboard, camera, telemetry and control over HTTP."""
 
     def __init__(
         self,
         stream: DashboardStream,
         host: str = "0.0.0.0",
         port: int = DEFAULT_PORT,
+        camera: DashboardStream | None = None,
+        telemetry: TelemetryHub | None = None,
     ) -> None:
         self.stream = stream
+        self.camera = camera
+        self.telemetry = telemetry
         self.host = host
         self.port = port
         handler = type(
-            "BoundDashboardHandler", (_DashboardHandler,), {"stream": stream}
+            "BoundDashboardHandler",
+            (_DashboardHandler,),
+            {
+                "stream": stream,
+                "camera": camera,
+                "telemetry": telemetry,
+                "page": load_page(),
+            },
         )
         self._server = _ThreadedHTTPServer((host, port), handler)
         self._server.socket.settimeout(5.0)
@@ -614,6 +751,8 @@ class DashboardWebServer:
         except Exception:
             pass
         self.stream.close()
+        if self.camera is not None:
+            self.camera.close()
 
 
 def local_ip_address() -> str:
@@ -637,18 +776,32 @@ def start_dashboard_server(
     version: str = "",
     host: str = "0.0.0.0",
     control: RobotControl | None = None,
+    camera_fps: float | None = None,
+    telemetry: TelemetryHub | None = None,
 ) -> tuple[DashboardStream, DashboardWebServer] | None:
-    """Start streaming, or return None if the port cannot be bound.
+    """Start serving, or return None if the port cannot be bound.
 
-    A dashboard viewer is a convenience. Failing to bind (port in use, no
-    network yet) must degrade to "no remote view", never to "no robot".
+    A remote view is a convenience. Failing to bind (port in use, no network
+    yet) must degrade to "no remote view", never to "no robot".
     """
     stream = DashboardStream(
         fps=fps, quality=quality, version=version, control=control
     )
+    camera = (
+        None
+        if camera_fps is None
+        else DashboardStream(
+            fps=camera_fps, quality=quality, version=version,
+            control=control, name="camera-encoder",
+        )
+    )
     try:
-        server = DashboardWebServer(stream, host=host, port=port)
+        server = DashboardWebServer(
+            stream, host=host, port=port, camera=camera, telemetry=telemetry
+        )
     except OSError:
         stream.close()
+        if camera is not None:
+            camera.close()
         return None
     return stream, server

@@ -858,6 +858,142 @@ roughly 15% of one Pi 3B core at the replan rate.
 Desktop tests and simulation only (405 pass). **Nothing here has run on the
 robot.**
 
+### v1.9.22: planning through the route, more LD19 data, moving objects, a real phone view
+
+Reported from driving v1.9.21: it committed to paths it should not have taken
+in multi-turn spaces, circled one area in large open rooms, needed to cope with
+things moving around it, and the phone controls were laggy and turned a fixed
+~45 degrees per tap. Also requested: more LD19 data, a better LiDAR view, and a
+camera tab.
+
+**Two planners disagreed about what fits - again, one level up.** The global
+route planner inflated obstacles by 0.14 m, a figure left over from the chassis
+model that was 60% too narrow. The local arc planner, using the measured
+footprint, needs 0.23 m. So the global plan routinely went through gaps the
+robot would never drive: it committed, arrived, and improvised. Global
+inflation is now the footprint radius plus the same safety margin the arc
+planner uses. This is the same class of bug as v1.9.21's spinning, and the fix
+is the same: make both layers agree on what a route is.
+
+**The local planner now follows the route, not a heading.** It used to steer
+toward a single look-ahead waypoint. At a junction where the route turns left a
+metre ahead, driving straight makes excellent "forward progress" and lands off
+the route; the arc that starts turning early makes less forward progress and
+lands on it. Candidate arcs are now scored by distance made good *along the
+planned route* and distance *off* it - the substance of Nav2 DWB's PathDist and
+PathAlign critics. In a T-junction test the old scoring drove straight past the
+turn and ended 36 cm off the route; the new scoring starts the turn and ends
+16 cm off it.
+
+**Circling in open rooms had two causes.** Every time the map scrolled to keep
+the robot away from its edge - every metre or two in a large room - the goal
+and route were thrown away and a new goal chosen. They are now shifted with the
+map instead. And goals were re-chosen every replan with no memory of the
+previous one. Following explore_lite, a goal is now kept until reached or until
+the route to it stops shrinking for 10 s, at which point it is blacklisted for
+45 s; a slightly better alternative does not cause a switch. When there is
+nothing left to discover, roaming goals are deliberately far (at least 1.3 m),
+deliberately in little-visited space, and preferably in open floor.
+
+**Planning moved off the control loop.** Global planning ran inline with a
+45 ms budget - a periodic latency spike right in the drive path. It now runs on
+its own thread and hands back plans as they finish; a slow replan costs
+freshness, never control latency. It also got cheaper: A* never took its
+straight-line shortcut (because a traversal cost is always supplied), so every
+goal in an open room paid for a full search. Planning a 12 m map dropped from
+32-42 ms to about 14 ms on the development machine.
+
+**More of what the LD19 measures reaches the planner.**
+
+* The reader capped range at 6 m; the LD19 is rated to 12 m. Now 12 m, and the
+  map grew from 8 m to 12 m at the same 2 cm cells so the extra range has
+  somewhere to go.
+* At most 240 rays per revolution marked free space, one Python call each,
+  leaving about half of every 450-return scan unused. Every return now counts,
+  with the wedge between adjacent returns on one surface filled in a single
+  call - but never across a depth jump, so the far side of a doorway is not
+  claimed as seen through its frame.
+* The map re-processed the same sliding scan window two or three times per
+  revolution; it now integrates once per revolution.
+* Walls faded from the map with a ~3.4 s half-life because fading was applied
+  per integration. Fading is now by elapsed time with a 12 s half-life, so the
+  robot remembers space that has briefly left view.
+* LDROBOT's own SDK applies a mixed-pixel filter to LD06/LD19 data; this runtime
+  did not. A beam clipping an edge returns a range between the edge and the
+  background, and those phantom returns float exactly in the doorways the
+  planner is judging. `robot_scan.py` ports that filter (its grouping and
+  intensity thresholds). Every return within 0.6 m is kept regardless, because
+  the filter can remove a real dark thin object and close to the chassis a
+  missed obstacle is a collision.
+
+**LD19 CPU cost fell.** The packet CRC was computed a bit at a time in Python -
+about three quarters of all parsing time, holding the interpreter lock the
+control loop needs. A lookup table gives an identical result: parsing one
+second of LD19 data went from 20.4 ms to 5.6 ms. The scan window is also no
+longer rebuilt on every call, only when packets arrive.
+
+**Moving objects** (`robot_tracking.py`). The scan is segmented into compact
+clusters, clusters are associated to tracks by nearest neighbour, and each
+track's velocity is estimated with an alpha-beta filter, in the map frame so
+the robot's own motion is removed. Moving tracks are predicted forward under
+constant velocity and handed to the arc planner as obstacles at the positions
+they *will* occupy. When something is on a collision course the robot yields -
+for at most 2 s, so a person standing in a doorway cannot park it - and then
+routes around the predictions. The obstacle memory also gained raytrace
+clearing: a remembered return is forgotten when the live scan sees past it, so
+a person walking by no longer leaves a phantom wall behind them. Honest limit:
+the chassis has no encoders, so pose drift can make still things appear to
+move; motion is only declared after several sightings, a minimum speed, a
+minimum distance actually travelled, and never while the robot spins quickly.
+
+**Research this draws on:** [Nav2 DWB critics](https://github.com/ros-navigation/navigation2/tree/main/nav2_dwb_controller)
+(route-relative arc scoring), [explore_lite](https://index.ros.org/p/explore_lite/)
+(goal progress timeout and blacklisting),
+[Regulated Pure Pursuit](https://arxiv.org/abs/2305.20026),
+[costmap raytrace clearing](https://arxiv.org/pdf/1706.09068),
+[predictive DWA for moving obstacles](https://www.hrl.uni-bonn.de/papers/icra19missura.pdf),
+the [LDROBOT SDK](https://github.com/ldrobotSensorTeam/ldlidar_sdk) and
+[LD19 specifications](https://www.waveshare.com/wiki/DTOF_LIDAR_LD19).
+
+Desktop tests (469 pass), a simulated-room run of the real control loop, and a
+browser session against the real dashboard server. **Nothing here has run on
+the robot.** None of it verifies real LD19 mixed-pixel behaviour, pose drift
+while tracking, Pi 3B CPU headroom with all of this running, or Wi-Fi latency.
+
+### Phone dashboard (v1.9.22)
+
+`http://<pi-address>:8080/` now has three tabs, with the controls beside every
+one of them so switching views never loses control:
+
+* **LiDAR** - drawn by the phone from raw telemetry: every LD19 return coloured
+  by signal strength, returns the edge filter removed (magenta), the obstacle
+  memory, the occupancy map, the planned route and goal, the arc about to be
+  driven, the gap being turned toward, moving objects with velocity arrows and
+  predicted positions, and the chassis at its measured size. Pinch or +/- to
+  zoom; HDG toggles heading-up and north-up; MAP and MEM toggle layers.
+* **Camera** - the onboard webcam.
+* **Dashboard** - the HDMI panel mirror.
+
+Drawing on the phone is deliberate. Rendering and JPEG-encoding a detailed
+image is exactly what a Pi 3B cannot spare, and the phone's GPU is idle; the
+robot sends a few kilobytes of numbers ten times a second instead. Nothing is
+built for a view nobody has open: telemetry, the map image, camera frames and
+the dashboard render are each produced only while that view has a viewer.
+
+**Manual control** now travels over a WebSocket rather than one HTTP request
+per button event, and holding a button refreshes it every 50 ms. The robot
+stops on its own if refreshes stop arriving for 0.35 s (previously 0.6 s, which
+is how a quick tap became a ~45 degree turn), stops immediately on release, and
+stops if the page's connection closes. The press survives a finger sliding
+slightly, which mobile browsers used to report as a cancelled press. Driving is
+proportional: a tap is a small nudge, and holding builds the rate. Keyboard
+arrows or WASD work on a laptop; space halts. In a browser test the robot-side
+command reached 26% after 150 ms of holding, 91% after one second, and returned
+to STOP within 60 ms of release.
+
+The control endpoint is still unauthenticated: keep the port on a trusted
+network, or set `VISIONFSD_NO_WEB=1`.
+
 ### Dashboard operator controls
 
 The phone dashboard now carries **STOP**, **RESUME** and **MANUAL CONTROL**

@@ -4,6 +4,7 @@ import math
 import pathlib
 import sys
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -18,6 +19,78 @@ class SlamLiteTests(unittest.TestCase):
         mapper = LidarSlamLite()
         self.assertAlmostEqual(mapper.metres / mapper.cells, 0.0208, places=3)
         self.assertEqual(mapper.BIN_COUNT, 360)
+
+    def test_default_map_covers_the_ld19_rated_range(self) -> None:
+        """The LD19 is rated to 12 m. An 8 m map discarded most of that: with
+        the robot recentred it could hold at most about 4 m in any direction."""
+        mapper = LidarSlamLite()
+        self.assertGreaterEqual(mapper.metres, 12.0)
+
+    def test_redundant_scan_is_skipped_before_deskewing(self) -> None:
+        """The scan window refreshes every packet batch, far faster than a
+        revolution. Re-deskewing and re-binning identical data every control
+        tick was most of the per-tick cost of keeping a map."""
+        mapper = LidarSlamLite()
+        points = [(0, LidarPoint(0.0, 1000, 90, 1.0))]
+        mapper.update(points, 0, 0, 1.02, scan_stamp_hint=1.0)
+        with mock.patch.object(
+            mapper, "deskew_points", wraps=mapper.deskew_points
+        ) as deskew:
+            mapper.update(points, 0, 0, 1.05, scan_stamp_hint=1.03)
+        deskew.assert_not_called()
+
+    def test_all_returns_on_a_surface_mark_the_space_between_them(self) -> None:
+        """At most 240 rays used to be traced, one Python call each, leaving
+        about half of a full revolution's free space unmarked."""
+        mapper = LidarSlamLite(cells=240, metres=6.0)
+        points = [
+            (index, LidarPoint(angle, 2000, 200, 1.0))
+            for index, angle in enumerate(np.arange(-40.0, 40.0, 0.8))
+        ]
+        mapper._integrate_points(points)
+        scale = mapper.cells / mapper.metres
+        # A cell midway between two rays, well inside the wedge, is observed.
+        row = int(round((mapper.y - 1.0) * scale))
+        col = int(round((mapper.x + math.tan(math.radians(0.4)) * 1.0) * scale))
+        self.assertEqual(int(mapper.observed[row, col]), 255)
+
+    def test_space_behind_a_depth_jump_is_not_claimed_as_seen(self) -> None:
+        """A wedge is only filled between returns on one continuous surface,
+        so the far side of a doorway is not marked through its frame."""
+        mapper = LidarSlamLite(cells=240, metres=6.0)
+        points = [
+            (0, LidarPoint(10.0, 600, 200, 1.0)),
+            (1, LidarPoint(10.8, 2400, 200, 1.0)),
+        ]
+        mapper._integrate_points(points)
+        scale = mapper.cells / mapper.metres
+        # Just past the near return, between the two rays: never observed.
+        distance = 1.2
+        bearing = math.radians(10.4)
+        row = int(round((mapper.y - math.cos(bearing) * distance) * scale))
+        col = int(round((mapper.x + math.sin(bearing) * distance) * scale))
+        self.assertEqual(int(mapper.observed[row, col]), 0)
+
+    def test_occupancy_fades_by_elapsed_time_not_by_call_count(self) -> None:
+        """Memory length must not depend on how often the loop integrates."""
+        fast = LidarSlamLite(cells=120, metres=6.0)
+        slow = LidarSlamLite(cells=120, metres=6.0)
+        for mapper in (fast, slow):
+            mapper.grid[10, 10] = 200
+        fast._decay_factor(0.0)
+        slow._decay_factor(0.0)
+        fast_keep = 1.0
+        for step in range(1, 21):
+            fast_keep *= fast._decay_factor(step * 0.1)
+        slow_keep = slow._decay_factor(2.0)
+        self.assertAlmostEqual(fast_keep, slow_keep, places=5)
+
+    def test_recenter_reports_the_shift_it_applied(self) -> None:
+        mapper = LidarSlamLite(cells=100, metres=5.0)
+        mapper.x = 0.3
+        mapper.y = 2.5
+        self.assertTrue(mapper._recenter_if_needed())
+        self.assertNotEqual(mapper.last_shift_cells, (0, 0))
 
     def test_one_degree_bins_keep_the_nearest_duplicate_return(self) -> None:
         points = [
@@ -175,8 +248,9 @@ class SlamLiteTests(unittest.TestCase):
             118, 118, 1.1, camera_translation_scale=0.20
         )
 
-        normal_distance = 4.0 - normal.y
-        reduced_distance = 4.0 - reduced.y
+        # The pose starts at the map centre, whatever size the map is.
+        normal_distance = normal.metres / 2.0 - normal.y
+        reduced_distance = reduced.metres / 2.0 - reduced.y
         self.assertAlmostEqual(reduced_distance / normal_distance, 0.20, places=2)
 
     def test_recenter_moves_grid_content_by_the_same_shift_as_the_robot(self) -> None:
