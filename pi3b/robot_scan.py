@@ -1,24 +1,30 @@
-"""Array form of the live LD19 scan, with the manufacturer's edge filter.
+"""Array form of the live LD19 scan, with an edge-artefact flag for display.
 
-Two things motivate this module.
+**Cost.** Every consumer of the scan used to walk the list of point objects
+again on every control tick, whether or not the LD19 had produced anything new.
+``ScanFrame`` is built once per new batch of packets and shared as arrays.
 
-**Cost.** Every consumer of the scan - the arc planner's obstacle memory, the
-whole-scan motion detector, the moving-object tracker, the web visualiser -
-used to walk the list of point objects again on every control tick, whether or
-not the LD19 had produced anything new. ``ScanFrame`` is built once per new
-batch of packets and handed to all of them as plain arrays.
+**Edge artefacts are flagged, not removed.** A time-of-flight beam clipping an
+edge can return a range between the edge and whatever is behind it. v1.9.22
+removed those returns before planning, using a port of LDROBOT's own
+NEAR_FILTER, which groups returns by a 3% range jump. That was a serious
+mistake: along a wall seen at a glancing angle, consecutive returns
+*legitimately* differ in range by more than 3%, so every one of them became a
+lone "artefact" and was discarded. In simulation it removed 68-95% of a
+wall's returns at 1-2 m and all of them at 2-3 m, for a wall the robot drove
+alongside. The planner could not see those walls until they were within
+0.6 m - which is how v1.9.22 came to drive quickly at openings that were walls.
 
-**Mixed pixels.** A time-of-flight beam that clips an edge returns a range
-somewhere between the edge and whatever is behind it. Those phantom returns
-float in doorways and beside furniture legs, which is exactly where the
-planner is deciding whether a gap is passable. LDROBOT's own SDK removes them
-for the LD06/LD19 with a near-field filter (``Tofbf``, NEAR_FILTER mode); this
-is a direct port of that filter's grouping and intensity rules, vectorised.
+Two changes follow from that:
 
-The filter is not allowed to weaken near-field safety. It can drop a real thin,
-dark object, so every return inside ``NEAR_KEEP_M`` is kept regardless of what
-the filter says. Close to the chassis a phantom obstacle only costs caution; a
-missed real one costs a collision.
+* Planning, memory, tracking and mapping use **every** return again. A
+  phantom return in a doorway only makes the planner more cautious; a missing
+  real one causes a collision.
+* The flag, now only for the phone view, is judged by *spatial isolation*: a
+  return is an artefact candidate only when it is far in space from both of
+  its angular neighbours and weak. A glancing wall's returns are spread in
+  range but close together along the wall, so they are never flagged, while
+  a ghost floating between two surfaces still is.
 """
 
 from __future__ import annotations
@@ -27,26 +33,29 @@ from dataclasses import dataclass
 
 import numpy as np
 
-# LDROBOT Tofbf NEAR_FILTER constants for the LD06/LD19.
 MEASURE_FREQUENCY_HZ = 4500.0
-FILTER_MAX_RANGE_MM = 5000.0
-GROUP_RANGE_JUMP_RATIO = 0.03
-LARGE_GROUP_POINTS = 15
-SMALL_GROUP_POINTS = 3
-GROUP_MIN_MEAN_INTENSITY = 15.0
-LONE_POINT_MIN_INTENSITY = 220.0
-# Returns this close are never filtered. See the module docstring.
-NEAR_KEEP_M = 0.60
 DEFAULT_SPEED_DPS = 3600.0
+# Only returns this close are candidates for the artefact flag.
+FILTER_MAX_RANGE_MM = 5000.0
+# A return that is spatially isolated needs at least this signal strength to
+# be considered a real thin object rather than a ghost.
+LONE_POINT_MIN_INTENSITY = 220.0
+# Neighbouring returns on one surface can be spread by up to the sample step
+# divided by the cosine of the angle of incidence. Tolerate surfaces seen up to
+# this glancing angle before calling two returns separated.
+GLANCING_LIMIT_DEG = 80.0
+MIN_SEPARATION_M = 0.06
+# Returns this close are never flagged.
+NEAR_KEEP_M = 0.60
 
 
 @dataclass(frozen=True)
 class ScanFrame:
     """One view of the current scan window as arrays.
 
-    ``keep`` marks returns that survive the mixed-pixel filter (plus every
-    near-field return). Arrays are never mutated after construction, so a
-    frame can be shared across threads.
+    ``keep`` is False for returns flagged as likely edge ghosts. It is for
+    display only: planning uses every return. Arrays are never mutated after
+    construction, so a frame can be shared across threads.
     """
 
     seq: int
@@ -93,57 +102,37 @@ def mixed_pixel_keep_mask(
     intensity: np.ndarray,
     speed_dps: float,
 ) -> np.ndarray:
-    """Return True for returns that are real surfaces, per LDROBOT's filter.
+    """True for returns that look like real surfaces; False for likely ghosts.
 
-    Returns within 5 m are grouped along the scan: a new group starts when the
-    angular gap exceeds two nominal sample spacings or the range jumps by more
-    than 3%. Groups of more than 15 returns are real surfaces. Groups of 3-15
-    need a mean intensity of at least 15. Groups of fewer than 3 are the
-    classic mixed-pixel signature and each return needs intensity 220.
+    A return is flagged only when it is weak, within the near field, and far in
+    space from *both* of its angular neighbours. Judging separation in space
+    rather than by a range jump is what keeps walls seen at glancing angles:
+    their consecutive ranges differ a lot, but the points sit close together
+    along the wall.
     """
     count = angles_deg.size
     keep = np.ones(count, dtype=bool)
-    if count == 0:
+    if count < 3:
         return keep
+    order = np.argsort(angles_deg, kind="stable")
+    radians = np.radians(angles_deg[order].astype(np.float64))
+    ranges = ranges_mm[order].astype(np.float64) / 1000.0
+    x = np.sin(radians) * ranges
+    y = np.cos(radians) * ranges
+    previous = np.roll(np.arange(count), 1)
+    following = np.roll(np.arange(count), -1)
+    gap_previous = np.hypot(x - x[previous], y - y[previous])
+    gap_following = np.hypot(x - x[following], y - y[following])
     speed = speed_dps if speed_dps > 0.0 else DEFAULT_SPEED_DPS
-    max_gap_deg = speed / MEASURE_FREQUENCY_HZ * 2.0
-    candidate = ranges_mm < FILTER_MAX_RANGE_MM
-    indices = np.flatnonzero(candidate)
-    if indices.size == 0:
-        return keep
-    order = indices[np.argsort(angles_deg[indices], kind="stable")]
-    angles = angles_deg[order].astype(np.float64)
-    ranges = ranges_mm[order].astype(np.float64)
-    power = intensity[order].astype(np.float64)
-
-    breaks = np.zeros(order.size, dtype=bool)
-    if order.size > 1:
-        breaks[1:] = (np.diff(angles) > max_gap_deg) | (
-            np.abs(np.diff(ranges)) > ranges[:-1] * GROUP_RANGE_JUMP_RATIO
-        )
-    group = np.cumsum(breaks)
-    # A surface that straddles 0 degrees is one group, not two.
-    if order.size > 1 and group[-1] > 0:
-        wrap_gap = angles[0] + 360.0 - angles[-1]
-        if (
-            wrap_gap <= max_gap_deg
-            and abs(ranges[0] - ranges[-1]) <= ranges[-1] * GROUP_RANGE_JUMP_RATIO
-        ):
-            group[group == group[-1]] = 0
-    sizes = np.bincount(group)
-    mean_power = np.bincount(group, weights=power) / np.maximum(sizes, 1)
-    point_size = sizes[group]
-    point_mean = mean_power[group]
-    survives = np.where(
-        point_size > LARGE_GROUP_POINTS,
-        True,
-        np.where(
-            point_size >= SMALL_GROUP_POINTS,
-            point_mean >= GROUP_MIN_MEAN_INTENSITY,
-            power >= LONE_POINT_MIN_INTENSITY,
-        ),
+    step = np.radians(speed / MEASURE_FREQUENCY_HZ * 1.5)
+    allowed = np.maximum(
+        MIN_SEPARATION_M,
+        ranges * step / np.cos(np.radians(GLANCING_LIMIT_DEG)),
     )
-    keep[order] = survives
+    isolated = (gap_previous > allowed) & (gap_following > allowed)
+    weak = intensity[order] < LONE_POINT_MIN_INTENSITY
+    near = ranges_mm[order] < FILTER_MAX_RANGE_MM
+    keep[order] = ~(isolated & weak & near)
     return keep
 
 

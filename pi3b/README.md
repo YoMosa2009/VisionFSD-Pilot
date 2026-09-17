@@ -960,6 +960,63 @@ browser session against the real dashboard server. **Nothing here has run on
 the robot.** None of it verifies real LD19 mixed-pixel behaviour, pose drift
 while tracking, Pi 3B CPU headroom with all of this running, or Wi-Fi latency.
 
+### v1.9.23: see every wall again, look past each arc, drive calmly
+
+Reported from driving v1.9.22: it felt like a downgrade - far too fast,
+repeatedly driving into things, and choosing openings short-term instead of
+heading for clear space further ahead.
+
+**The main cause was a LiDAR filter.** v1.9.22 removed suspected edge
+artefacts before planning, using a port of LDROBOT's NEAR_FILTER that groups
+returns by a 3% range jump. Along a wall seen at a glancing angle, neighbouring
+returns legitimately differ by more than that, so they were treated as lone
+artefacts and discarded: 68-95% of such a wall at 1-2 m and all of it at 2-3 m,
+in a synthetic LD19 sweep. The planner could not see walls it was driving
+alongside until they were within 0.6 m, so they looked like openings, earned
+cruise speed, and were found late. Planning, memory, tracking and mapping now
+use every return again. The artefact flag survives for the phone view only,
+and is judged by spatial isolation (weak *and* far in space from both angular
+neighbours), which keeps glancing walls and still flags doorway ghosts.
+
+**Look-ahead past each arc.** Each candidate arc is about 1.6 m long. Two arcs
+can be equally clear for that length while one ends facing a wall and the other
+faces a long clear corridor. The planner now measures clear corridor (0.52 m
+wide, out to 4 m) ahead of each arc's end along the heading it ends on, and
+prefers arcs that lead somewhere. When a global route is being followed that
+term is off: the route already sees the whole map and knows which way a
+junction turns, and a straight corridor must not outvote it.
+
+**Calm speed.**
+- Cruise (112) is earned only with at least 3 m of clear corridor ahead and
+  steering within 10 degrees. Otherwise the slower level is preferred, ranked
+  across the levels (105 and 112 are only 6% apart as fractions of top speed,
+  which made the old preference too weak to matter).
+- No wheel exceeds 127 PWM while turning; a real turn drops the drive level to
+  the movement floor (after Regulated Pure Pursuit). v1.9.22 reached 136-139 on
+  the outer wheel in sharp turns. The arc planner's turn model uses the capped
+  split, so it does not plan arcs the wheels cannot follow.
+- Steering slew 75 -> 45 deg/s, drive-level ramp 120 -> 50 PWM/s, escape pivot
+  boost 18 -> 12.
+
+Honest limit: the Uno firmware will not drive below 105 PWM
+(`MIN_EFFECTIVE_PWM`), so software cannot make it crawl slower than that
+without reflashing. What changed is how often and where it runs faster.
+
+**Measured in a closed-loop simulation** (the real control loop, a simulated
+LD19 sweep with mixed pixels, Uno firmware floor/ramp/lease, and chassis lag;
+three rooms, two starts, 60 s each):
+
+| version | closest approach | cells covered | mean PWM | max wheel PWM |
+|---|---|---|---|---|
+| v1.9.21 | 0.12 m | 42.7 | 106.9 | 136 |
+| v1.9.22 | 0.04 m | 30.3 | 104.1 | 136 |
+| v1.9.23 | 0.10 m | 38.7 | 106.2 | 127 |
+
+The simulation has no wheel slip, perfect odometry and clean geometry, and no
+version made contact in it, so it understates real collisions; treat it as a
+comparison, not a prediction. Desktop tests (475 pass). **Nothing here has run
+on the robot.**
+
 ### Phone dashboard (v1.9.22)
 
 `http://<pi-address>:8080/` now has three tabs, with the controls beside every

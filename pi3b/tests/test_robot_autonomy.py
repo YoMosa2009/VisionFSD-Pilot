@@ -17,6 +17,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from robot_autonomy import (
     CORRIDOR_HALF_WIDTH_M,
+    EFFECTIVE_TURN_SPLIT_PWM,
     FRONT_OVERHANG_M,
     MAX_PWM,
     MAX_PWM_RATE_PER_S,
@@ -529,7 +530,10 @@ class AutonomousPolicyTests(unittest.TestCase):
         self.assertGreater(policy.left_pwm, 0)
         self.assertGreater(policy.right_pwm, 0)
         self.assertGreaterEqual(min(policy.left_pwm, policy.right_pwm), MIN_MOVE_PWM)
-        self.assertGreaterEqual(abs(policy.left_pwm - policy.right_pwm), 24)
+        # The outer wheel is capped while turning, which bounds the split.
+        self.assertGreaterEqual(
+            abs(policy.left_pwm - policy.right_pwm), EFFECTIVE_TURN_SPLIT_PWM
+        )
 
     def test_multi_object_profile_cannot_immediately_flip_turn_direction(self) -> None:
         policy = AutonomousPolicy(0.0, 118)

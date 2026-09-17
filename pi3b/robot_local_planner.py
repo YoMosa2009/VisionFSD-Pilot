@@ -141,6 +141,17 @@ class PlannerLimits:
     # samples still overlap and nothing can slip between them. Eight was
     # simply paying for resolution the collision check does not need.
     horizon_steps: int = 6
+    # Look-ahead past the end of each arc. The arc itself only reaches about
+    # 1.6 m; what the robot will face when it gets there decides whether that
+    # arc leads anywhere. Open space is measured down a corridor this wide,
+    # out to this distance.
+    openness_half_width_m: float = 0.26
+    openness_range_m: float = 4.0
+    # Cruise is only earned by open space: the faster drive level scores
+    # nothing unless at least this much clear corridor lies ahead of the arc
+    # and the arc is close to straight.
+    cruise_open_depth_m: float = 3.0
+    cruise_max_steer_deg: float = 10.0
     # Degrees per second of yaw at a full-scale steering command.
     #
     # This is not a free parameter: it follows from how the chassis actually
@@ -407,6 +418,8 @@ class ArcBank:
         self.fastest_mps = max(
             (mps for _pwm, mps in self.speed_options), default=1.0
         )
+        self.slowest_mps = min((mps for _pwm, mps in self.speed_options), default=1.0)
+        self.speed_span_mps = max(self.fastest_mps - self.slowest_mps, 1e-6)
         self.horizon_m = float(
             np.clip(
                 max(
@@ -547,6 +560,48 @@ def route_progress(
     )
 
 
+def arc_openness(
+    bank: "ArcBank",
+    obstacle_x: np.ndarray,
+    obstacle_y: np.ndarray,
+    any_blocked: np.ndarray,
+    first_blocked: np.ndarray,
+) -> np.ndarray:
+    """Clear distance ahead of each arc's usable end, along its end heading.
+
+    This is what gives the local planner a horizon beyond its own arcs. Two
+    arcs can have identical clearance for their 1.6 m, while one ends pointing
+    down an open corridor and the other ends squarely facing a wall a metre
+    further on. Scoring only the arc prefers them equally; scoring what lies
+    beyond prefers the one that actually leads somewhere, which is the
+    difference between reacting to the next obstacle and heading for the
+    opening.
+    """
+    limits = bank.limits
+    count = len(bank.candidates)
+    depth = np.full(count, limits.openness_range_m, dtype=np.float32)
+    if count == 0 or obstacle_x.size == 0:
+        return depth
+    last = np.where(any_blocked, first_blocked - 1, bank.steps - 1)
+    rows = np.arange(count)
+    index = np.maximum(last, 0)
+    end_x = np.where(last >= 0, bank.arc_x[rows, index], 0.0)
+    end_y = np.where(last >= 0, bank.arc_y[rows, index], 0.0)
+    heading = np.where(last >= 0, bank.arc_heading[rows, index], 0.0)
+    ux = np.sin(heading)[:, None]
+    uy = np.cos(heading)[:, None]
+    rel_x = obstacle_x[None, :] - end_x[:, None]
+    rel_y = obstacle_y[None, :] - end_y[:, None]
+    along = rel_x * ux + rel_y * uy
+    lateral = np.abs(rel_x * uy - rel_y * ux)
+    in_corridor = (along > 0.0) & (lateral <= limits.openness_half_width_m)
+    nearest = np.where(in_corridor, along, np.inf).min(axis=1)
+    depth = np.minimum(depth, nearest).astype(np.float32)
+    # An arc that is blocked outright leads nowhere, whatever it faces.
+    depth[last < 0] = 0.0
+    return depth
+
+
 def evaluate_arcs(
     obstacle_x: np.ndarray,
     obstacle_y: np.ndarray,
@@ -577,7 +632,11 @@ def evaluate_arcs(
     if not bank.candidates:
         return best
     if reduce:
-        obstacle_x, obstacle_y = reduce_obstacles(obstacle_x, obstacle_y)
+        # Out to 5 m rather than 3.2 so the look-ahead past each arc can see
+        # the far side of a room, not only what the arc itself might touch.
+        obstacle_x, obstacle_y = reduce_obstacles(
+            obstacle_x, obstacle_y, max_range_m=5.0
+        )
     limits = bank.limits
     distance = bank.distance
     if obstacle_x.size:
@@ -616,6 +675,7 @@ def evaluate_arcs(
         any_blocked[:, None], steps_index < first_blocked[:, None], True
     )
     worst_margin = np.where(usable, margins, np.inf).min(axis=1)
+    openness = arc_openness(bank, obstacle_x, obstacle_y, any_blocked, first_blocked)
     # Progress is distance made good along the current heading, not arc
     # length. Scoring arc length rewards the arc that curls tightly away from
     # everything - it stays "clear" for its whole length while going nowhere -
@@ -690,6 +750,24 @@ def evaluate_arcs(
         else:
             room = min(float(progress[index]), 2.0) * 0.80
         margin_term = min(max(clearance_m, 0.0), 0.60) * 0.55
+        # Where the arc leads: clear corridor ahead of its end, in the
+        # direction the chassis will then face.
+        depth = float(openness[index])
+        ahead_term = min(depth, limits.openness_range_m) / limits.openness_range_m * (
+            # A global route already looks past this horizon, across the whole
+            # map, and knows which way to turn at a junction; a straight
+            # corridor ahead must not outvote it. Without a route this is the
+            # planner's only view of where an arc leads.
+            0.0 if following_route else 1.20
+        )
+        # 0 for the slowest drive level, 1 for the fastest. Ranked across the
+        # levels rather than as a fraction of top speed: 105 and 112 PWM are
+        # only 6% apart, which made the preference too weak to matter.
+        speed_rank = (speed_mps - bank.slowest_mps) / bank.speed_span_mps
+        open_enough = (
+            depth >= limits.cruise_open_depth_m
+            and abs(steering_deg) <= limits.cruise_max_steer_deg
+        )
         score = (
             room
             + margin_term
@@ -697,7 +775,16 @@ def evaluate_arcs(
             + smoothness
             + straightness
             - obstruction
-            + (speed_mps / bank.fastest_mps) * 0.45
+            + ahead_term
+            # Speed is earned by open space, not preferred by default. Outside
+            # it, the slower level is actively favoured.
+            + (
+                # Small: enough to pick the faster level on the same arc, not
+                # enough to pull the steering choice toward straight.
+                speed_rank * 0.20
+                if open_enough
+                else -speed_rank * 0.60
+            )
         )
         if score > best_score:
             best_score = score

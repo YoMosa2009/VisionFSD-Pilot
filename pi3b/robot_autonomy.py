@@ -119,6 +119,12 @@ MAX_GENTLE_HEADING_DEG = 40.0
 # freshly charged pack and lowering --min-move-pwm, which buys split from the
 # slow side instead of the fast side.
 MAX_TURN_SPLIT_PWM = 34
+# No wheel exceeds this while turning. See _differential().
+TURN_OUTER_CAP_PWM = 127
+# The wheel split actually available once the outer wheel is capped. The arc
+# planner's turn model must use this, not MAX_TURN_SPLIT_PWM, or it plans arcs
+# tighter than the wheels can now follow.
+EFFECTIVE_TURN_SPLIT_PWM = min(MAX_TURN_SPLIT_PWM, TURN_OUTER_CAP_PWM - MIN_MOVE_PWM)
 # Chassis yaw rate at a full-scale wheel split, matching the turn model in
 # robot_slam_lite.integrate_motion(). The arc planner derives its own turn
 # model from this so the two cannot drift apart: a planner that believes it
@@ -143,7 +149,7 @@ ESCAPE_SIDE_HARD_CLEARANCE_M = 0.16
 # more resistance than rolling straight. min_move_pwm is calibrated for the
 # straight case, so pivots need a little more to actually rotate on carpet
 # instead of buzzing in place until the turn times out.
-ESCAPE_PIVOT_BOOST_PWM = 18
+ESCAPE_PIVOT_BOOST_PWM = 12
 # Start choosing a broad alternate corridor before the robot reaches the
 # close-range recovery zone. This creates clearance through motion rather than
 # waiting until the only safe action is an abrupt stop.
@@ -231,8 +237,11 @@ YIELD_COOLDOWN_S = 2.5
 # exactly when the scene was busiest. These are the previous per-tick steps
 # times the nominal 30 Hz loop, so nominal behaviour is unchanged and a slow
 # tick now catches up instead of falling behind.
-MAX_STEERING_RATE_DPS = 75.0
-MAX_PWM_RATE_PER_S = 120.0
+# Halved after v1.9.22 testing reported fast, abrupt driving. These now set a
+# deliberately calm response: steering takes almost a second to reach full
+# lock, and drive level above the movement floor rises gradually.
+MAX_STEERING_RATE_DPS = 45.0
+MAX_PWM_RATE_PER_S = 50.0
 # Target control period. The loop sleeps the remainder of this rather than a
 # fixed amount on top of however long the work took.
 CONTROL_PERIOD_S = 0.025
@@ -1174,7 +1183,7 @@ class AutonomousPolicy:
                 top_speed_mps=top_speed_mps,
                 footprint=ROBOT_FOOTPRINT,
                 yaw_rate_dps_at_full_steer=(
-                    MAX_TURN_SPLIT_PWM
+                    EFFECTIVE_TURN_SPLIT_PWM
                     / MAX_PWM
                     * CHASSIS_TURN_RATE_DPS_AT_FULL_SPLIT
                 ),
@@ -2037,7 +2046,25 @@ class AutonomousPolicy:
         # The old eight-PWM split produced a turn radius too large to avoid an
         # obstacle detected one metre ahead.  Add only the headroom needed for
         # steering, keeping the inside wheel above its measured loaded floor.
-        outer = min(MAX_PWM, max(speed, self.min_move_pwm + requested_split))
+        # Curvature regulation, after Regulated Pure Pursuit: slow down in turns
+        # rather than let the outer wheel run away. The inner wheel cannot go
+        # below the movement floor, so extra split could only ever come from
+        # speeding the outer wheel up - up to 139 PWM at full lock, which is
+        # what a sharp turn felt like on the robot. Cap the outer wheel and
+        # accept a wider radius; sharper changes of direction belong to the
+        # gap-seeking pivot, done at crawl speed.
+        requested_split = min(
+            requested_split, max(0, TURN_OUTER_CAP_PWM - self.min_move_pwm)
+        )
+        if turn_fraction > 0.25:
+            # Only a real turn drops to crawl. Dropping on every small
+            # correction would flick the drive level up and down as steering
+            # hovered near straight - its own kind of pulsing.
+            speed = self.min_move_pwm
+        outer = min(
+            TURN_OUTER_CAP_PWM if requested_split > 0 else MAX_PWM,
+            max(speed, self.min_move_pwm + requested_split),
+        )
         inner = max(self.min_move_pwm, outer - requested_split)
         if heading < 0.0:
             left, right = inner, outer
@@ -3810,9 +3837,10 @@ def main() -> int:
             last_control_at = control_now
             # One conversion of the revolution, shared by the motion tracker
             # and the local planner's obstacle memory.
-            # Mixed-pixel-filtered returns for planning and motion evidence.
-            # Near-field returns are always retained, see robot_scan.
-            scan_angles, scan_ranges = scan.kept()
+            # Every return, for planning, memory, tracking and motion evidence.
+            # v1.9.22 planned on edge-filtered returns and the filter discarded
+            # most of any wall seen at a glancing angle; see robot_scan.
+            scan_angles, scan_ranges = scan.angles_deg, scan.ranges_m
             # Whole-scan motion evidence. This runs before the decision so a
             # displacement is acted on in the same tick it is observed.
             scan_result = scan_motion.update(

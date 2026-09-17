@@ -168,7 +168,7 @@ class PivotAuthorityTests(unittest.TestCase):
         control ticks rather than in one step.
         """
         policy = AutonomousPolicy(0.0, 118, MIN_MOVE_PWM)
-        for _ in range(12):
+        for _ in range(30):
             policy._pivot_crawl("L")
         self.assertEqual(
             policy.left_pwm, -(MIN_MOVE_PWM + ESCAPE_PIVOT_BOOST_PWM)
@@ -176,7 +176,7 @@ class PivotAuthorityTests(unittest.TestCase):
         self.assertEqual(policy.right_pwm, 0)
 
         centre = AutonomousPolicy(0.0, 118, MIN_MOVE_PWM)
-        for _ in range(12):
+        for _ in range(30):
             centre._center_pivot_crawl("R")
         self.assertEqual(
             centre.left_pwm, MIN_MOVE_PWM + ESCAPE_PIVOT_BOOST_PWM

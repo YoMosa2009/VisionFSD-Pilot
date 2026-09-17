@@ -39,7 +39,7 @@ from robot_local_planner import (
     evaluate_arcs,
     route_progress,
 )
-from robot_scan import NEAR_KEEP_M, frame_from_points, mixed_pixel_keep_mask
+from robot_scan import frame_from_points, mixed_pixel_keep_mask
 from robot_slam_lite import LidarSlamLite
 from robot_tracking import (
     MovingObjectTracker,
@@ -115,52 +115,71 @@ class LD19IngestionTests(unittest.TestCase):
 
 
 class MixedPixelFilterTests(unittest.TestCase):
-    """Port of LDROBOT's Tofbf NEAR_FILTER for the LD06/LD19."""
+    """The artefact flag is display-only and must never hide a real wall."""
 
-    def _scan(self, surface_mm=2000.0, count=450):
-        angles = np.linspace(0.0, 360.0, count, endpoint=False).astype(np.float32)
-        ranges = np.full(count, surface_mm, dtype=np.float32)
-        power = np.full(count, 200.0, dtype=np.float32)
-        return angles, ranges, power
+    def _glancing_wall(self, offset_m: float = 0.5):
+        angles = np.arange(0.0, 360.0, 0.8, dtype=np.float32)
+        ranges = []
+        power = []
+        for angle in angles:
+            dx = math.sin(math.radians(float(angle)))
+            if dx < -1e-3:
+                distance = offset_m / -dx
+                incidence = abs(dx)
+            else:
+                distance = 12.5
+                incidence = 1.0
+            ranges.append(distance * 1000.0)
+            power.append(220.0 * incidence ** 0.5 - 6.0 * min(distance, 12.0))
+        return (
+            angles,
+            np.array(ranges, dtype=np.float32),
+            np.clip(np.array(power, dtype=np.float32), 0, 255),
+        )
+
+    def test_a_wall_seen_at_a_glancing_angle_is_kept(self) -> None:
+        """The v1.9.22 regression. A range-jump filter flagged 68-95% of this
+        wall at 1-2 m and all of it at 2-3 m, so the planner could not see
+        walls the robot was driving alongside until they were 0.6 m away."""
+        angles, ranges, power = self._glancing_wall()
+        keep = mixed_pixel_keep_mask(angles, ranges, power, 3600.0)
+        wall = (ranges > 1000.0) & (ranges < 3000.0)
+        self.assertGreater(int(wall.sum()), 10)
+        self.assertTrue(np.all(keep[wall]))
 
     def test_a_continuous_surface_is_kept(self) -> None:
-        angles, ranges, power = self._scan()
-        keep = mixed_pixel_keep_mask(angles, ranges, power, 3600.0)
-        self.assertTrue(np.all(keep))
+        angles = np.linspace(0.0, 360.0, 450, endpoint=False).astype(np.float32)
+        ranges = np.full(450, 2000.0, dtype=np.float32)
+        power = np.full(450, 150.0, dtype=np.float32)
+        self.assertTrue(np.all(mixed_pixel_keep_mask(angles, ranges, power, 3600.0)))
 
-    def test_a_lone_weak_return_between_surfaces_is_removed(self) -> None:
-        """The classic mixed pixel: one return floating between an edge and
-        the background, with the weak signal a split beam produces."""
-        angles, ranges, power = self._scan()
-        ranges[100] = 1200.0
-        power[100] = 90.0
+    def test_a_ghost_between_two_surfaces_is_flagged(self) -> None:
+        angles = np.arange(0.0, 360.0, 0.8, dtype=np.float32)
+        ranges = np.full(angles.size, 1000.0, dtype=np.float32)
+        power = np.full(angles.size, 210.0, dtype=np.float32)
+        door = (angles > 20) & (angles < 45)
+        ranges[door] = 3500.0
+        ghost = int(np.argmax(angles > 20))
+        ranges[ghost] = 2100.0
+        power[ghost] = 80.0
         keep = mixed_pixel_keep_mask(angles, ranges, power, 3600.0)
-        self.assertFalse(keep[100])
-        self.assertTrue(keep[99] and keep[101])
+        self.assertFalse(keep[ghost])
 
-    def test_a_lone_strong_return_is_a_real_thin_object(self) -> None:
-        angles, ranges, power = self._scan()
-        ranges[100] = 1200.0
-        power[100] = 235.0
-        keep = mixed_pixel_keep_mask(angles, ranges, power, 3600.0)
-        self.assertTrue(keep[100])
+    def test_a_strong_isolated_return_is_a_real_thin_object(self) -> None:
+        angles = np.arange(0.0, 360.0, 0.8, dtype=np.float32)
+        ranges = np.full(angles.size, 4000.0, dtype=np.float32)
+        power = np.full(angles.size, 200.0, dtype=np.float32)
+        ranges[10] = 1500.0
+        power[10] = 235.0
+        self.assertTrue(mixed_pixel_keep_mask(angles, ranges, power, 3600.0)[10])
 
-    def test_returns_beyond_five_metres_are_not_filtered(self) -> None:
-        angles, ranges, power = self._scan(surface_mm=8000.0)
-        ranges[100] = 6500.0
-        power[100] = 40.0
-        keep = mixed_pixel_keep_mask(angles, ranges, power, 3600.0)
-        self.assertTrue(keep[100])
-
-    def test_near_field_returns_always_survive_the_frame(self) -> None:
-        """The filter can drop a real dark thin object. Close to the chassis a
-        missed obstacle costs a collision, so near returns are always kept."""
-        now = 1.0
-        points = [(i, LidarPoint(float(a), 2000, 200, now)) for i, a in enumerate(np.arange(0, 360, 0.8))]
-        points[50] = (50, LidarPoint(40.0, int(NEAR_KEEP_M * 1000) - 100, 40, now))
-        frame = frame_from_points(points, 1, 3600.0)
-        index = int(np.argmin(np.abs(frame.ranges_m - (NEAR_KEEP_M - 0.1))))
-        self.assertTrue(frame.keep[index])
+    def test_planning_uses_every_return_not_the_flag(self) -> None:
+        """The flag can mark a real dim chair leg. It must never reach the
+        planner."""
+        source = pathlib.Path(__file__).resolve().parents[1] / "robot_autonomy.py"
+        text = source.read_text(encoding="utf-8")
+        self.assertNotIn("scan_angles, scan_ranges = scan.kept()", text)
+        self.assertIn("scan_angles, scan_ranges = scan.angles_deg, scan.ranges_m", text)
 
     def test_frame_arrays_are_consistent(self) -> None:
         now = 2.0
@@ -169,7 +188,7 @@ class MixedPixelFilterTests(unittest.TestCase):
         self.assertEqual(frame.seq, 7)
         self.assertEqual(frame.stamp, now)
         self.assertEqual(frame.angles_deg.size, frame.ranges_m.size)
-        x, y = frame.cartesian()
+        x, y = frame.cartesian(kept_only=False)
         self.assertAlmostEqual(float(np.max(np.hypot(x, y))), 1.5, places=3)
 
     def test_empty_input_gives_an_empty_frame(self) -> None:
