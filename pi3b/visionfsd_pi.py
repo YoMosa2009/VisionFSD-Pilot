@@ -390,8 +390,15 @@ class LatestCamera:
 
     def __init__(self, source: str, width: int, height: int, fps: int) -> None:
         numeric_source: int | str = int(source) if source.isdigit() else source
-        self._cap = cv2.VideoCapture(numeric_source, cv2.CAP_V4L2 if isinstance(numeric_source, int) else cv2.CAP_ANY)
+        v4l_source = (
+            isinstance(numeric_source, int)
+            or source.startswith("/dev/video")
+            or source.startswith("/dev/v4l/")
+        )
+        backend = cv2.CAP_V4L2 if v4l_source else cv2.CAP_ANY
+        self._cap = cv2.VideoCapture(numeric_source, backend)
         if not self._cap.isOpened():
+            self._cap.release()
             raise RuntimeError(f"Could not open camera/source: {source}")
         self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
