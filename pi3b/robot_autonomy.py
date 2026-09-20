@@ -3454,6 +3454,15 @@ def build_telemetry(
             "lidar": bool(clearance.fresh),
             "camera": bool(camera_ready),
             "imu": imu_state,
+            # Diagnostics only: use the sampler snapshot, never probe USB here.
+            # Bound failure text so repeated transport errors cannot grow telemetry.
+            "imu_error": (imu.error or "")[:512],
+            "imu_hold": imu.calibration_hold[:80],
+            "imu_calibration": round(imu.calibration_progress * 100),
+            "imu_age_s": (
+                round(max(0.0, now - imu.updated_at), 2)
+                if imu.updated_at > 0.0 else None
+            ),
             "uno": bool(differential_ready and now - status.received_at <= 1.5),
             "lock": policy.watchdog.locked_sign,
             "stuck": policy.stuck_phase,

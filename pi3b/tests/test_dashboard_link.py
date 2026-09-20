@@ -283,6 +283,51 @@ class TelemetryBuilderTests(unittest.TestCase):
         # A whole revolution at centimetre precision stays a few kilobytes.
         self.assertLess(len(json.dumps(full)), 30000)
 
+    def test_imu_failure_reaches_both_telemetry_levels_and_clears(self) -> None:
+        policy, scan, mapper, status, clearance, now = self._inputs()
+        error = 'LSM6DS3 not found (0x6A: open failed; 0x6B: WHO_AM_I 0x00)'
+        states = (
+            (IMUState(error=error), "OFF", error),
+            (IMUState(connected=True, calibrated=True, fresh=True), "LIVE", ""),
+            (IMUState(calibrated=True, detected=True, error="USB read timed out"),
+             "OFF", "USB read timed out"),
+        )
+        for imu, expected, detail in states:
+            with self.subTest(expected=expected, error=detail):
+                light, full = build_telemetry(
+                    policy, scan, ExplorationState(), mapper.state(), imu, status,
+                    clearance, True, True, mapper, now, True,
+                )
+                for payload in (light, full):
+                    self.assertEqual(payload["health"]["imu"], expected)
+                    self.assertEqual(payload["health"]["imu_error"], detail)
+
+    def test_imu_calibration_and_sample_age_are_visible(self) -> None:
+        policy, scan, mapper, status, clearance, now = self._inputs()
+        imu = IMUState(connected=True, calibration_progress=.25,
+                       calibration_hold="USB WAIT", updated_at=now - .5)
+        light, _ = build_telemetry(
+            policy, scan, ExplorationState(), mapper.state(), imu, status,
+            clearance, True, True, mapper, now, False,
+        )
+        health = light["health"]
+        self.assertEqual(health["imu"], "CAL")
+        self.assertEqual(health["imu_calibration"], 25)
+        self.assertEqual(health["imu_hold"], "USB WAIT")
+        self.assertAlmostEqual(health["imu_age_s"], .5)
+
+    def test_imu_diagnostics_are_bounded_and_missing_sample_has_no_age(self) -> None:
+        policy, scan, mapper, status, clearance, now = self._inputs()
+        light, _ = build_telemetry(
+            policy, scan, ExplorationState(), mapper.state(),
+            IMUState(error="x" * 10000, calibration_hold="y" * 10000), status,
+            clearance, True, True, mapper, now, False,
+        )
+        self.assertEqual(len(light["health"]["imu_error"]), 512)
+        self.assertEqual(len(light["health"]["imu_hold"]), 80)
+        self.assertIsNone(light["health"]["imu_age_s"])
+        self.assertLess(len(json.dumps(light)), 2500)
+
     def test_map_png_decodes_at_half_resolution(self) -> None:
         _policy, _scan, mapper, *_rest = self._inputs()
         png = encode_map_png(mapper)

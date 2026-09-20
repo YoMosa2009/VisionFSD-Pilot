@@ -1,5 +1,25 @@
 # VisionFSD Pi 3B runtime
 
+## v1.9.24 - Phone IMU diagnostics
+
+The phone dashboard now shows the IMU error, calibration progress and hold
+reason, and the age of the latest sample. Both light and full telemetry carry
+these fields, so switching to the camera view retains the diagnosis. Error
+text is limited to 512 characters, displayed as text, and cleared when the
+sampler recovers. No USB reads or sensor setup run in the telemetry path.
+The LiDAR legend now correctly says suspected edge artefacts remain in safety
+planning rather than claiming they were removed.
+
+This addresses the missing diagnostic visibility in handoff section 5.15;
+it does not repair an unknown adapter, permissions, dependency or wiring fault.
+OFF means currently disconnected or disabled, including a lost connection
+after earlier successful detection. It does not prove the sensor never opened.
+Motor control, clearance checks, scan matching and non-IMU operation are
+unchanged. Desktop checks only; no robot or Pi timing verification.
+
+See [the handoff review](HANDOFF_REVIEW.md) for the source audit, corrections,
+research and recommended next navigation work.
+
 This is a **separate** Raspberry Pi 3B runtime derived from the design of the
 desktop VisionFSD Pilot. It is deliberately not a direct port.
 

@@ -211,10 +211,16 @@
     </div>
 
     <div class="card">
+      <h2>IMU</h2>
+      <div id="imu-status" class="muted">waiting for telemetry</div>
+      <div id="imu-diagnostic" class="hint" style="overflow-wrap:anywhere;white-space:pre-wrap"></div>
+    </div>
+
+    <div class="card">
       <h2>LEGEND</h2>
       <div class="legend">
         <span class="swatch" style="background:linear-gradient(90deg,#ffb020,#37e1ff)"></span><span>LiDAR return (colour = signal strength)</span>
-        <span class="swatch" style="background:#ff4fa8"></span><span>Removed as an edge artefact</span>
+        <span class="swatch" style="background:#ff4fa8"></span><span>Possible edge artefact (still used for safety)</span>
         <span class="swatch" style="background:#2c7f88"></span><span>Remembered obstacle</span>
         <span class="swatch" style="background:var(--route)"></span><span>Planned route to goal</span>
         <span class="swatch" style="background:var(--live)"></span><span>Arc the robot is about to drive</span>
@@ -657,6 +663,28 @@
     bar.style.background = v >= 0 ? "var(--accent)" : "var(--warn)";
     text.textContent = String(value || 0);
   }
+  function updateImuHealth(health) {
+    var state = health.imu || "UNKNOWN";
+    var status = state;
+    if (state === "CAL" && typeof health.imu_calibration === "number") {
+      status += " " + health.imu_calibration + "%";
+    }
+    if (typeof health.imu_age_s === "number") {
+      status += " · last sample " + health.imu_age_s.toFixed(2) + " s ago";
+    }
+    var detail = health.imu_error || "";
+    if (!detail && state === "CAL") {
+      detail = "Calibration: " + (health.imu_hold || "waiting for still samples");
+    } else if (!detail && state === "STALE") {
+      detail = "No fresh IMU samples; navigation is using non-IMU mode.";
+    } else if (!detail && state === "OFF") {
+      detail = "IMU unavailable or disabled; no error reported.";
+    }
+    $("imu-status").textContent = status;
+    // USB exception text is data, never HTML. Also clear old errors on recovery.
+    $("imu-diagnostic").textContent = detail;
+  }
+
   function updatePanels() {
     var t = telemetry;
     if (!t) { return; }
@@ -668,6 +696,7 @@
     $("cam-intent").style.color = intentColour(t.intent);
     $("cam-detail").textContent = t.detail || "";
     var hl = t.health || {};
+    updateImuHealth(hl);
     var chips = [
       chip("LD19", hl.lidar ? "ok" : "bad"),
       chip("CAM", hl.camera ? "ok" : "warn"),
