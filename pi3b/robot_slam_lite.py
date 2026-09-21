@@ -81,6 +81,9 @@ class LidarSlamLite:
         self.cells = cells
         self.metres = metres
         self.grid = np.zeros((cells, cells), dtype=np.uint8)
+        # Retain sub-unit occupancy between scans. Flooring the decay every
+        # revolution otherwise erases weak walls at the scan rate, not in seconds.
+        self._decay_remainder = np.zeros((cells, cells), dtype=np.float32)
         self.observed = np.zeros((cells, cells), dtype=np.uint8)
         self.visits = np.zeros((cells, cells), dtype=np.uint16)
         self.x = metres / 2.0
@@ -290,6 +293,9 @@ class LidarSlamLite:
         shift_row = centre - robot_row
         shift_col = centre - robot_col
         self.grid = self._rolled_and_cleared(self.grid, shift_row, shift_col)
+        self._decay_remainder = self._rolled_and_cleared(
+            self._decay_remainder, shift_row, shift_col
+        )
         self.observed = self._rolled_and_cleared(self.observed, shift_row, shift_col)
         self.visits = self._rolled_and_cleared(self.visits, shift_row, shift_col)
         if self._latest_hits.size:
@@ -505,9 +511,7 @@ class LidarSlamLite:
         point_list = list(points)
         scale = self.cells / self.metres
         keep = self._decay_factor(now)
-        accumulator = (
-            self.grid.astype(np.float32) * keep
-        ).astype(np.uint16)
+        accumulator = (self.grid.astype(np.float32) + self._decay_remainder) * keep
         if point_list:
             distances = np.fromiter(
                 (float(point.distance_mm) / 1000.0 for _index, point in point_list),
@@ -560,8 +564,8 @@ class LidarSlamLite:
             self.observed[endpoint_mask > 0] = 255
             free_mask = (visible > 0) & (endpoint_mask == 0)
             accumulator[free_mask] = np.maximum(
-                accumulator[free_mask].astype(np.int16) - 4, 0
-            ).astype(np.uint16)
+                accumulator[free_mask] - 4.0, 0.0
+            )
             # Multiple high-resolution rays can land in one occupancy cell.
             # More samples preserve shape, not multiple independent confirmations.
             accumulator[endpoint_mask > 0] += 12
@@ -581,7 +585,9 @@ class LidarSlamLite:
             ).astype(np.uint16)
         else:
             self._latest_hits = np.empty((0, 2), dtype=np.int32)
-        self.grid = np.minimum(accumulator, 255).astype(np.uint8)
+        np.minimum(accumulator, 255.0, out=accumulator)
+        self.grid = accumulator.astype(np.uint8)
+        self._decay_remainder = accumulator - self.grid
         self._map_updates += 1
 
     @classmethod
@@ -715,6 +721,8 @@ class LidarSlamLite:
         old map forward would silently corrupt every later plan.
         """
         self.grid[:] = 0
+        self._decay_remainder[:] = 0
+        self._last_decay_at = None
         self.observed[:] = 0
         self.visits[:] = 0
         self.x = self.metres / 2.0

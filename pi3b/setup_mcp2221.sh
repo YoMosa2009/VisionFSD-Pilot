@@ -1,43 +1,61 @@
 #!/usr/bin/env bash
-# One-time persistent Linux setup for the MCP2221A USB-I2C adapter.
+# Persistent setup plus bounded, noninteractive repair before robot startup.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MARKER="$ROOT/.mcp2221-system-v1"
 RULE_FILE="/etc/udev/rules.d/99-visionfsd-mcp2221.rules"
 BLACKLIST_FILE="/etc/modprobe.d/visionfsd-mcp2221.conf"
-
-if [[ -f "$MARKER" ]]; then
-  echo "MCP2221 system setup already complete."
-  exit 0
-fi
-
-packages_missing=false
-for package in libusb-1.0-0-dev libudev-dev; do
-  if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null \
-    | grep -q '^install ok installed$'; then
-    packages_missing=true
+REPAIR_ONLY=false
+SUDO=(sudo)
+if [[ "${1:-}" == "--repair" ]]; then
+  REPAIR_ONLY=true
+  SUDO=(sudo -n)
+  # No password prompt, apt/network work or initramfs rebuild during boot.
+  if ! "${SUDO[@]}" true; then
+    echo "MCP2221 repair needs noninteractive sudo; run setup_mcp2221.sh manually." >&2
+    exit 1
   fi
-done
-if [[ "$packages_missing" == true ]]; then
-  sudo apt-get update
-  sudo apt-get install -y --no-install-recommends libusb-1.0-0-dev libudev-dev
+elif [[ $# -ne 0 ]]; then
+  echo "Usage: setup_mcp2221.sh [--repair]" >&2
+  exit 2
 fi
 
-# Blinka uses hidraw directly.  Give the desktop robot user persistent access
-# and prevent Linux's optional native driver from claiming the same USB HID
-# interface first.  Both files are harmless on kernels without hid_mcp2221.
-printf '%s\n' \
-  'SUBSYSTEMS=="usb", ACTION=="add", ATTRS{idVendor}=="04d8", ATTRS{idProduct}=="00dd", MODE="0666"' \
-  | sudo tee "$RULE_FILE" >/dev/null
-printf '%s\n' 'blacklist hid_mcp2221' \
-  | sudo tee "$BLACKLIST_FILE" >/dev/null
+if [[ "$REPAIR_ONLY" == false ]]; then
+  packages_missing=false
+  for package in libusb-1.0-0-dev libudev-dev; do
+    if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null \
+      | grep -q '^install ok installed$'; then
+      packages_missing=true
+    fi
+  done
+  if [[ "$packages_missing" == true ]]; then
+    "${SUDO[@]}" apt-get update
+    "${SUDO[@]}" apt-get install -y --no-install-recommends libusb-1.0-0-dev libudev-dev
+  fi
+fi
 
+# A marker records an earlier run; it cannot prove current rules or driver
+# state. Always reconcile them, including hidraw nodes that already exist.
+rules='SUBSYSTEMS=="usb", ACTION=="add", ATTRS{idVendor}=="04d8", ATTRS{idProduct}=="00dd", MODE="0666"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="04d8", ATTRS{idProduct}=="00dd", MODE="0666"'
+if [[ ! -f "$RULE_FILE" ]] || [[ "$(cat "$RULE_FILE")" != "$rules" ]]; then
+  printf '%s\n' "$rules" | "${SUDO[@]}" tee "$RULE_FILE" >/dev/null
+fi
+blacklist_changed=false
+if [[ ! -f "$BLACKLIST_FILE" ]] || ! grep -qx 'blacklist hid_mcp2221' "$BLACKLIST_FILE"; then
+  printf '%s\n' 'blacklist hid_mcp2221' | "${SUDO[@]}" tee "$BLACKLIST_FILE" >/dev/null
+  blacklist_changed=true
+fi
 if lsmod | grep -q '^hid_mcp2221 '; then
-  sudo modprobe -r hid_mcp2221 || true
+  "${SUDO[@]}" modprobe -r hid_mcp2221
 fi
-sudo udevadm control --reload-rules
-sudo udevadm trigger --subsystem-match=usb
+"${SUDO[@]}" udevadm control --reload-rules
+"${SUDO[@]}" udevadm trigger --action=add --subsystem-match=usb
+"${SUDO[@]}" udevadm trigger --action=add --subsystem-match=hidraw
+if [[ "$REPAIR_ONLY" == false && "$blacklist_changed" == true ]] && command -v update-initramfs >/dev/null 2>&1; then
+  "${SUDO[@]}" update-initramfs -u
+fi
 
 touch "$MARKER"
-echo "MCP2221 persistent USB setup complete; runtime auto-detection enabled."
+echo "MCP2221 rules checked and driver conflict cleared; sensor connection still requires a successful identity read."

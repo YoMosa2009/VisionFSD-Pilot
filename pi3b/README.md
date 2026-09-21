@@ -1,5 +1,60 @@
 # VisionFSD Pi 3B runtime
 
+## v1.9.25 - Correct opening bearings and recovery memory
+
+This release fixes reproducible causes of bad opening choices and excessive
+pivoting, without lowering the 105 PWM floor or relaxing clearance checks:
+
+- **Opening geometry:** a circular-bin offset was incorrectly halved when an
+  opening crossed zero degrees. A straight opening could be reported off to
+  the side; a pivot could claim alignment while still 45 degrees from the
+  real opening in the regression scenario. Apply the complete rotation offset.
+- **Non-IMU recovery:** rotate obstacle memory and the committed opening by
+  the same yaw step. Previously their command-based predictions disagreed.
+  Translate remembered obstacles during reverse too; the forward-only speed
+  governor had incorrectly been reused for that transformation. These remain
+  motion predictions, not encoder measurements.
+- **Map memory:** preserve fractional occupancy evidence between scans so
+  integer rounding cannot silently shorten the existing 12-second half-life.
+  A cell starting at 200 fell to 66 after 12 seconds at 10 Hz before this fix;
+  it now retains approximately 100 across tested scan rates. Fractional state
+  follows map shifts and resets, adding about 1.27 MiB at the default map size.
+  Live free-space clearing remains enabled. This is not a persistent house map.
+- **Bounded global guidance:** validate the committed goal before searching
+  alternatives, and share the 120 ms deadline across all searches. On timeout,
+  reuse a cached route only when the reachable grid is unchanged and goal
+  commitment remains valid. Expire guidance from map snapshots over 1.5 seconds
+  old, and withdraw it on planner exceptions; local sensor-gated planning remains.
+- **Command age:** shorten the Pi heartbeat's command lease from 500 to 250 ms.
+  The Uno retains its separate 350 ms serial timeout and ultrasonic stop.
+  Scheduling and USB latency still require measurement on the Pi; this is not
+  a guaranteed physical stop time.
+- **IMU setup recovery:** check actual udev rules and loaded driver state even
+  when an old setup marker exists. Refresh existing hidraw device permissions.
+  Before runtime starts, attempt a noninteractive repair under an eight-second
+  timeout (one-second forced-kill grace). It uses the existing MCP2221 permission
+  policy and removes the conflicting kernel driver with the operator's approval.
+  No package install or initramfs rebuild runs at boot. Denied sudo, a busy
+  driver or a timeout is logged and does not prevent non-IMU startup. Manual
+  setup refreshes initramfs when adding the blacklist and the utility is present.
+
+Regression coverage includes rotated openings, a closed-loop gap-pivot scenario,
+non-IMU obstacle transforms, actual grid decay at multiple rates, planner budgets,
+stale/blocked routes, and isolated setup/launcher failures. The closed-loop case
+models a specified pivot response; it is not a complete physical robot simulator.
+
+All changes are desktop-tested only. The Pi dashboard at the supplied address
+was unreachable during development, so IMU recovery, floor clearance, wheel slip
+and Pi CPU timing are unverified. No larger persistent map or arbitrary-home
+reliability is claimed. After OTA, the IMU error in the dashboard still determines
+whether driver/permission repair was sufficient or wiring/dependencies need work.
+
+
+Release verification: 493 Python tests completed in 98.838 seconds, OK with
+one existing skip. `compileall`, Pyflakes, all nine `bash -n` checks,
+dashboard JavaScript checks and `git diff --check` passed. No Pi hardware test
+or confirmed installation was performed.
+
 ## v1.9.24 - Phone IMU diagnostics
 
 The phone dashboard now shows the IMU error, calibration progress and hold

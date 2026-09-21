@@ -1022,7 +1022,9 @@ def find_gap(
             # to take a chord between.
             mouth_m = max(mouth_m, depth_m)
         if mouth_m >= needed * 2.0:
-            centre_bin = (start + index + end) / 2.0 + 0.5
+            # Undo the circular roll in full; halving start aimed a wrapped
+            # opening away from its measured mouth as the chassis pivoted.
+            centre_bin = start + (index + end) / 2.0 + 0.5
             bearing = (centre_bin * span_deg + 180.0) % 360.0 - 180.0
             if direction_lock and bearing * direction_lock < 0.0:
                 # Turning the other way is exactly what the lock exists to
@@ -1106,7 +1108,10 @@ class LocalPlanner:
         elapsed_s = min(0.25, max(0.0, elapsed_s))
         if elapsed_s <= 0.0:
             return
-        forward_m = self.commanded_speed_mps(left_pwm, right_pwm) * elapsed_s
+        # The speed governor deliberately clips reverse speed to zero, but
+        # robot-frame memory must translate in both directions during recovery.
+        forward_m = ((left_pwm + right_pwm) * 0.5 / 255.0
+                     * self.limits.top_speed_mps * elapsed_s)
         if measured_yaw_delta_deg is not None:
             yaw_deg = measured_yaw_delta_deg
         else:

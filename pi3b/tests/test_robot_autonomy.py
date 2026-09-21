@@ -608,7 +608,7 @@ class AutonomousPolicyTests(unittest.TestCase):
 
 
 class ArduinoLinkTests(unittest.TestCase):
-    def test_published_drive_survives_bounded_half_second_control_stall(self) -> None:
+    def test_published_drive_refreshes_briefly_then_stops_on_control_stall(self) -> None:
         link = object.__new__(ArduinoLink)
         link._drive_lock = threading.Lock()
         link._drive_command = "STOP"
@@ -621,8 +621,9 @@ class ArduinoLinkTests(unittest.TestCase):
             link.publish_drive(110, 112)
 
         self.assertEqual(link._drive_lease_until, 10.0 + UNO_CONTROL_LEASE_S)
-        self.assertEqual(link._heartbeat_command(10.45), "DRIVE 110 112")
-        self.assertEqual(link._heartbeat_command(10.51), "STOP")
+        self.assertEqual(link._heartbeat_command(10.20), "DRIVE 110 112")
+        self.assertEqual(link._heartbeat_command(10.26), "STOP")
+        self.assertIsNone(link._heartbeat_command(10.45))
 
     def test_drive_heartbeat_refreshes_lease_then_expires_to_stop(self) -> None:
         link = object.__new__(ArduinoLink)

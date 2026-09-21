@@ -72,10 +72,10 @@ WINDOW_TITLE = f"VisionFSD Pi Robot v{RUNTIME_VERSION} - standby"
 UNO_BAUD = 115200
 UNO_HEARTBEAT_S = 0.09
 IMU_CALIBRATION_DIAGNOSTIC_PERIOD_S = 1.0
-# Keep the last safe command across bounded USB-I2C/camera/planner stalls. The
-# heartbeat thread still expires it quickly if the main control loop actually
-# dies, and the Uno retains its independent 350 ms serial and ultrasonic stops.
-UNO_CONTROL_LEASE_S = 0.50
+# A heartbeat must not keep a stale planning decision alive for longer than
+# the Uno's 350 ms serial timeout. Expire at 250 ms plus heartbeat scheduling;
+# the firmware still independently stops on serial silence or ultrasonic veto.
+UNO_CONTROL_LEASE_S = 0.25
 # The L298N bridge on this shield drops roughly 2 V, so a 7.9 V pack puts at
 # most about 5.6 V across a motor at full duty.  Capping PWM at 105 meant 41%
 # of that, near 2.3 V: enough to spin a free wheel on blocks, not enough to
@@ -1349,9 +1349,6 @@ class AutonomousPolicy:
             self._imu_yaw_reference_deg = self.imu_yaw_deg
         else:
             self._imu_yaw_reference_deg = None
-        self.local_planner.track_motion(
-            self.left_pwm, self.right_pwm, elapsed, measured_yaw
-        )
         yaw_step = (
             measured_yaw
             if measured_yaw is not None
@@ -1359,6 +1356,11 @@ class AutonomousPolicy:
             / MAX_PWM
             * CHASSIS_TURN_RATE_DPS_AT_FULL_SPLIT
             * elapsed
+        )
+        # Memory and gap commitment must rotate in the same frame, including
+        # command-predicted pivots when the optional IMU is unavailable.
+        self.local_planner.track_motion(
+            self.left_pwm, self.right_pwm, elapsed, yaw_step
         )
         forward_step = (
             self.local_planner.commanded_speed_mps(self.left_pwm, self.right_pwm)

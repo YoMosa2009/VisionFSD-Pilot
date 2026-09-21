@@ -823,16 +823,17 @@ class FrontierExplorer:
             reverse=True,
         )[:6]
 
+        # Validate the existing goal first so alternatives cannot consume its
+        # entire budget. Every search shares the same absolute deadline.
+        committed_path = None
+        if committed_valid:
+            committed_path = self._astar(
+                reachable, planning_start, committed, deadline, traversal_cost
+            )
         chosen_target, chosen_path, chosen_utility = self._best_route(
             ranked_candidates, reachable, planning_start, traversal_cost,
             scale, deadline,
         )
-
-        committed_path = None
-        if committed_valid:
-            committed_path = self._astar(
-                reachable, planning_start, committed, None, traversal_cost
-            )
         if committed_path:
             route_m = self._route_length(committed_path, scale)
             if route_m < self._goal_best_route_m - self.PROGRESS_MIN_M:
@@ -846,7 +847,7 @@ class FrontierExplorer:
                 if chosen_target == committed:
                     chosen_target, chosen_path, chosen_utility = self._best_route(
                         ranked_candidates, reachable, planning_start,
-                        traversal_cost, scale, None, skip=committed,
+                        traversal_cost, scale, deadline, skip=committed,
                     )
             else:
                 committed_score = next(
@@ -879,10 +880,19 @@ class FrontierExplorer:
 
         self._planning_ms = (time.perf_counter() - planning_started) * 1000.0
         if chosen_target is None or chosen_path is None:
-            if time.perf_counter() >= deadline and current.active:
+            timed_out = time.perf_counter() >= deadline
+            if timed_out:
                 self._next_replan_at = now + 0.15
-                return current
-            self._mode = "NO_REACHABLE_TARGET"
+                # Reuse only when the complete reachable mask is unchanged.
+                # This bounded array comparison preserves a safe commitment
+                # without starting another unbudgeted path search.
+                if (current.active and committed_valid
+                        and now - self._goal_progress_at <= self.PROGRESS_TIMEOUT_S
+                        and self._route_free is not None
+                        and np.array_equal(self._route_free, reachable)):
+                    return current
+            # Never resurrect the old route after new obstacles invalidated it.
+            self._mode = "PLAN_TIMEOUT" if timed_out else "NO_REACHABLE_TARGET"
             self._drop_goal()
             return self._state(x_m, y_m, heading_deg, scale)
 
@@ -942,6 +952,7 @@ class AsyncExplorer:
     """
 
     SNAPSHOT_PERIOD_S = 0.45
+    MAX_SNAPSHOT_AGE_S = 1.5
     WORKER_PERIOD_S = 0.10
 
     def __init__(self, explorer: FrontierExplorer | None = None) -> None:
@@ -956,6 +967,7 @@ class AsyncExplorer:
         self._snapshot: tuple | None = None
         self._pose: tuple[float, float, float] | None = None
         self._state = ExplorationState()
+        self._state_snapshot_at = 0.0
         self._next_snapshot_at = 0.0
         self.last_error: str | None = None
         self.plans = 0
@@ -985,7 +997,7 @@ class AsyncExplorer:
         with self._lock:
             self._pose = (x_m, y_m, heading_deg)
             if snapshot is not None:
-                self._snapshot = (self._epoch, *snapshot)
+                self._snapshot = (self._epoch, now, *snapshot)
         self._wake.set()
 
     def shift(self, shift_rows: int, shift_cols: int, fine_scale: float) -> None:
@@ -1010,6 +1022,9 @@ class AsyncExplorer:
 
     def state(self) -> ExplorationState:
         with self._lock:
+            if (self._state.active and
+                    time.monotonic() - self._state_snapshot_at > self.MAX_SNAPSHOT_AGE_S):
+                return ExplorationState(mode="STALE_MAP")
             return self._state
 
     def _run(self) -> None:
@@ -1028,7 +1043,9 @@ class AsyncExplorer:
                     self.explorer.invalidate()
             if snapshot is None or pose is None or snapshot[0] < epoch:
                 continue
-            _epoch, grid, observed, visits, metres, map_updates = snapshot
+            _epoch, snapshot_at, grid, observed, visits, metres, map_updates = snapshot
+            if time.monotonic() - snapshot_at > self.MAX_SNAPSHOT_AGE_S:
+                continue
             try:
                 state = self.explorer.update(
                     grid, observed, visits, pose[0], pose[1], pose[2],
@@ -1036,11 +1053,16 @@ class AsyncExplorer:
                 )
             except Exception as exc:  # planning must never kill the robot
                 self.last_error = str(exc)
+                with self._lock:
+                    if self._epoch == epoch:
+                        self._state = ExplorationState(mode="PLANNER_ERROR")
                 continue
             self.plans += 1
             with self._lock:
                 if self._epoch == epoch:
                     self._state = state
+                    self._state_snapshot_at = snapshot_at
+                    self.last_error = None
 
     def close(self) -> None:
         self._stop.set()

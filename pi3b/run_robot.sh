@@ -62,6 +62,15 @@ if [[ "${VISIONFSD_POST_UPDATE_REEXEC:-0}" != "1" ]]; then
   fi
 fi
 
+# OTA can deliver corrected USB setup without a manual reinstall. This runs
+# before the runtime owns any hardware, never waits for a password and never
+# installs packages. A failure leaves optional non-IMU navigation available.
+if [[ -f "$ROOT/setup_mcp2221.sh" ]] && command -v timeout >/dev/null 2>&1; then
+  if ! timeout --kill-after=1s 8s bash "$ROOT/setup_mcp2221.sh" --repair >>"$LOG" 2>&1; then
+    echo "MCP2221 boot repair incomplete; inspect IMU diagnostic on dashboard." >>"$LOG"
+  fi
+fi
+
 # USB devices are not always enumerated by the time the desktop session starts,
 # and the runtime exits when it cannot find the Uno.  Waiting turns a boot race
 # into a normal start instead of a silent failure.
