@@ -46,6 +46,7 @@ import socketserver
 import struct
 import threading
 import time
+import urllib.parse
 
 import cv2
 import numpy as np
@@ -185,6 +186,51 @@ def load_page() -> str:
     except OSError:
         page = _FALLBACK_PAGE
     return page.replace("STALE_AFTER_PLACEHOLDER", repr(STALE_AFTER_S))
+
+
+LOG_DIR = Path(__file__).resolve().parent / "logs"
+# Serving the tail keeps the reply small and costs one seek, however long the
+# run has been. The cap bounds what a viewer can pull in one request.
+LOG_DEFAULT_BYTES = 64 * 1024
+LOG_MAX_BYTES = 512 * 1024
+
+
+def read_run_log(request_path: str) -> bytes:
+    """Tail of the launcher's log, for reading the robot's own boot record.
+
+    The log holds what telemetry cannot: which version and commit actually
+    started, the MCP2221 repair result, and per-frame camera timing. Without
+    this, diagnosing the running robot means someone reading files on the Pi
+    by hand, which is why it went undiagnosed.
+
+    Read-only, bounded, and never raises: a viewer must not be able to take
+    the runtime down, and a missing log is a normal answer, not an error.
+    """
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(request_path).query)
+    name = "robot.previous.log" if query.get("prev") else "robot.log"
+    try:
+        wanted = int(query.get("bytes", [LOG_DEFAULT_BYTES])[0])
+    except (TypeError, ValueError):
+        wanted = LOG_DEFAULT_BYTES
+    wanted = max(1024, min(wanted, LOG_MAX_BYTES))
+    path = LOG_DIR / name
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            start = max(0, size - wanted)
+            handle.seek(start)
+            if start:
+                # The seek can land mid-line; drop the partial first line.
+                handle.readline()
+            tail = handle.read(wanted)
+            if not tail and size:
+                # A run of bytes with no line break at all: return the raw
+                # tail rather than nothing.
+                handle.seek(start)
+                tail = handle.read(wanted)
+            return tail
+    except OSError as exc:
+        return f"no log available ({path.name}): {exc}\n".encode("utf-8", "replace")
 
 
 class DashboardStream:
@@ -507,6 +553,8 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
                     self.send_error(503, "camera stream is not enabled")
                     return
                 self._stream(self.camera)
+            elif path == "/log.txt":
+                self._send_bytes(read_run_log(self.path), "text/plain; charset=utf-8")
             elif path == "/map.png":
                 png = None if self.telemetry is None else self.telemetry.map_png()[0]
                 if png is None:

@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import json
 import pathlib
+import shutil
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -21,11 +23,14 @@ import numpy as np
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
+import robot_web
 from robot_web import (
+    LOG_MAX_BYTES,
     STALE_AFTER_S,
     DashboardStream,
     RobotControl,
     local_ip_address,
+    read_run_log,
     start_dashboard_server,
 )
 
@@ -230,6 +235,12 @@ class DashboardServerTests(unittest.TestCase):
         # as the literal placeholder.
         self.assertNotIn(b"STALE_AFTER_PLACEHOLDER", body)
 
+    def test_log_endpoint_is_served_as_plain_text(self) -> None:
+        status, body, headers = self._get("/log.txt?bytes=4096")
+        self.assertEqual(status, 200)
+        self.assertIn("text/plain", headers["Content-Type"])
+        self.assertIsInstance(body, bytes)
+
     def test_status_endpoint_is_json(self) -> None:
         status, body, _headers = self._get("/status.json")
         self.assertEqual(status, 200)
@@ -291,6 +302,53 @@ class DashboardServerTests(unittest.TestCase):
             again[1].close()
             self.skipTest("platform allows rebinding this port")
         self.assertIsNone(again)
+
+
+class RunLogEndpointTests(unittest.TestCase):
+    """The launcher log is readable over the dashboard.
+
+    Telemetry cannot carry the startup version and commit, the MCP2221 repair
+    result, or camera timing. Before this, reading them meant opening files on
+    the Pi by hand, which is why the IMU fault stayed undiagnosed.
+    """
+
+    def setUp(self) -> None:
+        self.directory = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.directory, True)
+        self._real_dir = robot_web.LOG_DIR
+        robot_web.LOG_DIR = self.directory
+        self.addCleanup(setattr, robot_web, "LOG_DIR", self._real_dir)
+
+    def _write(self, name: str, text: str) -> None:
+        (self.directory / name).write_text(text, encoding="utf-8")
+
+    def test_the_tail_of_the_log_is_returned(self) -> None:
+        self._write("robot.log", "".join(f"line {i}\n" for i in range(5000)))
+        body = read_run_log("/log.txt?bytes=2048").decode()
+        self.assertIn("line 4999", body)
+        self.assertLessEqual(len(body), 2048)
+        # A tail must never begin mid-line.
+        self.assertTrue(body.startswith("line "))
+
+    def test_a_short_log_is_returned_whole(self) -> None:
+        self._write("robot.log", "version: 1.9.26\ncommit: abc123\n")
+        self.assertIn("commit: abc123", read_run_log("/log.txt").decode())
+
+    def test_the_previous_run_can_be_requested(self) -> None:
+        self._write("robot.log", "current run\n")
+        self._write("robot.previous.log", "earlier run\n")
+        self.assertIn("earlier run", read_run_log("/log.txt?prev=1").decode())
+        self.assertIn("current run", read_run_log("/log.txt").decode())
+
+    def test_a_missing_log_is_an_answer_not_an_error(self) -> None:
+        body = read_run_log("/log.txt").decode()
+        self.assertIn("no log available", body)
+
+    def test_the_reply_is_bounded_however_much_is_asked_for(self) -> None:
+        self._write("robot.log", "x" * (4 * LOG_MAX_BYTES))
+        self.assertLessEqual(len(read_run_log("/log.txt?bytes=99999999")), LOG_MAX_BYTES)
+        # A nonsense request falls back to the default rather than failing.
+        self.assertTrue(read_run_log("/log.txt?bytes=banana"))
 
 
 class LocalAddressTests(unittest.TestCase):

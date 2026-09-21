@@ -1092,6 +1092,31 @@ version made contact in it, so it understates real collisions; treat it as a
 comparison, not a prediction. Desktop tests (475 pass). **Nothing here has run
 on the robot.**
 
+### v1.9.26: the robot serves its own run log
+
+The launcher records what telemetry cannot: which version and commit actually
+started, the result of the MCP2221 boot repair, and per-frame camera timing.
+Until now, reading any of it meant opening files on the Pi by hand. That is a
+large part of why the IMU fault (`IMU OFF`, board LED lit) has stayed
+undiagnosed across several releases — the evidence existed and nobody could
+reach it while the robot was driving.
+
+`GET /log.txt` on the dashboard returns the tail of `logs/robot.log`:
+
+- `?bytes=` chooses how much, default 64 KiB, capped at 512 KiB.
+- `?prev=1` returns the previous boot's `robot.previous.log`.
+- The tail never starts mid-line, a missing log is answered as text rather
+  than an error, and the handler cannot raise into the runtime.
+
+Nothing about motion, planning or safety changed. The endpoint is read-only
+and serves only these two files. Like the rest of the dashboard it cannot
+authenticate, so the same rule applies: **this port belongs on a trusted
+network only**, and the log does contain host paths and device names.
+
+Six regressions cover the tail, short logs, the previous run, a missing log,
+the size cap and a nonsense request, plus one that fetches the endpoint from a
+running server. Desktop tests only.
+
 ### Phone dashboard (v1.9.22)
 
 `http://<pi-address>:8080/` now has three tabs, with the controls beside every
