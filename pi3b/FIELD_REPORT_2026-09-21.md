@@ -8,7 +8,10 @@ endpoint added in v1.9.26.
 such record in this project.
 
 - Runtime: v1.9.26, commit `99de7d0`, confirmed by the boot log.
-- Duration: 885 s (14.7 min), 1686 telemetry messages, 15 log snapshots.
+- Duration: 885 s (14 min 45 s), 1686 telemetry messages at ~1.9/s, 15 log
+  snapshots. One session; a short sample.
+- The operator lifted the robot to a safer spot several times during the run,
+  and reports seeing it both get stuck and take sensible actions.
 - Environment: the operator's home, mixed autonomous and manual driving.
 - Raw data: session scratchpad `drive_logs/` (telemetry JSONL, log snapshots,
   `analysis_full.txt`). Not committed: it is large and machine-specific.
@@ -58,14 +61,40 @@ robot had **no long-term destination at all**.
 This is the honest explanation of "it fails to take the paths that are
 genuinely logical". It is not mainly choosing badly between openings. It is
 mostly driving with no destination, on decisions that are hundreds of
-milliseconds stale.
+milliseconds stale - which is also why it circulates inside one area rather
+than crossing the house.
 
-### Consequence: it goes nowhere
+### Consequence: it circulates rather than getting anywhere
 
-- Path length **63.3 m**, net displacement **0.4 m**.
-- Moved less than 0.35 m in 12 s for **67%** of the run.
-- One unbroken episode of `DRIVE:-18deg` lasting **123.5 s**. A constant
-  steering angle held for two minutes is a circle.
+**Corrected after operator review.** An earlier draft of this report said the
+robot "went nowhere", from 63.3 m of path against 0.4 m of net displacement
+over the whole run. That measure is invalid: there were **25 distinct
+displacement events** (the operator lifting the robot to a safer spot, plus map
+resets), and each breaks pose continuity, so start-to-end displacement across
+15 minutes measures nothing. The operator's own observation — that it moved
+around the living room and sometimes took sensible actions — is consistent with
+the data once it is broken down properly.
+
+Per minute, excluding steps over 1 m as pickups or resets:
+
+| Minutes | Path travelled | Heading change |
+|---|---|---|
+| 0–5 | 0.2–2.1 m/min | up to 305°/min |
+| 6–14 | 2.6–8.1 m/min | mostly modest |
+
+Motors were commanded non-zero in **72%** of messages. So it does drive. The
+pathology is the shape of that driving:
+
+- The first six minutes are near-stationary with large rotation — minute 1 is
+  0.2 m of travel against 244° of turning.
+- Later minutes travel 4–8 m each, but net displacement per minute stays
+  between 0.0 and 2.3 m: it circulates inside one area.
+- One unbroken episode of `DRIVE:-18deg` lasting **123.5 s**, during which it
+  travelled 1.7 m while its heading went 49° → 284° on a constant (105, 120)
+  command. Two minutes of turning nearly in place.
+
+Note that pose here is scan-matched and drifts, so per-minute path lengths are
+estimates. The 1 Hz control-loop finding above does not depend on pose at all.
 
 ### It also drives very close to things
 
