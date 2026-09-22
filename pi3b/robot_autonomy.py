@@ -32,6 +32,7 @@ from serial.tools import list_ports
 from lidar_visualizer import LD19_MAX_RANGE_MM, LD19Parser, LivePolarMap
 from robot_camera_motion import CameraMotionState, estimate_motion
 from robot_explorer import AsyncExplorer, ExplorationState, FrontierExplorer
+from robot_loop_budget import AdvisoryBudget, StageTimer
 from robot_imu import AsyncIMULink, IMUState, LSM6DS3MCP2221Link
 from robot_local_planner import (
     reduce_obstacles,
@@ -251,7 +252,21 @@ CONTROL_PERIOD_S = 0.025
 # nudge the robot out of somewhere, not to race it.
 MANUAL_FORWARD_MIN_M = 0.32
 OPENING_HALF_WIDTH_DEG = 5
-DISPLAY_PERIOD_S = 0.10
+# The HDMI panel is a status screen, not a video feed, and drawing it costs
+# more than anything else on the control thread. The 2026-09-21 field run
+# measured the loop at about 1 Hz with this at 10 fps.
+DISPLAY_PERIOD_S = 0.33
+# Advisory work is skipped while the average control gap is above this, and
+# resumed below the lower figure. Both are well inside the 250 ms command
+# lease, so shedding starts before the motors can be cut.
+LOOP_LATE_MS = 150.0
+LOOP_RECOVERED_MS = 80.0
+# However busy the robot is, the screen and the phone still refresh this often.
+LOOP_MAX_SKIP_S = 2.0
+# Upper bound on LD19 returns serialised into one full telemetry message. A
+# full sweep is about 550 points; the phone cannot draw more than this
+# usefully, and the JSON is built on the control thread.
+TELEMETRY_SCAN_POINTS = 360
 TELEMETRY_PERIOD_S = 1.0
 CAPS_RETRY_S = 0.50
 CAMERA_RETRY_S = 1.0
@@ -3416,6 +3431,7 @@ def build_telemetry(
     local_map: LidarSlamLite,
     now: float,
     include_full: bool,
+    loop: dict | None = None,
 ) -> tuple[dict, dict | None]:
     """Telemetry for the phone dashboard, as (light, full).
 
@@ -3469,6 +3485,9 @@ def build_telemetry(
             "lock": policy.watchdog.locked_sign,
             "stuck": policy.stuck_phase,
             "route": policy.route_guided,
+            # Loop health, so a slow robot is visible from the phone rather
+            # than only in the log.
+            "loop": dict(loop) if loop else None,
         },
         "explore": {
             "mode": exploration.mode,
@@ -3487,12 +3506,23 @@ def build_telemetry(
         return light, None
     full = dict(light)
     if scan.size:
-        radians = np.radians(scan.angles_deg)
+        # Thinned to the cap when a sweep is denser than the phone can draw,
+        # by evenly spaced indices rather than a stride: a stride of 2 would
+        # throw away half of a 450-point sweep to respect a 360-point cap.
+        # Display copy only - planning, memory and safety use every return.
+        if scan.size > TELEMETRY_SCAN_POINTS:
+            picked = np.linspace(
+                0, scan.size - 1, TELEMETRY_SCAN_POINTS
+            ).astype(np.int32)
+        else:
+            picked = np.arange(scan.size, dtype=np.int32)
+        radians = np.radians(scan.angles_deg[picked])
+        ranges = scan.ranges_m[picked]
         full["scan"] = {
-            "x": _cm(np.sin(radians) * scan.ranges_m),
-            "y": _cm(np.cos(radians) * scan.ranges_m),
-            "i": np.clip(scan.intensity, 0, 255).astype(np.int32).tolist(),
-            "k": scan.keep.astype(np.int8).tolist(),
+            "x": _cm(np.sin(radians) * ranges),
+            "y": _cm(np.cos(radians) * ranges),
+            "i": np.clip(scan.intensity[picked], 0, 255).astype(np.int32).tolist(),
+            "k": scan.keep[picked].astype(np.int8).tolist(),
         }
     memory_x, memory_y = policy.local_planner.memory.cartesian()
     if memory_x.size:
@@ -3559,6 +3589,13 @@ def encode_map_png(local_map: LidarSlamLite) -> bytes | None:
     small = cv2.resize(image, (size, size), interpolation=cv2.INTER_NEAREST)
     ok, buffer = cv2.imencode(".png", small, [int(cv2.IMWRITE_PNG_COMPRESSION), 3])
     return buffer.tobytes() if ok else None
+
+
+def _mark(timer: StageTimer, name: str, started: float) -> float:
+    """Record one stage and return the clock for the next."""
+    now = time.perf_counter()
+    timer.note(name, now - started)
+    return now
 
 
 def display_available() -> bool:
@@ -3686,6 +3723,12 @@ def main() -> int:
     fullscreen_refreshes = 12
     next_telemetry_at = 0.0
     last_control_at = 0.0
+    stage_timer = StageTimer()
+    advisory = AdvisoryBudget(
+        late_ms=LOOP_LATE_MS,
+        recovered_ms=LOOP_RECOVERED_MS,
+        max_skip_s=LOOP_MAX_SKIP_S,
+    )
     last_policy_state: tuple[str, str, str] | None = None
     last_recenter_count = slam_lite.recenter_count
     last_imu_error: str | None = None
@@ -3747,6 +3790,7 @@ def main() -> int:
         while keep_running:
             now = time.monotonic()
             loop_started = now
+            stage_clock = time.perf_counter()
             arduino.poll_capabilities(now)
             if imu is not None:
                 imu_state = imu.tick(
@@ -3798,6 +3842,7 @@ def main() -> int:
             # Arrays for every consumer below, built once per new packet batch
             # rather than once per consumer per control tick.
             scan = lidar.scan_frame()
+            stage_clock = _mark(stage_timer, "sense", stage_clock)
             imu_yaw_rate = (
                 imu_state.gyro_z_dps
                 if imu_state.connected and imu_state.calibrated and imu_state.fresh
@@ -3840,12 +3885,15 @@ def main() -> int:
                 )
                 planner_resync = True
                 last_recenter_count = slam_lite.recenter_count
+            stage_clock = _mark(stage_timer, "slam", stage_clock)
             # Make the safety decision and refresh the Uno watchdog before the
             # advisory global planner runs.  A bounded but non-trivial A* search
             # must never turn route computation into periodic motor dropouts.
             control_now = time.monotonic()
             control_gap_ms = 0.0 if last_control_at == 0.0 else (control_now - last_control_at) * 1000.0
             last_control_at = control_now
+            advisory.observe(control_gap_ms)
+            advisory_ok = advisory.allows(control_now)
             # One conversion of the revolution, shared by the motion tracker
             # and the local planner's obstacle memory.
             # Every return, for planning, memory, tracking and motion evidence.
@@ -3874,6 +3922,7 @@ def main() -> int:
                         imu_yaw_rate,
                     )
                 )
+            stage_clock = _mark(stage_timer, "perceive", stage_clock)
             command = policy.decide(
                 clearance,
                 status,
@@ -3884,6 +3933,7 @@ def main() -> int:
                 camera_motion,
             )
             policy.send(arduino, command, control_now)
+            stage_clock = _mark(stage_timer, "decide", stage_clock)
             if policy.displacement_count != last_displacement_count:
                 # The chassis was picked up or shoved. The occupancy grid, the
                 # visit history and the cached route all describe where it
@@ -3937,6 +3987,7 @@ def main() -> int:
             planner_resync = False
             exploration = explorer.state()
             policy.observe_exploration(exploration)
+            stage_clock = _mark(stage_timer, "explore", stage_clock)
             if now >= next_telemetry_at:
                 next_telemetry_at = now + TELEMETRY_PERIOD_S
                 front = "--" if clearance.front_m is None else f"{clearance.front_m:.2f}"
@@ -3982,23 +4033,47 @@ def main() -> int:
                     f"intent={policy.intent} "
                     f"recenter={slam_lite.recenter_count}"
                 )
+            if stage_timer.elapsed(now) >= TELEMETRY_PERIOD_S and stage_timer.ticks:
+                # Where the loop time actually goes. Printed once a second so
+                # a field run answers the question instead of inviting another
+                # guess; see FIELD_REPORT_2026-09-21.md.
+                print(
+                    stage_timer.format_line(now)
+                    + f" advisory_skipped={advisory.skipped}"
+                    + f" advisory_forced={advisory.forced}"
+                    + f" avg_gap_ms={advisory.average_gap_ms:.0f}"
+                )
+                stage_timer.reset(now)
             # Phone dashboard. Each stream is only fed while it has viewers:
             # the robot builds no telemetry, encodes no map and compresses no
             # camera frame for a page nobody has open.
             if telemetry_hub.wants("light") and now >= next_telemetry_publish_at:
-                wants_full = telemetry_hub.wants("full")
+                # A full message carries every LD19 return and is built on this
+                # thread. While the loop is late the phone still gets the light
+                # message, which is what the status chips need.
+                wants_full = telemetry_hub.wants("full") and advisory_ok
                 light, full = build_telemetry(
                     policy, scan, exploration, slam_lite, imu_state, status,
                     clearance, camera_ready, arduino.differential_ready,
                     local_map, now, wants_full,
+                    loop={
+                        "hz": round(
+                            stage_timer.ticks / max(1e-6, stage_timer.elapsed(now)), 1
+                        ),
+                        **advisory.state(),
+                    },
                 )
                 telemetry_hub.publish(light, full)
-                next_telemetry_publish_at = now + (0.1 if wants_full else 0.25)
+                # 10 Hz of full telemetry was 10 Hz of serialising a whole
+                # sweep on the control thread. The phone view is unchanged at
+                # 5 Hz; the LiDAR only turns at about 10 Hz anyway.
+                next_telemetry_publish_at = now + (0.2 if wants_full else 0.25)
                 if wants_full and now >= next_map_publish_at:
                     png = encode_map_png(local_map)
                     if png is not None:
                         telemetry_hub.publish_map(png)
-                    next_map_publish_at = now + 1.0
+                    next_map_publish_at = now + 2.0
+            stage_clock = _mark(stage_timer, "telemetry", stage_clock)
             camera_stream = (
                 None if dashboard_server is None else dashboard_server.camera
             )
@@ -4011,12 +4086,21 @@ def main() -> int:
                 if frame is not None:
                     camera_stream.publish(frame)
                 next_camera_publish_at = now + camera_stream.publish_period_s
+            stage_clock = _mark(stage_timer, "camera_pub", stage_clock)
             window_due = show_window and now >= next_display_at
             stream_due = (
                 dashboard_stream is not None
                 and dashboard_stream.viewers > 0
                 and now >= next_web_render_at
             )
+            if (window_due or stream_due) and not advisory_ok:
+                # Drawing the map and panel is the heaviest thing on this
+                # thread. Skipping it while the loop is late is what keeps a
+                # busy robot deciding at all; it resumes on its own, and is
+                # forced through at least every LOOP_MAX_SKIP_S so the view
+                # never looks frozen.
+                window_due = False
+                stream_due = False
             if window_due or stream_due:
                 if window_due:
                     next_display_at = now + DISPLAY_PERIOD_S
@@ -4068,6 +4152,8 @@ def main() -> int:
                         fullscreen_refreshes -= 1
                     if cv2.waitKey(1) & 0xFF in (27, ord("q"), ord("Q")):
                         break
+            _mark(stage_timer, "render", stage_clock)
+            stage_timer.tick()
             # Sleep the remainder of the control period rather than a fixed
             # amount on top of the work: a tick that spent time rendering the
             # dashboard or replanning otherwise pushed the next sensor read

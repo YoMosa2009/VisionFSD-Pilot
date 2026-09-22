@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import os
 import pathlib
 import socket
@@ -27,6 +28,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from lidar_visualizer import LidarPoint
 from robot_autonomy import (
+    TELEMETRY_SCAN_POINTS,
     ArduinoStatus,
     AutonomousPolicy,
     SectorClearance,
@@ -270,14 +272,30 @@ class TelemetryBuilderTests(unittest.TestCase):
         self.assertNotIn("scan", light)
         self.assertLess(len(json.dumps(light)), 2000)
 
-    def test_full_telemetry_carries_every_return(self) -> None:
+    def test_full_telemetry_carries_the_sweep_thinned_to_the_cap(self) -> None:
+        """Every return reaches planning; the phone gets at most
+        TELEMETRY_SCAN_POINTS of them, evenly spread. Building this message
+        happens on the control thread, which the 2026-09-21 field run measured
+        running at about 1 Hz."""
         policy, scan, mapper, status, clearance, now = self._inputs()
         _light, full = build_telemetry(
             policy, scan, ExplorationState(), mapper.state(), IMUState(), status,
             clearance, True, True, mapper, now, True,
         )
-        self.assertEqual(len(full["scan"]["x"]), scan.size)
-        self.assertEqual(len(full["scan"]["k"]), scan.size)
+        expected = min(scan.size, TELEMETRY_SCAN_POINTS)
+        self.assertEqual(len(full["scan"]["x"]), expected)
+        self.assertEqual(len(full["scan"]["k"]), expected)
+        self.assertEqual(len(full["scan"]["i"]), expected)
+        # Thinning must keep the whole sweep's spread, not a slice of it: the
+        # phone draws this, and a missing quadrant would read as open floor.
+        distances = [
+            math.hypot(x, y) for x, y in zip(full["scan"]["x"], full["scan"]["y"])
+        ]
+        self.assertTrue(all(distance > 0 for distance in distances))
+        self.assertGreater(max(full["scan"]["x"]), 0)
+        self.assertLess(min(full["scan"]["x"]), 0)
+        self.assertGreater(max(full["scan"]["y"]), 0)
+        self.assertLess(min(full["scan"]["y"]), 0)
         self.assertIn("foot", full)
         self.assertAlmostEqual(full["foot"]["w"], 22.9, places=1)
         # A whole revolution at centimetre precision stays a few kilobytes.

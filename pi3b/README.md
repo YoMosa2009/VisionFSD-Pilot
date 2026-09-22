@@ -1092,6 +1092,73 @@ version made contact in it, so it understates real collisions; treat it as a
 comparison, not a prediction. Desktop tests (475 pass). **Nothing here has run
 on the robot.**
 
+### v1.9.27: measure the control loop, and give it priority over the view
+
+The first measured field run ([FIELD_REPORT_2026-09-21.md](FIELD_REPORT_2026-09-21.md))
+found the control loop running at about **1 Hz against its 25 ms design
+period** — median gap 484–889 ms, worst 1.9 s. Everything else followed from
+that:
+
+- 663 expired command leases, and 267 stop/go transitions (18 per minute) —
+  the pulsing, measured from the robot rather than inferred.
+- The frontier planner timed out in 62% of samples and produced a real goal in
+  **3.5%**, so the robot usually had nowhere to go. That, not bad arc scoring,
+  is why it circulates instead of crossing the house.
+- `uno_timeouts` stayed at 0 and no sensor ever reported unhealthy. The link
+  and the sensors are fine; this is Pi-side compute.
+
+**Nothing about navigation behaviour changed in this release.** At 1 Hz,
+tuning navigation is tuning noise.
+
+**Where the time goes is now measured, not guessed.** `robot_loop_budget.py`
+adds a `StageTimer` costing one `perf_counter` call per stage. Once a second
+the runtime logs the mean and worst milliseconds per stage, busiest first:
+
+```
+LOOP ticks=32 hz=32.0 period_ms=31 mean/max_ms: sense=8.2/25.5 slam=5.6/24.3
+  perceive=1.1/10.3 decide=0.7/2.1 telemetry=0.2/2.0 render=0.0/0.0
+```
+
+The loop rate also reaches the phone as a `LOOP n Hz` chip, so a slow robot is
+visible while it is driving rather than afterwards in a log.
+
+**Advisory work now yields to the control decision.** Drawing the HDMI panel,
+encoding the map and serialising every LiDAR return inform a person; they never
+decide where the robot drives. They ran on the control thread, so when they
+overran, the safety decision waited behind them and the command lease expired.
+That is a priority inversion. `AdvisoryBudget` sheds that work when the average
+control gap exceeds 150 ms and restores it below 80 ms — hysteresis, so it
+cannot flap — with a forced pass at least every 2 s so a viewer can still tell
+a busy robot from a crashed one. Both thresholds sit inside the 250 ms command
+lease, so shedding starts before the motors can be cut.
+
+Lengthening the lease was the alternative. It was rejected: it would hide the
+stalls while the robot kept acting on second-old decisions.
+
+**Fixed costs cut**, each one measured as a cause rather than assumed:
+
+| What | Before | After |
+|---|---|---|
+| HDMI panel redraw | every 0.10 s | every 0.33 s |
+| Full telemetry (whole sweep, built on the control thread) | every 0.1 s | every 0.2 s |
+| Map PNG encode | every 1.0 s | every 2.0 s |
+| LD19 returns per full message | all (~550) | at most 360, evenly spread |
+
+The thinning is for the phone only — planning, obstacle memory, tracking and
+safety still use every return, which is the v1.9.23 lesson and is covered by a
+test. Points are chosen by evenly spaced indices rather than a stride, so a
+450-point sweep sends 360 rather than dropping to 225, and the view keeps the
+sweep's full angular spread.
+
+**A bug found by its own test:** the budget used `0.0` as "nothing has run
+yet", which collides with a clock that legitimately starts at zero and would
+have forced a render on the first busy tick after start-up.
+
+11 new regressions for the timer and the budget, plus the updated telemetry
+contract. 510 tests pass. **Desktop tests only — this has not run on the
+robot.** Whether it actually restores the loop rate is the next thing to
+measure, with the per-stage numbers naming what to cut next.
+
 ### v1.9.26: the robot serves its own run log
 
 The launcher records what telemetry cannot: which version and commit actually

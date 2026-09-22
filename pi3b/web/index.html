@@ -703,6 +703,16 @@
       chip("IMU " + (hl.imu || ""), hl.imu === "LIVE" ? "ok" : (hl.imu === "OFF" ? "" : "warn")),
       chip("UNO", hl.uno ? "ok" : "bad")
     ];
+    if (hl.loop && typeof hl.loop.hz === "number") {
+      // Control-loop rate. The 2026-09-21 field run measured about 1 Hz
+      // against a 40 Hz design, which is what expired the command lease and
+      // cut the motors. Showing it makes a slow robot visible from the phone.
+      chips.push(chip(
+        "LOOP " + hl.loop.hz.toFixed(0) + " Hz",
+        hl.loop.hz >= 20 ? "ok" : (hl.loop.hz >= 8 ? "warn" : "bad")
+      ));
+      if (hl.loop.behind) { chips.push(chip("SHEDDING VIEW", "warn")); }
+    }
     if (hl.lock) { chips.push(chip("TURN LOCK " + (hl.lock > 0 ? "R" : "L"), "warn")); }
     if (hl.stuck && hl.stuck !== "IDLE") { chips.push(chip("STUCK " + hl.stuck, "bad")); }
     if (hl.route) { chips.push(chip("ROUTE GUIDED", "ok")); }
