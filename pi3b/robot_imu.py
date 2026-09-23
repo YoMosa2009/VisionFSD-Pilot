@@ -157,15 +157,27 @@ class _MCP2221Bus:
         self._process.start()
         child.close()
         try:
-            self._receive(startup_timeout_s)
+            self._receive(startup_timeout_s, stage="startup")
         except Exception:
             self.close()
             raise
 
-    def _receive(self, timeout_s):
+    def _receive(self, timeout_s, stage="transaction"):
         try:
             if not self._connection.poll(timeout_s):
-                raise OSError("MCP2221 USB timeout; reopening adapter")
+                # Say which step timed out. The same text for both is why the
+                # 2026-09 field runs could not tell a worker that never
+                # started (software, CPU, USB enumeration) from a sensor that
+                # never answered (wiring, pull-ups, power).
+                if stage == "startup":
+                    raise OSError(
+                        "MCP2221 USB timeout: adapter worker did not start "
+                        f"within {timeout_s:.1f} s; reopening adapter"
+                    )
+                raise OSError(
+                    "MCP2221 USB timeout: no reply to an I2C transaction "
+                    f"within {timeout_s:.2f} s; reopening adapter"
+                )
             ok, result = self._connection.recv()
         except (EOFError, BrokenPipeError, OSError) as exc:
             self.close()
@@ -220,6 +232,11 @@ class LSM6DS3MCP2221Link:
     # LSM6DS3TR-C identifies as 0x6A. The older non-C LSM6DS3 uses 0x69.
     EXPECTED_IDS = (0x6A,)
     RETRY_SECONDS = 1.0
+    #: Longest wait between failed connection attempts. Each attempt spawns a
+    #: Python process that imports the USB stack; retrying every second
+    #: against an adapter that never answers kept one of the Pi 3B's four
+    #: cores starting interpreters for the whole of both 2026-09 field runs.
+    RETRY_MAX_SECONDS = 30.0
     MAX_SAMPLE_AGE_S = 0.25
     DATA_READY_TIMEOUT_S = 0.75
     FILTER_CUTOFF_HZ = 5.0
@@ -273,6 +290,7 @@ class LSM6DS3MCP2221Link:
         self._bus_factory = bus_factory or _mcp2221_bus_factory
         self._bus: _SMBusLike | None = None
         self._next_connect_at = 0.0
+        self._connect_failures = 0
         self._error: str | None = None
         self._calibration: list[
             tuple[float, float, float, float, float, float, float]
@@ -374,6 +392,7 @@ class LSM6DS3MCP2221Link:
             self._bus = bus
             self._connected_at = now
             self._error = None
+            self._connect_failures = 0
             return True
         except Exception as exc:
             if bus is not None:
@@ -383,7 +402,15 @@ class LSM6DS3MCP2221Link:
                     pass
             self._bus = None
             self._error = str(exc)
-            self._next_connect_at = now + self.RETRY_SECONDS
+            # 1, 2, 4, 8, 16, then every 30 s. A link that drops while running
+            # still retries after one second (see _disconnect); only repeated
+            # failure to connect backs off.
+            delay = min(
+                self.RETRY_MAX_SECONDS,
+                self.RETRY_SECONDS * (2.0 ** min(self._connect_failures, 5)),
+            )
+            self._connect_failures += 1
+            self._next_connect_at = now + delay
             return False
 
     def _disconnect(self, now: float, error: Exception) -> None:

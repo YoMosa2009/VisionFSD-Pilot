@@ -170,3 +170,89 @@ class ScanMotionTrackerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _room_signature(heading_deg: float = 0.0, x: float = 2.0, y: float = 1.6) -> np.ndarray:
+    """A 6 x 5 m room with 15 chair-leg-sized posts, as the robot sees it.
+
+    Legs are what make a turn look like a carry: each 5-degree bin keeps its
+    nearest return, so rotating a few degrees swaps a near leg for a far wall
+    in many bins at once. In this scene the old comparison calls even a
+    10-degree turn a pickup, as it did on the real robot.
+    """
+    import math
+
+    rng = np.random.default_rng(3)
+    segments = [((0, 0), (6, 0)), ((6, 0), (6, 5)), ((6, 5), (0, 5)), ((0, 5), (0, 0))]
+    for cx, cy in rng.uniform([0.4, 0.4], [5.6, 4.6], (15, 2)):
+        if math.hypot(cx - 2.0, cy - 1.6) < 0.5:
+            continue
+        h = 0.03
+        corners = [(cx - h, cy - h), (cx + h, cy - h), (cx + h, cy + h), (cx - h, cy + h)]
+        segments += list(zip(corners, corners[1:] + corners[:1]))
+    points = []
+    for index, angle in enumerate(np.arange(0.0, 360.0, 0.8)):
+        world = math.radians(angle + heading_deg)
+        dx, dy = math.sin(world), math.cos(world)
+        best = 9.0
+        for (x1, y1), (x2, y2) in segments:
+            ex, ey = x2 - x1, y2 - y1
+            denominator = dx * ey - dy * ex
+            if abs(denominator) < 1e-9:
+                continue
+            t = ((x1 - x) * ey - (y1 - y) * ex) / denominator
+            u = ((x1 - x) * dy - (y1 - y) * dx) / denominator
+            if t > 0.05 and 0.0 <= u <= 1.0:
+                best = min(best, t)
+        points.append((index, _Point(float(angle), best * 1000.0)))
+    return range_signature(points)
+
+
+class DisplacementIsNotTurningTests(unittest.TestCase):
+    """v1.9.28. The robot declared itself picked up whenever it turned
+    between two compared scans: 33 times in a 3-minute run on 2026-09-23 and
+    102 in the 15-minute run of 2026-09-21, each wiping the map and every
+    memory of where it had been. Replaying the recorded scans, 96 of 100 were
+    explained by the robot having turned (median 23 degrees) and 4 by loop
+    stalls too long to judge."""
+
+    def test_a_turn_between_scans_is_not_a_pickup(self) -> None:
+        for turned in (10.0, 23.0, 40.0):
+            tracker = ScanMotionTracker()
+            tracker.update(_room_signature(0.0), 0.0)
+            result = tracker.update(_room_signature(turned), 0.35)
+            self.assertFalse(result.displaced, f"turned {turned} deg")
+
+    def test_the_unaligned_comparison_would_have_called_it_a_pickup(self) -> None:
+        """Guards the test above: without rotation alignment this turn does
+        look like a carry, which is exactly the false alarm being fixed."""
+        change, _overlap, fraction = signature_change_m(
+            _room_signature(23.0), _room_signature(0.0)
+        )
+        self.assertGreaterEqual(change, 0.35)
+        self.assertGreaterEqual(fraction, 0.45)
+
+    def test_being_carried_across_the_room_is_still_a_pickup(self) -> None:
+        tracker = ScanMotionTracker()
+        tracker.update(_room_signature(0.0, 2.0, 1.6), 0.0)
+        result = tracker.update(_room_signature(15.0, 4.2, 3.4), 0.15)
+        self.assertTrue(result.displaced)
+
+    def test_scans_too_far_apart_are_not_judged(self) -> None:
+        """Across a long loop stall, ordinary driving moves the chassis as
+        far as the threshold, so the answer is "cannot tell"."""
+        tracker = ScanMotionTracker()
+        tracker.update(_room_signature(0.0, 2.0, 1.6), 0.0)
+        result = tracker.update(_room_signature(0.0, 4.2, 3.4), 1.5)
+        self.assertFalse(result.displaced)
+
+    def test_rotation_search_is_bounded_by_what_the_chassis_can_turn(self) -> None:
+        """A fresh scan 0.1 s later cannot be 90 degrees round: that is not
+        something the robot did to itself."""
+        from robot_motion import CHASSIS_MAX_YAW_DPS
+
+        self.assertLess(CHASSIS_MAX_YAW_DPS * 0.1, 90.0)
+        tracker = ScanMotionTracker()
+        tracker.update(_room_signature(0.0), 0.0)
+        result = tracker.update(_room_signature(90.0), 0.1)
+        self.assertTrue(result.displaced)

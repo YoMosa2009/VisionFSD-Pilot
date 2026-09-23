@@ -175,8 +175,10 @@ class LidarDetailTests(unittest.TestCase):
         points = [(0, LidarPoint(357., 1000, 200, .9))]
         with mock.patch.object(mapper, '_integrate_points', wraps=mapper._integrate_points) as integrate:
             mapper.update(points, 118, 90, 1., imu_yaw_rate_dps=30.)
+        # The map converts a scan to arrays once and shares them (v1.9.28);
+        # the deskewed angle must be what reaches integration.
         corrected = integrate.call_args.args[0]
-        self.assertAlmostEqual(corrected[0][1].angle_deg, 0.)
+        self.assertAlmostEqual(float(corrected.angles[0]) % 360., 0., places=4)
         self.assertEqual(points[0][1].angle_deg, 357.)
         self.assertEqual(mapper.state().map_updates, 1)
 

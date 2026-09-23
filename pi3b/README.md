@@ -1092,6 +1092,84 @@ version made contact in it, so it understates real collisions; treat it as a
 comparison, not a prediction. Desktop tests (475 pass). **Nothing here has run
 on the robot.**
 
+### v1.9.28: stop forgetting, and take the map off the control loop
+
+Two findings from the second field run (2026-09-23, recorded in
+[FIELD_REPORT_2026-09-21.md](FIELD_REPORT_2026-09-21.md)), plus the operator's
+report that the robot did not seem to remember what it had done or where it
+had been, and did not pick out open space it had not yet driven that it could
+fit into.
+
+**It really was forgetting — every few seconds.** The robot wiped its map,
+and with it every memory of where it had been, **33 times in a 3-minute run**
+and 102 times in the 15-minute run of 2026-09-21. Each wipe was a "picked up"
+verdict: two consecutive scans compared bearing by bearing in the robot's own
+frame. When the robot turned between them, every range slid sideways, and in a
+room full of chair legs most bins changed by more than the threshold. Replaying
+the recorded scans, **96 of 100 false verdicts are explained by the robot having
+turned** (median 23 degrees) and 4 by loop stalls too long to judge.
+
+The comparison now tries the rotations the chassis could physically have made
+in the elapsed time and uses the best match, and refuses to judge across a gap
+longer than 0.6 s. On the recorded run the verdicts fall from 102 to 2. Both
+remaining ones occur with the motors stopped, one just after a manual stop —
+consistent with the robot being lifted, though not confirmed. A
+real carry across the room is still detected, and so is a jump no chassis
+could turn in the time. The trade-off is stated: a carry that happens entirely
+within a long stall, or a pure hand-rotation in place, is no longer flagged.
+
+**Where it has been is now spatial.** Visit memory was a single-cell lookup,
+so a goal 20 cm beside a path driven ten times scored as never visited. The
+explorer now computes, for every reachable cell, the distance to the nearest
+place the chassis has physically driven. When a room has nothing left to
+discover — a 360-degree LiDAR sees a whole room within seconds, so *seen* says
+little about *been* — the next goal is chosen mainly for that novelty, then
+openness and distance. Every candidate is already reachable with the chassis
+inflation, so novelty cannot pull a goal into a gap the robot does not fit.
+Frontiers get the same novelty bonus.
+
+**What failed is remembered.** When the robot is confirmed stuck, the spot and
+the goal it was chasing are avoided for 90 s and a new goal is chosen at once —
+explore_lite's rule for a failed goal. Before, nothing recorded the failure,
+so the same goal was chased the same way again.
+
+**The loop.** The Pi-side stage timings from the second run named the costs:
+`sense` 150-370 ms, `slam` 80-200 ms, `render` 14-78 ms with no monitor and no
+viewer attached. The Pi also booted under-voltage and throttled
+(`throttled=0x50005`).
+
+- **The map runs on its own thread** (`robot_map_worker.py`). Nothing on the
+  safety path uses it: the arc planner, clearance and emergency brake work from
+  the live scan and the obstacle memory. Every tick's motion is replayed in
+  order, so dead reckoning is unchanged, and a scan is integrated after the
+  motion of the tick it arrived on. A test checks the worker builds a map and
+  pose **identical** to the inline one over 160 ticks. The view borrows the map
+  without waiting and skips a frame if it is busy; a pickup reset is applied
+  before the next batch and a pre-reset map is never handed to the planner.
+  At the measured 3 Hz, the per-step dead-reckoning cap of 0.2 s was also
+  discarding about 40% of commanded motion; a faster loop removes that.
+- **Map integration scales with the scan, not the grid**: evidence is written
+  inside the box the scan actually touched, fading touches only occupied cells,
+  and each scan is converted to arrays once instead of three times. On all
+  1,695 recorded sweeps the result is identical except that sub-one-count
+  remainders on empty cells are dropped (grid values within 1 of 255).
+- **Clearance is 3.4x cheaper with bit-identical results** — zero mismatches
+  across 2,095 scans x 6 sectors. It uses the scan arrays built once per scan,
+  and the sector check looks at each return's ~20 angular neighbours instead
+  of building an n x n comparison.
+- **No drawing to a screen that is not there.** The window is opened only when
+  the kernel reports a connected monitor (re-checked every 5 s, so plugging one
+  in later works). A desktop session alone is not evidence of a screen.
+- **The IMU stops hammering the CPU.** Each failed connection spawned a Python
+  process importing the USB stack, retried every second for entire runs. Retries
+  now back off to 30 s, and the error names which step failed — *adapter worker
+  did not start* versus *no reply to an I2C transaction* — which the field runs
+  could not tell apart.
+
+529 tests pass. **Desktop tests and replays of recorded data only — not yet run
+on the robot.** The per-stage `LOOP` line will show what this bought on the Pi.
+The throttling is a power-supply issue and is not addressed by software.
+
 ### v1.9.27: measure the control loop, and give it priority over the view
 
 The first measured field run ([FIELD_REPORT_2026-09-21.md](FIELD_REPORT_2026-09-21.md))

@@ -52,6 +52,16 @@ MOVED_CHANGE_M = 0.045
 # drivable speed can rearrange this much geometry.
 DISPLACED_CHANGE_M = 0.35
 DISPLACED_BIN_FRACTION = 0.45
+# The comparison is only meaningful between scans close in time. The field
+# runs of 2026-09-21 and 2026-09-23 had control-loop gaps of 0.3-1.9 s, and
+# across such a gap ordinary driving moves the chassis as far as the
+# displacement threshold. Past this gap the verdict is "cannot tell", never
+# "picked up".
+DISPLACED_MAX_GAP_S = 0.6
+# Fastest the chassis can spin on its own (about 130 deg/s at full wheel
+# split), plus margin. A difference between two scans that some rotation of
+# at most this much explains is the robot turning, not being carried.
+CHASSIS_MAX_YAW_DPS = 150.0
 
 
 @dataclass(frozen=True)
@@ -138,6 +148,33 @@ def signature_change_m(
     return float(np.median(differences)), count, changed_fraction
 
 
+def rotation_aligned_change_m(
+    current: np.ndarray, reference: np.ndarray, max_shift_bins: int
+) -> tuple[float, int, float]:
+    """signature_change_m() at the rotation that best explains the change.
+
+    The signature is binned by bearing in the robot's own frame, so a robot
+    that has turned between two scans sees every range slide sideways - and in
+    a room full of edges most bins then change by far more than the
+    displacement threshold. Without this the robot declared itself "picked
+    up" whenever it turned: 33 times in a 3-minute run on 2026-09-23, each one
+    wiping its map and its memory of where it had been.
+
+    Only shifts the chassis could physically have turned are tried, so this
+    cannot explain away a real carry, which rearranges the geometry rather
+    than rotating it.
+    """
+    best = signature_change_m(current, reference)
+    for shift in range(1, max(0, max_shift_bins) + 1):
+        for signed in (shift, -shift):
+            candidate = signature_change_m(np.roll(current, signed), reference)
+            if candidate[1] >= MIN_OVERLAP_BINS and (
+                best[1] < MIN_OVERLAP_BINS or candidate[0] < best[0]
+            ):
+                best = candidate
+    return best
+
+
 class ScanMotionTracker:
     """Turn successive range signatures into MOVING/NOT_MOVING/UNKNOWN.
 
@@ -158,12 +195,14 @@ class ScanMotionTracker:
         self._reference: np.ndarray | None = None
         self._reference_at = 0.0
         self._last_scan_at: float | None = None
+        self._previous_at: float | None = None
 
     def reset(self) -> None:
         self._previous = None
         self._reference = None
         self._reference_at = 0.0
         self._last_scan_at = None
+        self._previous_at = None
 
     def update(
         self, signature: np.ndarray | None, scan_at: float | None
@@ -178,9 +217,18 @@ class ScanMotionTracker:
 
         displaced = False
         displacement_m = 0.0
-        if self._previous is not None:
-            step_change, step_overlap, changed_fraction = signature_change_m(
-                signature, self._previous
+        gap_s = (
+            None if self._previous_at is None else scan_at - self._previous_at
+        )
+        if (
+            self._previous is not None
+            and gap_s is not None
+            and gap_s <= DISPLACED_MAX_GAP_S
+        ):
+            bin_deg = 360.0 / signature.size
+            max_shift = int(np.ceil(CHASSIS_MAX_YAW_DPS * gap_s / bin_deg)) + 1
+            step_change, step_overlap, changed_fraction = rotation_aligned_change_m(
+                signature, self._previous, max_shift
             )
             if step_overlap >= MIN_OVERLAP_BINS:
                 displacement_m = step_change
@@ -189,6 +237,7 @@ class ScanMotionTracker:
                     and changed_fraction >= DISPLACED_BIN_FRACTION
                 )
         self._previous = signature
+        self._previous_at = scan_at
 
         if self._reference is None:
             self._reference = signature

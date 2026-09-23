@@ -33,6 +33,7 @@ from lidar_visualizer import LD19_MAX_RANGE_MM, LD19Parser, LivePolarMap
 from robot_camera_motion import CameraMotionState, estimate_motion
 from robot_explorer import AsyncExplorer, ExplorationState, FrontierExplorer
 from robot_loop_budget import AdvisoryBudget, StageTimer
+from robot_map_worker import MapWorker, MotionSample
 from robot_imu import AsyncIMULink, IMUState, LSM6DS3MCP2221Link
 from robot_local_planner import (
     reduce_obstacles,
@@ -418,31 +419,97 @@ def _sector_clearance(points: list[tuple[int, object]], centre_deg: float, half_
     small angular cluster preserves small real obstacles while suppressing a
     lone speckle, which otherwise makes a lightweight robot twitch or spin.
     """
-    samples = sorted(
-        (
-            float(point.angle_deg),
-            point.distance_mm / 1000.0,
-            int(getattr(point, "confidence", 0)),
-        )
-        for _index, point in points
-        if abs(_signed_angle(point.angle_deg - centre_deg)) <= half_width_deg
-        # Keep the useful indoor portion of the LD19's range.  The live map
-        # itself rejects anything beyond 6 m; the old 4.5 m cut-off made an
-        # open room look like an unseen path and caused unnecessary stops.
-        and 0.08 <= point.distance_mm / 1000.0 <= 5.8
-    )
-    if not samples:
+    if not points:
         return None
-    angles, ranges, confidence = np.asarray(samples, dtype=np.float64).T
-    angular_delta = np.abs((angles[:, None] - angles[None, :] + 180.) % 360. - 180.)
-    neighbours = ((angular_delta <= 3.)
-                  & (np.abs(ranges[:, None] - ranges[None, :])
-                     <= np.maximum(0.14, ranges * 0.22)[:, None]))
-    supported = ((np.count_nonzero(neighbours, axis=1) >= 2)
-                 | ((ranges <= 0.75) & (confidence >= 180)))
+    return sector_clearance_arrays(
+        np.fromiter((float(point.angle_deg) for _i, point in points), dtype=np.float64, count=len(points)),
+        np.fromiter((point.distance_mm / 1000.0 for _i, point in points), dtype=np.float64, count=len(points)),
+        np.fromiter((int(getattr(point, "confidence", 0)) for _i, point in points), dtype=np.float64, count=len(points)),
+        centre_deg,
+        half_width_deg,
+    )
+
+
+#: Angular reach, either side, within which two returns can support each other.
+SECTOR_SUPPORT_DEG = 3.0
+
+
+def sector_clearance_arrays(
+    angles_deg: np.ndarray,
+    ranges_m: np.ndarray,
+    confidence: np.ndarray,
+    centre_deg: float,
+    half_width_deg: float,
+) -> float | None:
+    """_sector_clearance() over plain arrays, in O(n) rather than O(n^2).
+
+    The rule is unchanged: a return counts when at least one other return
+    within 3 degrees agrees on range (or it is close and strong), and the
+    sector's clearance is the smallest median range over each counted return's
+    supporting neighbours.
+
+    It used to compare every return with every other in the sector through
+    n x n matrices - about 32,000 cells for the 120-degree rear sector - six
+    times per scan, from Python point objects. On the 2026-09-23 field run
+    this was the largest part of a 215 ms sensing stage. A return's
+    neighbours within 3 degrees are contiguous once the sector is sorted by
+    angle, so each return only needs its window of about 20 others.
+    """
+    if angles_deg.size == 0:
+        return None
+    relative = (angles_deg - centre_deg + 180.0) % 360.0 - 180.0
+    inside = (
+        (np.abs(relative) <= half_width_deg)
+        & (ranges_m >= 0.08)
+        & (ranges_m <= 5.8)
+    )
+    if not np.any(inside):
+        return None
+    angles = angles_deg[inside]
+    ranges = ranges_m[inside]
+    strong = confidence[inside]
+    # Sort by angle relative to the sector centre. Within one sector (at most
+    # 120 degrees wide) that order has no wrap, so each return's neighbours
+    # form one contiguous run.
+    rel = relative[inside]
+    order = np.argsort(rel, kind="stable")
+    angles, ranges, strong, rel = angles[order], ranges[order], strong[order], rel[order]
+    low = np.searchsorted(rel, rel - (SECTOR_SUPPORT_DEG + 1e-6), side="left")
+    high = np.searchsorted(rel, rel + (SECTOR_SUPPORT_DEG + 1e-6), side="right")
+    width = int((high - low).max())
+    candidates = low[:, None] + np.arange(width)[None, :]
+    in_window = candidates < high[:, None]
+    candidates = np.minimum(candidates, angles.size - 1)
+    # The same wrapped angular test and range tolerance as before, applied
+    # only inside each window.
+    angular_delta = np.abs(
+        (angles[:, None] - angles[candidates] + 180.0) % 360.0 - 180.0
+    )
+    neighbour_ranges = ranges[candidates]
+    neighbours = (
+        in_window
+        & (angular_delta <= SECTOR_SUPPORT_DEG)
+        & (np.abs(ranges[:, None] - neighbour_ranges)
+           <= np.maximum(0.14, ranges * 0.22)[:, None])
+    )
+    supported = (
+        (np.count_nonzero(neighbours, axis=1) >= 2)
+        | ((ranges <= 0.75) & (strong >= 180))
+    )
     if not np.any(supported):
         return None
-    medians = np.nanmedian(np.where(neighbours[supported], ranges[None, :], np.nan), axis=1)
+    # Median of each counted return's supporting ranges. Sorting with the
+    # non-neighbours pushed to the end gives the same value as nanmedian
+    # (the mean of the two middle values for an even count) without its
+    # masked-array overhead.
+    rows = np.sort(
+        np.where(neighbours[supported], neighbour_ranges[supported], np.inf), axis=1
+    )
+    counts = np.count_nonzero(neighbours[supported], axis=1)
+    index = np.arange(rows.shape[0])
+    lower = rows[index, (counts - 1) // 2]
+    upper = rows[index, counts // 2]
+    medians = np.mean(np.stack((lower, upper)), axis=0)
     return float(np.min(medians))
 
 
@@ -938,15 +1005,29 @@ class LD19Link:
         scan_at = max((float(point.captured_at) for _index, point in points), default=0.0)
         if self._clearance_cache is not None and scan_at <= self._clearance_stamp:
             return self._clearance_cache
-        profiles = corridor_profile(points, _CLEARANCE_HEADINGS)
-        rear_evidence = _sector_clearance(points, 180.0, 60.0)
+        # The frame arrays are built once per scan and shared; walking the
+        # point objects again here cost more than the geometry itself.
+        frame = self.scan_frame()
+        angles = frame.angles_deg.astype(np.float64)
+        ranges = frame.ranges_m.astype(np.float64)
+        strength = frame.intensity.astype(np.float64)
+
+        def sector(centre_deg: float, half_width_deg: float) -> float | None:
+            return sector_clearance_arrays(
+                angles, ranges, strength, centre_deg, half_width_deg
+            )
+
+        profiles = corridor_profile_arrays(
+            frame.angles_deg, frame.ranges_m, frame.intensity, _CLEARANCE_HEADINGS
+        )
+        rear_evidence = sector(180.0, 60.0)
         clearance = SectorClearance(
-            _sector_clearance(points, 0.0, 20.0),
-            _sector_clearance(points, -75.0, 35.0),
-            _sector_clearance(points, 75.0, 35.0),
+            sector(0.0, 20.0),
+            sector(-75.0, 35.0),
+            sector(75.0, 35.0),
             True,
-            _sector_clearance(points, -35.0, 20.0),
-            _sector_clearance(points, 35.0, 20.0),
+            sector(-35.0, 20.0),
+            sector(35.0, 20.0),
             profiles[:-1],
             None if rear_evidence is None else float(profiles[-1]),
             scan_at,
@@ -3609,6 +3690,58 @@ def display_available() -> bool:
     return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
 
+#: Where the kernel reports each video connector's state on a Raspberry Pi.
+DRM_STATUS_GLOB = "/sys/class/drm/card*-*/status"
+#: How often to re-check, so a monitor plugged in later is picked up.
+MONITOR_RECHECK_S = 5.0
+
+
+def monitor_connected(pattern: str = DRM_STATUS_GLOB) -> bool | None:
+    """True if any video output reports a connected screen.
+
+    None when the kernel does not expose connector state (not Linux, or an
+    older display driver), in which case the caller keeps its previous
+    behaviour. A desktop session alone is not evidence of a screen: the Pi
+    runs one with nothing plugged in, and on the 2026-09-23 field run the
+    robot spent 29-78 ms of every control tick drawing a window nobody could
+    see.
+    """
+    import glob
+
+    paths = glob.glob(pattern)
+    if not paths:
+        return None
+    for path in paths:
+        try:
+            with open(path, encoding="ascii") as handle:
+                if handle.read().strip() == "connected":
+                    return True
+        except OSError:
+            continue
+    return False
+
+
+class DisplayGate:
+    """Decide whether the local window is worth drawing, re-checked lazily."""
+
+    def __init__(self, session: bool, probe=monitor_connected) -> None:
+        self.session = session
+        self._probe = probe
+        self._checked_at: float | None = None
+        self._wanted = False
+        self.opened = False
+
+    def wanted(self, now: float) -> bool:
+        if not self.session:
+            return False
+        if self._checked_at is None or now - self._checked_at >= MONITOR_RECHECK_S:
+            self._checked_at = now
+            state = self._probe()
+            # Unknown connector state: keep the old behaviour and draw.
+            self._wanted = True if state is None else state
+        return self._wanted
+
+
 def open_dashboard_window() -> None:
     cv2.namedWindow(WINDOW_TITLE, cv2.WINDOW_NORMAL)
     maximize_dashboard_window()
@@ -3712,6 +3845,10 @@ def main() -> int:
     local_map = LidarSlamLite()
     # Global planning runs on its own thread; see AsyncExplorer.
     explorer = AsyncExplorer(FrontierExplorer())
+    # So does the map, which also feeds the explorer; see MapWorker.
+    map_worker = MapWorker(local_map, explorer)
+    last_submitted_scan = -1.0
+    last_stuck_phase = "IDLE"
     scan_motion = ScanMotionTracker()
     mover_tracker = MovingObjectTracker()
     slam_lite = local_map.state()
@@ -3730,7 +3867,6 @@ def main() -> int:
         max_skip_s=LOOP_MAX_SKIP_S,
     )
     last_policy_state: tuple[str, str, str] | None = None
-    last_recenter_count = slam_lite.recenter_count
     last_imu_error: str | None = None
     calibrated_source: str | None = None
     imu_probe_until = policy.started_at + IMU_PROBE_GRACE_S
@@ -3738,13 +3874,14 @@ def main() -> int:
     imu_calibration_complete = False
     next_imu_calibration_diagnostic_at = 0.0
     last_displacement_count = policy.displacement_count
-    planner_resync = False
     keep_running = True
     # A desktop session is no longer required. Without one the runtime keeps
     # driving and keeps streaming; only the local window is skipped.
-    show_window = not args.no_display and display_available()
-    if not args.no_display and not show_window:
+    display_gate = DisplayGate(not args.no_display and display_available())
+    if not args.no_display and not display_gate.session:
         print("No DISPLAY/WAYLAND_DISPLAY; running headless with stream only")
+    elif display_gate.session and monitor_connected() is False:
+        print("Desktop session but no monitor connected; skipping the local window")
     dashboard_stream = None
     dashboard_server = None
     robot_control = RobotControl()
@@ -3784,8 +3921,6 @@ def main() -> int:
 
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
-    if show_window:
-        open_dashboard_window()
     try:
         while keep_running:
             now = time.monotonic()
@@ -3859,8 +3994,12 @@ def main() -> int:
                 and now - camera_motion.captured_at <= 0.45
                 and camera_motion.confidence >= 0.25
             )
-            slam_lite = local_map.update(
-                points,
+            # Hand this tick's motion, and the scan if it is new, to the map
+            # worker; take the latest pose it has finished. The worker replays
+            # every tick's motion in order, so dead reckoning is unchanged,
+            # and recentre shifts reach the explorer from there.
+            new_scan = scan.size > 0 and scan.stamp > last_submitted_scan
+            map_worker.submit(MotionSample(
                 policy.left_pwm,
                 policy.right_pwm,
                 now,
@@ -3868,23 +4007,13 @@ def main() -> int:
                 camera_motion.yaw_rate_dps if camera_flow_fresh else None,
                 camera_motion.translation_scale if camera_flow_fresh else 1.0,
                 imu_yaw,
-                scan_stamp_hint=scan.stamp if scan.size else None,
-            )
+                points if new_scan else None,
+                scan.stamp if new_scan else None,
+            ))
+            if new_scan:
+                last_submitted_scan = scan.stamp
+            slam_lite = map_worker.state()
             policy.observe_pose(slam_lite)
-            if slam_lite.recenter_count != last_recenter_count:
-                # The occupancy grid just scrolled to keep the robot off its
-                # edge. Move the goal and route by the same shift rather than
-                # discarding them: in a large room this happens every metre or
-                # two, and dropping the goal each time is what kept the robot
-                # re-choosing destinations and circling one area.
-                shift_rows, shift_cols = local_map.last_shift_cells
-                explorer.shift(
-                    shift_rows,
-                    shift_cols,
-                    local_map.cells / local_map.metres,
-                )
-                planner_resync = True
-                last_recenter_count = slam_lite.recenter_count
             stage_clock = _mark(stage_timer, "slam", stage_clock)
             # Make the safety decision and refresh the Uno watchdog before the
             # advisory global planner runs.  A bounded but non-trivial A* search
@@ -3916,9 +4045,9 @@ def main() -> int:
                         scan_angles,
                         scan_ranges,
                         scan.stamp,
-                        local_map.x,
-                        local_map.y,
-                        local_map.heading,
+                        slam_lite.x_m,
+                        slam_lite.y_m,
+                        slam_lite.heading_deg,
                         imu_yaw_rate,
                     )
                 )
@@ -3934,15 +4063,19 @@ def main() -> int:
             )
             policy.send(arduino, command, control_now)
             stage_clock = _mark(stage_timer, "decide", stage_clock)
+            if policy.stuck_phase == "RECOVER" and last_stuck_phase != "RECOVER":
+                # Confirmed stuck: tell the planner where, so the next goal is
+                # not the same place reached the same way.
+                explorer.note_trouble(slam_lite.x_m, slam_lite.y_m)
+            last_stuck_phase = policy.stuck_phase
             if policy.displacement_count != last_displacement_count:
                 # The chassis was picked up or shoved. The occupancy grid, the
                 # visit history and the cached route all describe where it
                 # used to be, and no sensor here can relate the old frame to
                 # the new one, so restart the map where it now stands.
                 last_displacement_count = policy.displacement_count
-                local_map.reset()
+                map_worker.request_reset()
                 explorer.invalidate()
-                planner_resync = True
                 scan_motion.reset()
                 mover_tracker.reset()
                 print(
@@ -3969,22 +4102,9 @@ def main() -> int:
                     f"recenter={slam_lite.recenter_count}"
                 )
                 last_policy_state = policy_state
-            # Hand the planner the latest pose (and a map copy when due), then
-            # take whatever plan it has most recently finished. This never
-            # waits: a slow replan costs freshness, not control latency.
-            explorer.publish(
-                local_map.grid,
-                local_map.observed,
-                local_map.visits,
-                local_map.x,
-                local_map.y,
-                local_map.heading,
-                local_map.metres,
-                slam_lite.map_updates,
-                control_now,
-                force=planner_resync,
-            )
-            planner_resync = False
+            # The map worker hands the explorer each map and pose; take
+            # whatever plan it has most recently finished. This never waits:
+            # a slow replan costs freshness, not control latency.
             exploration = explorer.state()
             policy.observe_exploration(exploration)
             stage_clock = _mark(stage_timer, "explore", stage_clock)
@@ -4069,10 +4189,13 @@ def main() -> int:
                 # 5 Hz; the LiDAR only turns at about 10 Hz anyway.
                 next_telemetry_publish_at = now + (0.2 if wants_full else 0.25)
                 if wants_full and now >= next_map_publish_at:
-                    png = encode_map_png(local_map)
+                    # Borrowed without waiting: if the worker is mid-update,
+                    # the phone gets this map image next time instead.
+                    with map_worker.borrow() as map_view:
+                        png = None if map_view is None else encode_map_png(map_view)
                     if png is not None:
                         telemetry_hub.publish_map(png)
-                    next_map_publish_at = now + 2.0
+                        next_map_publish_at = now + 2.0
             stage_clock = _mark(stage_timer, "telemetry", stage_clock)
             camera_stream = (
                 None if dashboard_server is None else dashboard_server.camera
@@ -4087,7 +4210,10 @@ def main() -> int:
                     camera_stream.publish(frame)
                 next_camera_publish_at = now + camera_stream.publish_period_s
             stage_clock = _mark(stage_timer, "camera_pub", stage_clock)
-            window_due = show_window and now >= next_display_at
+            window_due = now >= next_display_at and display_gate.wanted(now)
+            if window_due and not display_gate.opened:
+                open_dashboard_window()
+                display_gate.opened = True
             stream_due = (
                 dashboard_stream is not None
                 and dashboard_stream.viewers > 0
@@ -4116,8 +4242,10 @@ def main() -> int:
                     if exploration.waypoint_x_m is None or exploration.waypoint_y_m is None
                     else (exploration.waypoint_x_m, exploration.waypoint_y_m)
                 )
-                panel = draw_dashboard(
-                    local_map.render(
+                # Borrowed without waiting, like the map image above: a busy
+                # map worker costs this frame, never the control decision.
+                with map_worker.borrow() as map_view:
+                    map_image = None if map_view is None else map_view.render(
                         size=640,
                         target_xy=target_xy,
                         waypoint_xy=waypoint_xy,
@@ -4132,26 +4260,29 @@ def main() -> int:
                             if policy.arc.admissible
                             else None
                         ),
-                    ),
-                    policy,
-                    clearance,
-                    status,
-                    False,
-                    camera_ready,
-                    arduino.differential_ready,
-                    imu_state,
-                    slam_lite,
-                    camera_motion,
-                )
-                if stream_due:
-                    dashboard_stream.publish(panel)
-                if window_due:
-                    cv2.imshow(WINDOW_TITLE, panel)
-                    if fullscreen_refreshes > 0:
-                        maximize_dashboard_window()
-                        fullscreen_refreshes -= 1
-                    if cv2.waitKey(1) & 0xFF in (27, ord("q"), ord("Q")):
-                        break
+                    )
+                if map_image is not None:
+                    panel = draw_dashboard(
+                        map_image,
+                        policy,
+                        clearance,
+                        status,
+                        False,
+                        camera_ready,
+                        arduino.differential_ready,
+                        imu_state,
+                        slam_lite,
+                        camera_motion,
+                    )
+                    if stream_due:
+                        dashboard_stream.publish(panel)
+                    if window_due:
+                        cv2.imshow(WINDOW_TITLE, panel)
+                        if fullscreen_refreshes > 0:
+                            maximize_dashboard_window()
+                            fullscreen_refreshes -= 1
+                        if cv2.waitKey(1) & 0xFF in (27, ord("q"), ord("Q")):
+                            break
             _mark(stage_timer, "render", stage_clock)
             stage_timer.tick()
             # Sleep the remainder of the control period rather than a fixed
@@ -4167,10 +4298,11 @@ def main() -> int:
         camera.close()
         if imu is not None:
             imu.close()
+        map_worker.close()
         explorer.close()
         if dashboard_server is not None:
             dashboard_server.close()
-        if show_window:
+        if display_gate.opened:
             cv2.destroyAllWindows()
     return 0
 

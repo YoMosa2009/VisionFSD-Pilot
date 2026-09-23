@@ -99,6 +99,19 @@ class FrontierExplorer:
     ROBOT_RECONNECT_M = 0.40
     ROUTE_CLEARANCE_WEIGHT = 0.80
     FRONTIER_CLEARANCE_WEIGHT = 0.55
+    # "Been there" memory. A 360-degree LiDAR sees a whole room within seconds,
+    # so what the robot has *seen* says little about where it has *been*.
+    # Novelty is the distance from a cell to the nearest place the chassis has
+    # physically driven; goals prefer it, capped so that very far does not
+    # outweigh reachable and open.
+    NOVELTY_CAP_M = 2.5
+    FRONTIER_NOVELTY_WEIGHT = 0.45
+    PATROL_NOVELTY_WEIGHT = 1.00
+    PATROL_DISTANCE_WEIGHT = 0.25
+    # Where the robot got stuck, and the goal it was chasing then, are avoided
+    # for this long: retrying the same thing the same way is what it looked
+    # like it had forgotten.
+    TROUBLE_MEMORY_S = 90.0
     ROUTE_LENGTH_WEIGHT = 0.28
     ROUTE_DETOUR_WEIGHT = 0.45
 
@@ -328,6 +341,7 @@ class FrontierExplorer:
         robot: tuple[int, int],
         scale: float,
         obstacle_clearance: np.ndarray | None = None,
+        novelty_m: np.ndarray | None = None,
     ) -> list[tuple[float, tuple[int, int]]]:
         unknown_nearby = cv2.dilate(
             (~known).astype(np.uint8), np.ones((3, 3), dtype=np.uint8)
@@ -339,6 +353,8 @@ class FrontierExplorer:
         count, labels, stats, centroids = cv2.connectedComponentsWithStats(
             frontier.astype(np.uint8), connectivity=8
         )
+        if novelty_m is None:
+            novelty_m = self._novelty_m(visits, scale)
         candidates: list[tuple[float, tuple[int, int]]] = []
         for label in range(1, count):
             area = int(stats[label, cv2.CC_STAT_AREA])
@@ -357,7 +373,7 @@ class FrontierExplorer:
             distance = math.hypot(
                 target[0] - robot[0], target[1] - robot[1]
             ) / scale
-            visit_penalty = float(visits[target]) * 0.025
+            novelty = float(novelty_m[target])
             persistence = 0.0
             if self._target_cell is not None:
                 previous_distance = math.hypot(
@@ -376,7 +392,7 @@ class FrontierExplorer:
                 + min(distance, 3.0) * 0.22
                 + persistence
                 + clearance_reward
-                - visit_penalty
+                + novelty * self.FRONTIER_NOVELTY_WEIGHT
             )
             candidates.append((score, target))
         self._frontier_count = len(candidates)
@@ -406,6 +422,7 @@ class FrontierExplorer:
         robot: tuple[int, int],
         scale: float,
         obstacle_clearance: np.ndarray | None = None,
+        novelty_m: np.ndarray | None = None,
     ) -> list[tuple[float, tuple[int, int]]]:
         """Roaming goals for when there is nothing left to discover.
 
@@ -437,9 +454,15 @@ class FrontierExplorer:
             if obstacle_clearance is None
             else np.minimum(obstacle_clearance[rows, cols] / scale, 0.8)
         )
+        if novelty_m is None:
+            novelty_m = cls._novelty_m(visits, scale)
+        novelty = novelty_m[rows, cols]
+        # Where the robot has not been leads; open enough to fit, and far
+        # enough to be worth the trip, follow. Candidates are already
+        # reachable with the chassis inflation, so every one of them fits.
         score = (
-            np.minimum(distance, cls.ROAM_MAX_DISTANCE_M) * 0.55
-            - visits[rows, cols].astype(np.float32) * 0.06
+            novelty * cls.PATROL_NOVELTY_WEIGHT
+            + np.minimum(distance, cls.ROAM_MAX_DISTANCE_M) * cls.PATROL_DISTANCE_WEIGHT
             + openness * 0.6
         )
         order = np.argsort(score)[::-1][:12]
@@ -619,6 +642,34 @@ class FrontierExplorer:
             fine_scale / factor,
         )
 
+    @classmethod
+    def _novelty_m(cls, visits: np.ndarray, scale: float) -> np.ndarray:
+        """Metres from each planning cell to the nearest cell driven through.
+
+        A single-cell visit lookup, as before, let a goal 20 cm beside a path
+        the robot had driven ten times score as never visited.
+        """
+        unvisited = (visits == 0).astype(np.uint8)
+        if not np.any(unvisited == 0):
+            # Nowhere driven yet: everything is equally new.
+            return np.full(visits.shape, cls.NOVELTY_CAP_M, dtype=np.float32)
+        distance = cv2.distanceTransform(unvisited, cv2.DIST_L2, 3) / scale
+        return np.minimum(distance, cls.NOVELTY_CAP_M).astype(np.float32)
+
+    def note_trouble(self, x_m: float, y_m: float, now: float) -> None:
+        """The robot got stuck here: avoid this spot, and drop the goal.
+
+        explore_lite's rule for a failed goal, applied to getting stuck: the
+        goal being chased and the place it went wrong are both kept out of
+        consideration for a while, and a new goal is chosen now.
+        """
+        until = now + self.TROUBLE_MEMORY_S
+        self._blacklist.append((x_m, y_m, until))
+        if self._target_cell is not None and self._scale > 0.0:
+            self._remember(self._target_cell, self._scale, until)
+        self._drop_goal()
+        self._next_replan_at = 0.0
+
     def _prune_blacklist(self, now: float) -> None:
         self._blacklist = [entry for entry in self._blacklist if entry[2] > now]
 
@@ -787,14 +838,17 @@ class FrontierExplorer:
             return self._state(x_m, y_m, heading_deg, scale)
         reachable = (labels == robot_label) & free_mask
 
+        novelty_m = self._novelty_m(plan_visits, scale)
         candidates = self._candidate_frontiers(
-            reachable, known, plan_visits, robot, scale, obstacle_clearance
+            reachable, known, plan_visits, robot, scale, obstacle_clearance,
+            novelty_m,
         )
         self._mode = "FRONTIER"
         if not candidates:
             self._mode = "PATROL"
             candidates = self._patrol_candidates(
-                reachable, plan_visits, robot, scale, obstacle_clearance
+                reachable, plan_visits, robot, scale, obstacle_clearance,
+                novelty_m,
             )
         candidates = [
             item for item in candidates if not self._blacklisted(item[1], scale)
@@ -1013,6 +1067,12 @@ class AsyncExplorer:
                     self._state, shift_cols / fine_scale, shift_rows / fine_scale
                 )
 
+    def note_trouble(self, x_m: float, y_m: float) -> None:
+        """The robot got stuck at this map position; see FrontierExplorer."""
+        with self._lock:
+            self._commands.append(("trouble", float(x_m), float(y_m)))
+        self._wake.set()
+
     def invalidate(self) -> None:
         with self._lock:
             self._epoch += 1
@@ -1039,6 +1099,8 @@ class AsyncExplorer:
             for command in commands:
                 if command[0] == "shift":
                     self.explorer.shift(command[1], command[2], command[3])
+                elif command[0] == "trouble":
+                    self.explorer.note_trouble(command[1], command[2], time.monotonic())
                 else:
                     self.explorer.invalidate()
             if snapshot is None or pose is None or snapshot[0] < epoch:

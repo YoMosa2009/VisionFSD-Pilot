@@ -160,6 +160,48 @@ Impact: none on safety. Stuck detection loses one of its votes.
 
 ---
 
+## Run 2 — 2026-09-23, v1.9.27
+
+A controlled 3-minute capture: boot log, then 60 s with no viewer, 60 s with
+light telemetry, 60 s with full telemetry. No HDMI monitor and no other viewer
+attached. Autonomous driving throughout. Runtime v1.9.27, commit `c69cc23`.
+
+**Being watched is not the cost.** Loop rate 2.9 Hz with no viewer, 3.2 Hz
+light, 3.7 Hz full. That settles the caveat in section 3.
+
+**Where the time goes**, mean per tick (no-viewer phase):
+
+| Stage | mean | worst |
+|---|---|---|
+| `sense` | 215 ms | 385 ms |
+| `slam` | 122 ms | 253 ms |
+| `render` | 29 ms | 211 ms — with no monitor and no viewer |
+| `perceive` | 18 ms | 69 ms |
+| `decide` | 17 ms | 63 ms |
+
+Desktop profiling on the recorded sweeps traced `sense` mostly to the six
+sector-clearance checks (n x n comparisons from Python point objects) and
+`slam` to full-grid operations on every scan. `render` was drawing a window
+nobody could see: the Pi runs a desktop session with nothing plugged in.
+
+**The Pi was power-throttled**: `throttled=0x50005` at boot — under-voltage
+and CPU throttling both active. The first run booted `0x0`. This slows every
+stage and is a power-supply problem, not a software one.
+
+**v1.9.27 helped, partly.** Loop 2.9-3.7 Hz against about 1-2 Hz before, and
+the robot had a real frontier goal in 35-50% of samples against 3.5%; global
+planning timeouts fell from 62% to 4-20%.
+
+**The robot was wiping its memory every few seconds.** 33 "picked up" verdicts
+in 3 minutes, each resetting the map and all visit history. Replaying the
+recorded scans of both runs, 96 of 100 false verdicts are explained by the
+robot having turned between the compared scans and 4 by loop stalls. This is
+the main cause of the operator's report that it did not remember where it had
+been. Fixed in v1.9.28.
+
+The IMU still reported `MCP2221 USB timeout`, as expected with no wiring
+change; v1.9.28 makes the message say which step timed out.
+
 ## 4. Plan for the next release
 
 In order. Nothing here is a navigation-behaviour change: at 1 Hz, tuning

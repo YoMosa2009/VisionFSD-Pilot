@@ -37,6 +37,56 @@ class SlamLiteState:
     recenter_count: int = 0
 
 
+@dataclass(frozen=True)
+class ScanArrays:
+    """One conversion of a point list into the arrays every stage needs.
+
+    ``update`` used to turn the same point objects into arrays three times per
+    scan - for yaw bins, for translation matching and for map integration -
+    each a Python-level walk over every return. On the 2026-09-21 and
+    2026-09-23 field runs the map stage cost 80-200 ms per tick on the Pi.
+    Values are computed exactly as before (``float(distance_mm) / 1000.0``
+    rounded to float32), so results do not change.
+    """
+
+    distances: np.ndarray
+    angles: np.ndarray
+    confidence: np.ndarray
+    stamps: np.ndarray
+
+    def __len__(self) -> int:
+        return int(self.distances.size)
+
+    @classmethod
+    def from_points(cls, points) -> "ScanArrays":
+        if isinstance(points, ScanArrays):
+            return points
+        point_list = list(points)
+        count = len(point_list)
+        return cls(
+            distances=np.fromiter(
+                (float(point.distance_mm) / 1000.0 for _index, point in point_list),
+                dtype=np.float32,
+                count=count,
+            ),
+            angles=np.fromiter(
+                (float(point.angle_deg) for _index, point in point_list),
+                dtype=np.float32,
+                count=count,
+            ),
+            confidence=np.fromiter(
+                (float(getattr(point, "confidence", 0.0)) for _index, point in point_list),
+                dtype=np.float32,
+                count=count,
+            ),
+            stamps=np.fromiter(
+                (float(point.captured_at) for _index, point in point_list),
+                dtype=np.float64,
+                count=count,
+            ),
+        )
+
+
 class LidarSlamLite:
     """A Pi 3B-friendly LiDAR/IMU exploration mapper.
 
@@ -115,26 +165,14 @@ class LidarSlamLite:
     @classmethod
     def bins_from_points(cls, points: Iterable[tuple[int, object]]) -> tuple[np.ndarray, float]:
         """Build robust one-degree range bins and return the newest timestamp."""
-        point_list = list(points)
+        scan = ScanArrays.from_points(points)
         values = np.full(cls.BIN_COUNT, np.inf, dtype=np.float32)
-        if not point_list:
+        if not len(scan):
             values.fill(np.nan)
             return values, -1.0
-        distances = np.fromiter(
-            (float(point.distance_mm) / 1000.0 for _index, point in point_list),
-            dtype=np.float32,
-            count=len(point_list),
-        )
-        angles = np.fromiter(
-            (float(point.angle_deg) for _index, point in point_list),
-            dtype=np.float32,
-            count=len(point_list),
-        )
-        stamps = np.fromiter(
-            (float(point.captured_at) for _index, point in point_list),
-            dtype=np.float64,
-            count=len(point_list),
-        )
+        distances = scan.distances
+        angles = scan.angles
+        stamps = scan.stamps
         valid = (distances >= 0.10) & (distances <= 5.8)
         if not np.any(valid):
             values.fill(np.nan)
@@ -337,23 +375,12 @@ class LidarSlamLite:
         self, points: list[tuple[int, object]]
     ) -> tuple[float, float, float, bool]:
         """Correlate current scan hits against the map near the predicted pose."""
-        if self._map_updates < 3 or not points:
+        if self._map_updates < 3 or not len(points):
             return 0.0, 0.0, 0.0, False
-        distances = np.fromiter(
-            (float(point.distance_mm) / 1000.0 for _index, point in points),
-            dtype=np.float32,
-            count=len(points),
-        )
-        angles = np.fromiter(
-            (float(point.angle_deg) for _index, point in points),
-            dtype=np.float32,
-            count=len(points),
-        )
-        confidence = np.fromiter(
-            (float(getattr(point, "confidence", 0.0)) for _index, point in points),
-            dtype=np.float32,
-            count=len(points),
-        )
+        scan = ScanArrays.from_points(points)
+        distances = scan.distances
+        angles = scan.angles
+        confidence = scan.confidence
         valid = (
             (distances >= 0.15)
             & (distances <= min(5.6, self.metres * 0.72))
@@ -505,39 +532,58 @@ class LidarSlamLite:
         elapsed = min(2.0, max(0.0, now - previous))
         return 0.5 ** (elapsed / self.MEMORY_HALF_LIFE_S)
 
+    def _decay_occupied(self, keep: float) -> None:
+        """Fade stored evidence, touching only cells that hold any.
+
+        The grid is 576 x 576 = 331,776 cells, and fading all of them - by
+        converting the whole grid to float, scaling it and splitting it back
+        into whole and fractional parts - happened on every scan. Only
+        occupied cells have evidence to fade: walls and furniture, a few
+        thousand cells. The arithmetic per cell is unchanged, so the half-life
+        is exactly what it was. A fractional remainder is kept only while a
+        cell still holds a whole count; below one count there is no evidence
+        left to keep.
+        """
+        if keep >= 1.0:
+            return
+        flat_grid = self.grid.reshape(-1)
+        flat_remainder = self._decay_remainder.reshape(-1)
+        occupied = np.flatnonzero(flat_grid)
+        if occupied.size == 0:
+            flat_remainder[:] = 0.0
+            return
+        values = (flat_grid[occupied].astype(np.float32) + flat_remainder[occupied]) * keep
+        np.minimum(values, 255.0, out=values)
+        whole = values.astype(np.uint8)
+        flat_grid[occupied] = whole
+        remainder = values - whole
+        remainder[whole == 0] = 0.0
+        flat_remainder[occupied] = remainder
+
     def _integrate_points(
         self, points: Iterable[tuple[int, object]], now: float | None = None
     ) -> None:
-        point_list = list(points)
+        """Fade old evidence, then add this scan's hits and free space.
+
+        Everything a scan can change lies inside the box spanning the robot
+        and its returns: every ray and every free-space wedge runs from the
+        robot to a return. The masks, the free-space clearing and the hit
+        evidence are therefore built for that box only, rather than as three
+        full-grid masks per scan. The cells touched and the arithmetic applied
+        to them are the same as before.
+        """
+        scan = ScanArrays.from_points(points)
         scale = self.cells / self.metres
-        keep = self._decay_factor(now)
-        accumulator = (self.grid.astype(np.float32) + self._decay_remainder) * keep
-        if point_list:
-            distances = np.fromiter(
-                (float(point.distance_mm) / 1000.0 for _index, point in point_list),
-                dtype=np.float32,
-                count=len(point_list),
-            )
-            angles = np.fromiter(
-                (float(point.angle_deg) for _index, point in point_list),
-                dtype=np.float32,
-                count=len(point_list),
-            )
-            confidence = np.fromiter(
-                (
-                    float(getattr(point, "confidence", 0.0))
-                    for _index, point in point_list
-                ),
-                dtype=np.float32,
-                count=len(point_list),
-            )
+        self._decay_occupied(self._decay_factor(now))
+        if len(scan):
             valid = (
-                (distances >= 0.10)
-                & (distances <= self.metres * 0.72)
-                & (confidence >= 20.0)
+                (scan.distances >= 0.10)
+                & (scan.distances <= self.metres * 0.72)
+                & (scan.confidence >= 20.0)
             )
-            distances = distances[valid]
-            radians = np.radians(angles[valid] + self.heading)
+            distances = scan.distances[valid]
+            angles = scan.angles[valid]
+            radians = np.radians(angles + self.heading)
             cols = ((self.x + np.sin(radians) * distances) * scale).astype(np.int32)
             rows = ((self.y - np.cos(radians) * distances) * scale).astype(np.int32)
             inside = (rows >= 0) & (rows < self.cells) & (cols >= 0) & (cols < self.cells)
@@ -545,49 +591,66 @@ class LidarSlamLite:
             hit_cols = cols[inside]
             self._latest_hits = np.column_stack((hit_rows, hit_cols))
 
-            visible = np.zeros_like(self.observed)
             robot_col = int(np.clip(round(self.x * scale), 0, self.cells - 1))
             robot_row = int(np.clip(round(self.y * scale), 0, self.cells - 1))
+            if rows.size:
+                row0 = max(0, min(int(rows.min()), robot_row))
+                row1 = min(self.cells, max(int(rows.max()), robot_row) + 1)
+                col0 = max(0, min(int(cols.min()), robot_col))
+                col1 = min(self.cells, max(int(cols.max()), robot_col) + 1)
+            else:
+                row0, row1, col0, col1 = robot_row, robot_row + 1, robot_col, robot_col + 1
+            box = (slice(row0, row1), slice(col0, col1))
+            visible = np.zeros((row1 - row0, col1 - col0), dtype=self.observed.dtype)
             self._trace_visible(
                 visible,
-                robot_row,
-                robot_col,
-                rows,
-                cols,
-                angles[valid],
+                robot_row - row0,
+                robot_col - col0,
+                rows - row0,
+                cols - col0,
+                angles,
                 distances,
             )
-            self.observed[visible > 0] = 255
+            observed = self.observed[box]
+            observed[visible > 0] = 255
 
-            endpoint_mask = np.zeros_like(self.observed)
-            endpoint_mask[hit_rows, hit_cols] = 255
-            self.observed[endpoint_mask > 0] = 255
+            endpoint_mask = np.zeros_like(visible)
+            endpoint_mask[hit_rows - row0, hit_cols - col0] = 255
+            observed[endpoint_mask > 0] = 255
             free_mask = (visible > 0) & (endpoint_mask == 0)
-            accumulator[free_mask] = np.maximum(
-                accumulator[free_mask] - 4.0, 0.0
+            accumulator = (
+                self.grid[box].astype(np.float32) + self._decay_remainder[box]
             )
+            accumulator[free_mask] = np.maximum(accumulator[free_mask] - 4.0, 0.0)
             # Multiple high-resolution rays can land in one occupancy cell.
             # More samples preserve shape, not multiple independent confirmations.
             accumulator[endpoint_mask > 0] += 12
+            np.minimum(accumulator, 255.0, out=accumulator)
+            whole = accumulator.astype(np.uint8)
+            self.grid[box] = whole
+            self._decay_remainder[box] = accumulator - whole
 
-            visit_mask = np.zeros_like(self.observed)
+            radius = max(1, int(round(0.12 * scale)))
+            v_row0 = max(0, robot_row - radius - 1)
+            v_row1 = min(self.cells, robot_row + radius + 2)
+            v_col0 = max(0, robot_col - radius - 1)
+            v_col1 = min(self.cells, robot_col + radius + 2)
+            visit_mask = np.zeros((v_row1 - v_row0, v_col1 - v_col0), dtype=np.uint8)
             cv2.circle(
                 visit_mask,
-                (robot_col, robot_row),
-                max(1, int(round(0.12 * scale))),
+                (robot_col - v_col0, robot_row - v_row0),
+                radius,
                 1,
                 -1,
             )
+            visits = self.visits[v_row0:v_row1, v_col0:v_col1]
             visit_cells = visit_mask > 0
-            self.visits[visit_cells] = np.minimum(
-                self.visits[visit_cells].astype(np.uint32) + 1,
+            visits[visit_cells] = np.minimum(
+                visits[visit_cells].astype(np.uint32) + 1,
                 np.iinfo(np.uint16).max,
             ).astype(np.uint16)
         else:
             self._latest_hits = np.empty((0, 2), dtype=np.int32)
-        np.minimum(accumulator, 255.0, out=accumulator)
-        self.grid = accumulator.astype(np.uint8)
-        self._decay_remainder = accumulator - self.grid
         self._map_updates += 1
 
     @classmethod
@@ -633,6 +696,25 @@ class LidarSlamLite:
             camera_translation_scale,
             imu_yaw_deg,
         )
+        return self.integrate_scan(
+            points, left_pwm, right_pwm, now, imu_yaw_rate_dps, scan_stamp_hint
+        )
+
+    def integrate_scan(
+        self,
+        points,
+        left_pwm: int,
+        right_pwm: int,
+        now: float,
+        imu_yaw_rate_dps: float | None = None,
+        scan_stamp_hint: float | None = None,
+    ) -> SlamLiteState:
+        """The scan half of update(): match, correct the pose, integrate.
+
+        Split from update() so a worker can replay every control tick's
+        motion in order and integrate the scan at the tick it arrived,
+        exactly as update() would have, without the control loop waiting.
+        """
         self._matched = False
         self._translation_matched = False
         self._translation_correction_m = 0.0
@@ -646,6 +728,8 @@ class LidarSlamLite:
             # most of the per-tick cost of keeping a map at all.
             return self.state()
         points = self.deskew_points(points, now, imu_yaw_rate_dps)
+        # One conversion shared by binning, matching and integration.
+        points = ScanArrays.from_points(points)
         bins, scan_stamp = self.bins_from_points(points)
         new_scan = (
             scan_stamp
