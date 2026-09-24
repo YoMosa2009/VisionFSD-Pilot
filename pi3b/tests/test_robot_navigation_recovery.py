@@ -429,3 +429,52 @@ class IntentReportingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ScanOnlyStallTests(unittest.TestCase):
+    """v1.9.28. On 2026-09-23 no second evidence source ever voted - the IMU
+    was off and the camera flow never reached a confident verdict - so the
+    two-source rule could not confirm a stall however long the robot sat
+    pushing against something. Sustained whole-scan evidence may now confirm
+    one alone, on stronger terms."""
+
+    def _drive(self, policy, seconds: float, verdict_every_s: float = 0.6,
+               verdict: str = "NOT_MOVING", other_camera: CameraMotionState | None = None):
+        now = time.monotonic()
+        next_verdict = now
+        for index in range(int(seconds / 0.05)):
+            tick_now = now + index * 0.05
+            if tick_now >= next_verdict:
+                policy.observe_scan_motion(ScanMotionResult(verdict=verdict), tick_now)
+                next_verdict = tick_now + verdict_every_s
+            clearance = SectorClearance(
+                2.5, 2.5, 2.5, True, 2.5, 2.5, rear_m=1.0, scan_at=tick_now
+            )
+            policy.decide(
+                clearance, _status(tick_now), False, tick_now, True, True,
+                other_camera if other_camera is None else replace(other_camera, captured_at=tick_now),
+            )
+
+    def test_sustained_scan_evidence_alone_confirms_a_stall(self) -> None:
+        policy = AutonomousPolicy(0.0, 118)
+        self._drive(policy, 4.0)
+        self.assertIn(policy.stuck_phase, ("RECOVER", "LATCHED"))
+        self.assertIn("STUCK", policy.reason)
+
+    def test_brief_scan_evidence_alone_is_not_enough(self) -> None:
+        policy = AutonomousPolicy(0.0, 118)
+        self._drive(policy, 1.8)
+        self.assertEqual(policy.stuck_phase, "IDLE")
+
+    def test_one_verdict_read_on_many_ticks_is_one_piece_of_evidence(self) -> None:
+        """A single LD19 verdict stays fresh for a second and is read on every
+        control tick in that time; it must count once."""
+        policy = AutonomousPolicy(0.0, 118)
+        self._drive(policy, 3.0, verdict_every_s=10.0)
+        self.assertEqual(policy.stuck_phase, "IDLE")
+
+    def test_any_source_seeing_motion_vetoes_the_scan(self) -> None:
+        policy = AutonomousPolicy(0.0, 118)
+        moving_camera = CameraMotionState(fresh=True, confidence=0.9, motion_observed=True)
+        self._drive(policy, 4.0, other_camera=moving_camera)
+        self.assertEqual(policy.stuck_phase, "IDLE")

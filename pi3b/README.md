@@ -1092,6 +1092,55 @@ version made contact in it, so it understates real collisions; treat it as a
 comparison, not a prediction. Desktop tests (475 pass). **Nothing here has run
 on the robot.**
 
+### v1.9.29: a plan that finishes, stall detection that can fire, an IMU that can start
+
+From the third field run (2026-09-23, v1.9.28), and the operator watching it:
+spinning a lot, staying in one area, not finding open paths, and not knowing
+when it was stuck.
+
+**v1.9.28's changes held.** Loop 6-7 Hz against about 3 Hz, zero command-lease
+stops in the viewer phases against about 100 a minute, and one map wipe in the
+run against 33.
+
+**The planner almost never finished.** It timed out in about 85% of plans, so
+the robot had no destination and fell back to turning toward the nearest
+opening - the spinning. Profiling on maps built from the recorded drive: a plan
+cost a median 437 ms on a desktop (the Pi is about 11x slower) against a 0.12 s
+budget, nearly all of it up to seven Python A* searches per plan. Now:
+
+- **Branch-and-bound goal choice.** A candidate's straight-line utility bounds
+  its true route utility, since no route is shorter than the straight line.
+  Searching stops once no remaining candidate can beat the best route found,
+  or the bar a new goal must clear to replace the current one. In steady
+  driving that is often zero searches, and every candidate is considered rather
+  than the top six. A test checks the result matches an exhaustive search.
+- **The current route is reused** while it stays clear instead of being
+  searched again every replan.
+- **The search runs over flat Python arrays** instead of per-element numpy
+  indexing - identical routes in 300 of 300 comparisons - and uses a mildly
+  weighted heuristic (1.6), bounding routes at 1.6x optimal (in practice a few
+  percent).
+- **The async budget is 0.4 s**, since the planner runs on its own thread.
+
+Result on the recorded maps: median 437 -> 36 ms, worst 760 -> 95 ms (desktop).
+
+**Stall detection could not fire.** It needs two independent sources to agree
+the chassis is not moving. In this run the IMU was off and the camera flow
+never reached a confident verdict, so only the whole-scan LiDAR check ever
+voted. That check may now confirm a stall alone, on stronger terms than the
+two-source path: three separate scan verdicts over at least 2.5 s, nothing
+saying MOVING, and the wheels driven.
+
+**The IMU adapter could not start.** v1.9.28's clearer message said *adapter
+worker did not start within 8.0 s* - the helper process, not the sensor. It was
+started with "spawn", which re-imports the whole robot runtime (OpenCV, numpy,
+the web server) before running anything; on a throttled Pi 3B that can exceed
+8 s. It now forks on Linux, starting from the already-loaded process, and allows
+12 s for Blinka to open the adapter. Whether the sensor then answers is still
+unknown: if it does not, the log will now say so specifically.
+
+542 tests pass. **Desktop tests and replays of recorded data only.**
+
 ### v1.9.28: stop forgetting, and take the map off the control loop
 
 Two findings from the second field run (2026-09-23, recorded in

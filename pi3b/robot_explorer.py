@@ -6,6 +6,7 @@ camera veto, and Uno ultrasonic stop remain the motor-safety authorities.
 
 from __future__ import annotations
 
+from array import array
 from dataclasses import dataclass
 import heapq
 import math
@@ -80,7 +81,19 @@ class FrontierExplorer:
     # long one replan may hold the interpreter lock rather than how long the
     # control loop waits. It was 45 ms when planning ran inline; that was too
     # short for a 12 m map on a Pi 3B, and it failed to route in open rooms.
-    PLAN_TIME_BUDGET_S = 0.12
+    # The planner runs on its own thread, so its budget costs plan freshness,
+    # not control latency. At 0.12 s it timed out in ~85% of plans on the
+    # 2026-09-23 run: a Pi 3B needs seconds for what a desktop does in 0.2 s,
+    # and without a plan the robot has nowhere to go and turns in place.
+    PLAN_TIME_BUDGET_S = 0.40
+    # Candidates searched with A* per plan, after ranking by straight-line
+    # utility. Every candidate is already known to be reachable; the search is
+    # for the route's length and shape, and six searches per plan was most of
+    # the cost.
+    ROUTE_SHORTLIST = 3
+    # Weighted A*: routes at most this factor longer than optimal (in practice
+    # a few percent), for far fewer expanded cells.
+    ASTAR_HEURISTIC_WEIGHT = 1.6
     # Plan on a coarser grid than the map is stored at. The 12 m map has
     # 2 cm cells for mapping accuracy; routing at that resolution spent most of
     # the planning budget on cells finer than the chassis can steer between.
@@ -133,6 +146,7 @@ class FrontierExplorer:
         self._route_length_m = 0.0
         # (map x metres, map y metres, expires_at)
         self._blacklist: list[tuple[float, float, float]] = []
+        self._route_searches = 0
         self._scale = 1.0
         self._now = 0.0
 
@@ -251,36 +265,60 @@ class FrontierExplorer:
             # for a full search and three fresh grid-sized arrays.
             return [start, goal]
 
+        # The search runs over flat Python arrays rather than indexing numpy
+        # arrays one element at a time: per expanded cell that was eight
+        # numpy scalar reads, and it made each search ~20 ms on a desktop and
+        # seconds on the Pi. g-scores are stored as float32, exactly as before,
+        # so every comparison - and therefore every route - is unchanged.
         height, width = free.shape
-        g_score = np.full((height, width), np.inf, dtype=np.float32)
-        came_row = np.full((height, width), -1, dtype=np.int16)
-        came_col = np.full((height, width), -1, dtype=np.int16)
-        closed = np.zeros((height, width), dtype=bool)
-        g_score[start] = 0.0
+        size = height * width
+        passable = free.astype(np.uint8).tobytes()
+        extra = (
+            None
+            if traversal_cost is None
+            else traversal_cost.astype(np.float32).ravel().tolist()
+        )
+        g_score = array("f", [math.inf]) * size
+        came = array("i", [-1]) * size
+        closed = bytearray(size)
+        start_index = start[0] * width + start[1]
+        goal_index = goal[0] * width + goal[1]
+        goal_row, goal_col = goal
+        weight = cls.ASTAR_HEURISTIC_WEIGHT
+        g_score[start_index] = 0.0
         queue: list[tuple[float, float, int, int]] = [
-            (math.hypot(goal[0] - start[0], goal[1] - start[1]), 0.0, *start)
+            (
+                math.hypot(goal_row - start[0], goal_col - start[1]) * weight,
+                0.0,
+                *start,
+            )
         ]
+        diagonal = math.sqrt(2.0)
         neighbours = (
             (-1, 0, 1.0),
             (1, 0, 1.0),
             (0, -1, 1.0),
             (0, 1, 1.0),
-            (-1, -1, math.sqrt(2.0)),
-            (-1, 1, math.sqrt(2.0)),
-            (1, -1, math.sqrt(2.0)),
-            (1, 1, math.sqrt(2.0)),
+            (-1, -1, diagonal),
+            (-1, 1, diagonal),
+            (1, -1, diagonal),
+            (1, 1, diagonal),
         )
+        hypot = math.hypot
+        heappush = heapq.heappush
+        heappop = heapq.heappop
         visited = 0
         found = False
         while queue and visited < cls.MAX_ASTAR_VISITS:
             if visited % 64 == 0 and deadline is not None and time.perf_counter() >= deadline:
                 return None
-            _estimate, cost, row, col = heapq.heappop(queue)
-            if closed[row, col]:
+            _estimate, cost, row, col = heappop(queue)
+            index = row * width + col
+            if closed[index]:
                 continue
-            closed[row, col] = True
+            closed[index] = 1
             visited += 1
-            if (row, col) == goal:
+            if index == goal_index:
                 found = True
                 break
             for delta_row, delta_col, step_cost in neighbours:
@@ -288,38 +326,41 @@ class FrontierExplorer:
                 next_col = col + delta_col
                 if not (0 <= next_row < height and 0 <= next_col < width):
                     continue
-                if not free[next_row, next_col] or closed[next_row, next_col]:
+                next_index = next_row * width + next_col
+                if not passable[next_index] or closed[next_index]:
                     continue
                 if delta_row != 0 and delta_col != 0:
-                    if not free[row + delta_row, col] or not free[row, col + delta_col]:
+                    if (
+                        not passable[(row + delta_row) * width + col]
+                        or not passable[row * width + col + delta_col]
+                    ):
                         continue
                 next_cost = cost + step_cost * (
-                    1.0
-                    if traversal_cost is None
-                    else 1.0 + float(traversal_cost[next_row, next_col])
+                    1.0 if extra is None else 1.0 + extra[next_index]
                 )
-                if next_cost >= float(g_score[next_row, next_col]):
+                if next_cost >= g_score[next_index]:
                     continue
-                g_score[next_row, next_col] = next_cost
-                came_row[next_row, next_col] = row
-                came_col[next_row, next_col] = col
-                heuristic = math.hypot(goal[0] - next_row, goal[1] - next_col)
-                heapq.heappush(
+                g_score[next_index] = next_cost
+                came[next_index] = index
+                heappush(
                     queue,
-                    (next_cost + heuristic, next_cost, next_row, next_col),
+                    (
+                        next_cost + hypot(goal_row - next_row, goal_col - next_col) * weight,
+                        next_cost,
+                        next_row,
+                        next_col,
+                    ),
                 )
         if not found:
             return None
 
         path = [goal]
-        current = goal
-        while current != start:
-            row = int(came_row[current])
-            col = int(came_col[current])
-            if row < 0 or col < 0:
+        current = goal_index
+        while current != start_index:
+            current = came[current]
+            if current < 0:
                 return None
-            current = (row, col)
-            path.append(current)
+            path.append((current // width, current % width))
         path.reverse()
         return path
 
@@ -709,30 +750,40 @@ class FrontierExplorer:
         scale,
         deadline,
         skip=None,
+        must_beat: float = float("-inf"),
     ):
-        """A* each shortlisted candidate and return the best by utility.
+        """Best candidate by route utility, searching as few routes as possible.
 
-        Returns (target, path, utility, committed_path, committed_utility)
-        where the committed entries describe ``skip``'s complement: the goal
-        already being driven toward, if it was evaluated.
+        Candidates arrive sorted by straight-line utility, an upper bound on
+        their true utility. Once the next bound cannot beat the best route
+        found - or ``must_beat``, the bar an alternative has to clear to
+        replace the goal already being driven toward - no remaining candidate
+        can win and the search stops. In steady driving that is usually before
+        the first A*. ``ROUTE_SHORTLIST`` caps the searches per plan.
         """
         chosen_target = None
         chosen_path = None
         chosen_utility = float("-inf")
+        searches = 0
         for candidate_score, target in ranked_candidates:
             if skip is not None and target == skip:
                 continue
+            direct_m = math.hypot(
+                target[0] - planning_start[0],
+                target[1] - planning_start[1],
+            ) / scale
+            bound = self._route_utility(candidate_score, direct_m, direct_m)
+            if bound <= chosen_utility or bound < must_beat:
+                break
+            if searches >= self.ROUTE_SHORTLIST:
+                break
             path = self._astar(
                 reachable, planning_start, target, deadline, traversal_cost
             )
+            searches += 1
             if path:
                 utility = self._route_utility(
-                    candidate_score,
-                    self._route_length(path, scale),
-                    math.hypot(
-                        target[0] - planning_start[0],
-                        target[1] - planning_start[1],
-                    ) / scale,
+                    candidate_score, self._route_length(path, scale), direct_m
                 )
                 if utility > chosen_utility:
                     chosen_utility = utility
@@ -740,7 +791,34 @@ class FrontierExplorer:
                     chosen_path = path
             if deadline is not None and time.perf_counter() >= deadline:
                 break
+        self._route_searches = searches
         return chosen_target, chosen_path, chosen_utility
+
+    def _reuse_route(
+        self,
+        reachable: np.ndarray,
+        start: tuple[int, int],
+        goal: tuple[int, int],
+    ) -> list[tuple[int, int]] | None:
+        """The current route from where the robot is now, if still clear."""
+        path = self._path_cells
+        if not path or path[-1] != goal:
+            return None
+        height, width = reachable.shape
+        for row, col in path:
+            if not (0 <= row < height and 0 <= col < width) or not reachable[row, col]:
+                return None
+        nearest = min(
+            range(len(path)),
+            key=lambda index: (path[index][0] - start[0]) ** 2
+            + (path[index][1] - start[1]) ** 2,
+        )
+        remaining = path[nearest:]
+        if remaining[0] == start:
+            return remaining
+        if not self._line_is_clear(reachable, start, remaining[0]):
+            return None
+        return [start] + remaining
 
     def update(
         self,
@@ -862,9 +940,10 @@ class FrontierExplorer:
             and bool(reachable[committed])
             and not self._blacklisted(committed, scale)
         )
-        # Do not spend the bounded A* budget on a distant candidate merely
-        # because it has a large frontier. Prefer high-value nearby openings,
-        # then use actual route detour as a second efficiency penalty.
+        # Rank by straight-line utility. A real route is never shorter than
+        # the straight line and never has negative detour, so this is an upper
+        # bound on each candidate's true utility - which is what lets
+        # _best_route stop searching as soon as nothing left can win.
         ranked_candidates = sorted(
             candidates,
             key=lambda item: (
@@ -875,34 +954,33 @@ class FrontierExplorer:
                 ) / scale * self.ROUTE_LENGTH_WEIGHT
             ),
             reverse=True,
-        )[:6]
+        )
 
-        # Validate the existing goal first so alternatives cannot consume its
-        # entire budget. Every search shares the same absolute deadline.
+        # The goal being driven toward: reuse its route while that route is
+        # still clear, and search only when it is not. Re-searching an
+        # unchanged route every replan was a large part of the planner's cost.
         committed_path = None
         if committed_valid:
-            committed_path = self._astar(
-                reachable, planning_start, committed, deadline, traversal_cost
-            )
-        chosen_target, chosen_path, chosen_utility = self._best_route(
-            ranked_candidates, reachable, planning_start, traversal_cost,
-            scale, deadline,
-        )
+            committed_path = self._reuse_route(reachable, planning_start, committed)
+            if committed_path is None:
+                committed_path = self._astar(
+                    reachable, planning_start, committed, deadline, traversal_cost
+                )
+
+        committed_utility = None
+        must_beat = float("-inf")
+        skip = None
         if committed_path:
             route_m = self._route_length(committed_path, scale)
             if route_m < self._goal_best_route_m - self.PROGRESS_MIN_M:
                 self._goal_best_route_m = route_m
                 self._goal_progress_at = now
+            skip = committed
             if now - self._goal_progress_at > self.PROGRESS_TIMEOUT_S:
                 # explore_lite's rule: a goal the robot has stopped getting
                 # closer to is abandoned, and kept out of consideration for a
                 # while rather than chosen again the moment it is dropped.
                 self._remember(committed, scale, now + self.BLACKLIST_S)
-                if chosen_target == committed:
-                    chosen_target, chosen_path, chosen_utility = self._best_route(
-                        ranked_candidates, reachable, planning_start,
-                        traversal_cost, scale, deadline, skip=committed,
-                    )
             else:
                 committed_score = next(
                     (score for score, target in candidates if target == committed),
@@ -922,15 +1000,20 @@ class FrontierExplorer:
                         committed[1] - planning_start[1],
                     ) / scale,
                 )
-                if chosen_target is None or (
-                    chosen_utility < committed_utility + self.GOAL_SWITCH_MARGIN
-                ):
-                    # Hysteresis. A slightly better goal appearing is not a
-                    # reason to turn around; with a one-metre turning radius,
-                    # changing goals is itself expensive.
-                    chosen_target = committed
-                    chosen_path = committed_path
-                    chosen_utility = committed_utility
+                # Hysteresis. A slightly better goal appearing is not a reason
+                # to turn around; with a one-metre turning radius, changing
+                # goals is itself expensive.
+                must_beat = committed_utility + self.GOAL_SWITCH_MARGIN
+        chosen_target, chosen_path, chosen_utility = self._best_route(
+            ranked_candidates, reachable, planning_start, traversal_cost,
+            scale, deadline, skip=skip, must_beat=must_beat,
+        )
+        if committed_utility is not None and (
+            chosen_target is None or chosen_utility < must_beat
+        ):
+            chosen_target = committed
+            chosen_path = committed_path
+            chosen_utility = committed_utility
 
         self._planning_ms = (time.perf_counter() - planning_started) * 1000.0
         if chosen_target is None or chosen_path is None:

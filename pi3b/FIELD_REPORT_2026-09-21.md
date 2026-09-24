@@ -133,11 +133,15 @@ with `imu_age_ms` climbing to 945217 — not one successful sample in 15 minutes
 kernel driver. The v1.9.25 setup repair ran and did its job. The adapter is
 enumerated and the runtime opens it.
 
-**What remains:** the I²C transaction to the LSM6DS3 times out. That is the
-adapter↔sensor link, not software — wiring (SDA/SCL/VCC/GND), missing I²C
-pull-up resistors, a damaged breakout, or a bad USB cable. It should be
-checked physically. No further software change will fix a link that never
-answers.
+**Corrected by run 3.** This section originally concluded the I²C
+transaction to the LSM6DS3 was timing out, and blamed wiring. That was not
+established: the old message was identical for two different failures. With
+v1.9.28's distinct messages the robot reported *adapter worker did not start
+within 8.0 s* - the helper process that owns the USB adapter never started,
+so the sensor was never even asked. The likely cause is software: the helper
+was started with "spawn", which re-imports the whole runtime first. v1.9.29
+forks it instead. Wiring remains possible, but is unproven either way until
+the helper starts.
 
 Impact: none on safety. Stuck detection loses one of its votes.
 
@@ -201,6 +205,43 @@ been. Fixed in v1.9.28.
 
 The IMU still reported `MCP2221 USB timeout`, as expected with no wiring
 change; v1.9.28 makes the message say which step timed out.
+
+## Run 3 — 2026-09-23 evening, v1.9.28
+
+Same 3-minute phased capture, no monitor, no other viewer. Operator watching:
+lots of spinning, staying in one area, not finding open paths, poor at knowing
+when stuck.
+
+| | Run 2 (v1.9.27) | Run 3 (v1.9.28) |
+|---|---|---|
+| Loop rate (light/full phases) | 3.2-3.7 Hz | 6.6-6.7 Hz |
+| Median control gap | 260-304 ms | 153-154 ms |
+| Lease stops (light/full phases) | 95-132 | **0** |
+| "Picked up" map wipes, whole run | 33 | 1 |
+| `slam` on the control thread | 83-122 ms | 0.2 ms |
+| `render` with no screen or viewer | 14-29 ms | 0.3-0.7 ms |
+| Planner timed out | 4-20% | **~85%** |
+
+`sense` (95-120 ms) and `perceive` (47-76 ms) are now the largest control-thread
+costs. Power flags `0x50000`: under-voltage and throttling *had occurred*
+since boot, not active at the moment of logging.
+
+**Findings:**
+
+- **No destination, again.** The planner timed out in ~85% of plans; a plan
+  needs several desktop-equivalent hundreds of milliseconds on a Pi, nearly
+  all Python A*. With no goal the robot turns toward the nearest opening,
+  often behind it (bearings of -120 to +145 degrees). Fixed in v1.9.29.
+- **No admissible arc in 52% of samples.** When blocked, the nearest return in
+  the robot's lane ahead was a median 0.55 m away: genuine clutter, not
+  ghosts.
+- **Moving-object yields in ~22% of samples**, mostly slow (median 0.07 m/s).
+  Mover counts do not differ between turning and straight driving, so they are
+  not a pose-lag artefact. Some likely were the operator nearby.
+- **Stall detection could not confirm anything**: only the whole-scan LiDAR
+  source ever voted; the rule needs two. Fixed in v1.9.29.
+- **IMU**: *adapter worker did not start within 8.0 s* - the helper process,
+  not the sensor. Fixed in v1.9.29 as far as software can tell.
 
 ## 4. Plan for the next release
 

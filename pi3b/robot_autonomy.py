@@ -289,6 +289,14 @@ IMU_HARD_YAW_RATE_DPS = 55.0
 STUCK_CONFIRM_WINDOW_S = 1.20
 STUCK_MIN_NOT_MOVING_VOTES = 3
 STUCK_MIN_CORROBORATING_SOURCES = 2
+# The whole-revolution LD19 check may confirm a stall on its own, but only on
+# stronger evidence than the two-source path needs: this many separate scan
+# verdicts, spread over at least this long, with nothing saying MOVING. On the
+# 2026-09-23 run no second source ever voted - the IMU was off and the camera
+# flow never reached a confident verdict - so the two-source rule could not
+# fire at all, and the robot kept driving into things it was stuck against.
+STUCK_SCAN_ONLY_MIN_VERDICTS = 3
+STUCK_SCAN_ONLY_CONFIRM_S = 2.5
 STUCK_RECOVERY_ATTEMPT_S = 0.80
 STUCK_MAX_RECOVERY_ATTEMPTS = 3
 # A recovery burst is bounded so a genuinely jammed drivetrain is not ground
@@ -1355,6 +1363,9 @@ class AutonomousPolicy:
         self._visual_last_at = 0.0
         self._visual_until = 0.0
         self._stuck_window_start: float | None = None
+        self._scan_stall_since: float | None = None
+        self._scan_stall_verdicts = 0
+        self._scan_stall_last_at: float | None = None
         self._stuck_not_moving_ticks = 0
         self._stuck_latched_reason = "STOP:STUCK_NEEDS_RESET"
         self._stuck_latched_at = 0.0
@@ -3173,6 +3184,30 @@ class AutonomousPolicy:
         self.stuck_phase = self._stuck_phase
         return command
 
+    def _scan_only_stall(self, votes: dict[str, str], now: float) -> bool:
+        """Sustained whole-scan evidence of no motion, with nothing against it.
+
+        Counts distinct LD19 verdicts, not control ticks: one verdict read on
+        many ticks is still one piece of evidence.
+        """
+        if votes.get("scan") != "NOT_MOVING" or "MOVING" in votes.values():
+            self._reset_scan_stall()
+            return False
+        if self._scan_stall_since is None:
+            self._scan_stall_since = now
+        if self._scan_motion_at != self._scan_stall_last_at:
+            self._scan_stall_last_at = self._scan_motion_at
+            self._scan_stall_verdicts += 1
+        return (
+            self._scan_stall_verdicts >= STUCK_SCAN_ONLY_MIN_VERDICTS
+            and now - self._scan_stall_since >= STUCK_SCAN_ONLY_CONFIRM_S
+        )
+
+    def _reset_scan_stall(self) -> None:
+        self._scan_stall_since = None
+        self._scan_stall_verdicts = 0
+        self._scan_stall_last_at = None
+
     def _apply_stuck_check(
         self,
         lidar: SectorClearance,
@@ -3214,6 +3249,7 @@ class AutonomousPolicy:
             return command
 
         if command == "STOP":
+            self._reset_scan_stall()
             # _plan() already refused to drive this tick for its own reason
             # (stale camera/LiDAR/Uno status, standby, IMU calibrating, an
             # existing boxed-in stop, ...). Those safety stops must win over
@@ -3257,6 +3293,7 @@ class AutonomousPolicy:
 
         commanding = self.left_pwm != 0 or self.right_pwm != 0
         if not commanding:
+            self._reset_scan_stall()
             self._stuck_window_start = None
             self._stuck_not_moving_ticks = 0
             self.stuck_phase = self._stuck_phase
@@ -3265,9 +3302,10 @@ class AutonomousPolicy:
         not_moving_sources = sum(
             vote == "NOT_MOVING" for vote in votes.values()
         )
-        corroborated_stall = (
-            verdict == "NOT_MOVING"
-            and not_moving_sources >= STUCK_MIN_CORROBORATING_SOURCES
+        scan_only_stall = self._scan_only_stall(votes, now)
+        corroborated_stall = verdict == "NOT_MOVING" and (
+            not_moving_sources >= STUCK_MIN_CORROBORATING_SOURCES
+            or scan_only_stall
         )
         if corroborated_stall:
             if self._stuck_window_start is None:
@@ -3282,10 +3320,11 @@ class AutonomousPolicy:
             self.stuck_phase = self._stuck_phase
             return command
 
-        if (
+        if scan_only_stall or (
             self._stuck_not_moving_ticks >= STUCK_MIN_NOT_MOVING_VOTES
             and now - self._stuck_window_start >= STUCK_CONFIRM_WINDOW_S
         ):
+            self._reset_scan_stall()
             self.left_pwm, self.right_pwm = previous_output
             return self._advance_stuck_recovery(lidar, now)
 

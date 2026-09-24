@@ -122,6 +122,10 @@ class GlobalBudgetTests(unittest.TestCase):
         self.assertTrue(first.active)
         # Cover ordinary commitment and the no-progress alternate-goal path.
         for now in (11., 25.):
+            # Since v1.9.28 a still-clear route is reused rather than searched
+            # again. Discard it so this replan has to search, which is what
+            # this test checks the deadline of.
+            explorer._path_cells = []
             with mock.patch.object(explorer, '_astar', wraps=explorer._astar) as search:
                 explorer.update(*args, now)
             self.assertTrue(search.call_args_list)

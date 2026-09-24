@@ -141,12 +141,35 @@ def _usb_bus_worker(connection, bus_factory) -> None:
         connection.close()
 
 
+#: How long a new adapter worker may take to open the USB-I2C bridge. Blinka
+#: itself takes a few seconds to import on a Pi 3B.
+USB_WORKER_STARTUP_S = 12.0
+
+
+def _usb_worker_context():
+    """How to start the adapter worker process.
+
+    "spawn" starts a fresh interpreter, and a spawned child re-imports the
+    program's main module before it runs anything - here the whole robot
+    runtime: OpenCV, numpy, the web server. On the 2026-09-23 run the worker
+    reported "did not start within 8.0 s" on every attempt, on a Pi 3B that
+    was also power-throttled. "fork" copies the already-loaded process, so the
+    worker starts at once and only imports Blinka. The parent holds no USB
+    handle for the child to inherit; only the child ever opens the adapter.
+
+    Fork is Linux-only; elsewhere (desktop tests on Windows) spawn is kept.
+    """
+    if "fork" in multiprocessing.get_all_start_methods() and os.name == "posix":
+        return multiprocessing.get_context("fork")
+    return multiprocessing.get_context("spawn")
+
+
 class _MCP2221Bus:
     """Bound USB operations without abandoning a thread holding the adapter."""
 
-    def __init__(self, bus_factory=None, startup_timeout_s=8.0,
+    def __init__(self, bus_factory=None, startup_timeout_s=USB_WORKER_STARTUP_S,
                  transaction_timeout_s=0.75) -> None:
-        context = multiprocessing.get_context("spawn")
+        context = _usb_worker_context()
         self._connection, child = context.Pipe()
         self._timeout = transaction_timeout_s
         self._process = context.Process(
