@@ -1,0 +1,749 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#070b10">
+<title>VisionFSD robot</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #070b10;
+    --panel: #0d141c;
+    --panel-2: #121c27;
+    --line: #1f2d3b;
+    --text: #e6eef5;
+    --muted: #8397a9;
+    --live: #57e39a;
+    --warn: #ffb35c;
+    --bad: #ff6b81;
+    --accent: #5fd4ff;
+    --route: #b48cff;
+    --radius: 12px;
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    display: flex; flex-direction: column; min-height: 100%;
+    -webkit-tap-highlight-color: transparent;
+  }
+  header {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 8px 14px; padding-top: max(8px, env(safe-area-inset-top));
+    background: linear-gradient(180deg, #0e1620, #0a1017);
+    border-bottom: 1px solid var(--line);
+  }
+  header strong { font-size: 15px; letter-spacing: 0.02em; }
+  .badge {
+    padding: 2px 10px; border-radius: 999px; font-size: 11px; font-weight: 700;
+    letter-spacing: 0.06em; border: 1px solid transparent;
+  }
+  .badge.live { background: #103b27; color: var(--live); border-color: #1e6a44; }
+  .badge.stale { background: #3d2610; color: var(--warn); border-color: #6a4418; }
+  .badge.lost { background: #3d1019; color: var(--bad); border-color: #6a1d2d; }
+  .muted { color: var(--muted); }
+  .grow { flex: 1; }
+  nav.tabs { display: flex; gap: 4px; background: var(--panel); padding: 3px; border-radius: 10px; }
+  nav.tabs button {
+    font: inherit; font-size: 13px; font-weight: 600; color: var(--muted);
+    background: transparent; border: 0; padding: 6px 12px; border-radius: 8px; cursor: pointer;
+  }
+  nav.tabs button[aria-selected="true"] { color: var(--text); background: var(--panel-2); box-shadow: inset 0 0 0 1px var(--line); }
+
+  main { flex: 1; display: grid; grid-template-columns: 1fr; gap: 10px; padding: 10px 12px 16px; }
+  @media (min-width: 980px) { main { grid-template-columns: minmax(0, 1fr) 340px; align-items: start; } }
+
+  .view { position: relative; background: #05080c; border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
+  .view[hidden] { display: none !important; }
+  #lidar-view { aspect-ratio: 1 / 1; max-height: calc(100vh - 150px); width: 100%; touch-action: none; }
+  @media (min-width: 980px) { #lidar-view { aspect-ratio: auto; height: calc(100vh - 90px); max-height: none; } }
+  canvas#lidar { display: block; width: 100%; height: 100%; }
+  .media-view img { display: block; width: 100%; height: auto; background: #05080c; min-height: 180px; }
+
+  .hud { position: absolute; pointer-events: none; }
+  .hud-top { left: 10px; right: 10px; top: 10px; display: flex; gap: 8px; align-items: flex-start; }
+  .intent {
+    pointer-events: none; background: rgba(8, 13, 19, 0.78); backdrop-filter: blur(6px);
+    border: 1px solid rgba(95, 212, 255, 0.18); border-radius: 10px; padding: 7px 11px; max-width: 72%;
+  }
+  .intent .label { font-size: 15px; font-weight: 800; letter-spacing: 0.04em; }
+  .intent .detail { font-size: 12px; color: var(--muted); margin-top: 1px; }
+  .hud-bottom { left: 10px; right: 10px; bottom: 10px; display: flex; gap: 8px; align-items: flex-end; justify-content: space-between; }
+  .chips { display: flex; gap: 5px; flex-wrap: wrap; max-width: 62%; }
+  .chip {
+    font-size: 10.5px; font-weight: 700; letter-spacing: 0.05em; padding: 3px 7px; border-radius: 6px;
+    background: rgba(8, 13, 19, 0.8); border: 1px solid var(--line); color: var(--muted);
+  }
+  .chip.ok { color: var(--live); border-color: #1e6a44; }
+  .chip.warn { color: var(--warn); border-color: #6a4418; }
+  .chip.bad { color: var(--bad); border-color: #6a1d2d; }
+  .gauges { background: rgba(8, 13, 19, 0.8); border: 1px solid var(--line); border-radius: 10px; padding: 6px 9px; min-width: 128px; }
+  .gauge-row { display: grid; grid-template-columns: 14px 1fr 34px; align-items: center; gap: 6px; font-size: 10.5px; color: var(--muted); }
+  .bar { position: relative; height: 6px; background: #17222e; border-radius: 4px; overflow: hidden; }
+  .bar > i { position: absolute; top: 0; bottom: 0; left: 50%; width: 0; background: var(--accent); border-radius: 4px; }
+  .view-tools { position: absolute; right: 10px; top: 10px; display: flex; flex-direction: column; gap: 6px; pointer-events: auto; }
+  .tool {
+    font: inherit; font-size: 13px; font-weight: 700; width: 34px; height: 34px; border-radius: 9px;
+    background: rgba(8, 13, 19, 0.82); color: var(--text); border: 1px solid var(--line); cursor: pointer;
+  }
+  .tool.small { font-size: 10px; }
+  .tool[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
+
+  aside { display: flex; flex-direction: column; gap: 10px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 10px 12px; }
+  .card h2 { font-size: 11px; letter-spacing: 0.1em; color: var(--muted); margin: 0 0 8px; font-weight: 700; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; }
+  .btn {
+    font: inherit; font-weight: 800; letter-spacing: 0.03em; color: var(--text); cursor: pointer;
+    background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px;
+    padding: 12px 14px; flex: 1; min-width: 88px; touch-action: manipulation;
+    -webkit-user-select: none; user-select: none;
+  }
+  .btn:disabled { opacity: 0.35; cursor: not-allowed; }
+  #halt { background: #4a121e; border-color: #86223a; }
+  #halt.active { background: #c42a47; border-color: #ff9bb0; box-shadow: 0 0 0 3px rgba(255, 107, 129, 0.25); }
+  #resume { background: #10321f; border-color: #1f6a44; }
+  #manual.active { background: #173f5a; border-color: var(--accent); color: #d8f5ff; }
+  #mode { font-size: 12px; margin-top: 8px; }
+
+  #pad { display: grid; grid-template-columns: repeat(3, 1fr); grid-template-rows: repeat(2, 76px); gap: 8px; margin-top: 10px; }
+  #pad button {
+    position: relative; font-size: 24px; min-width: 0; padding: 0; overflow: hidden;
+    touch-action: none; -webkit-touch-callout: none;
+  }
+  #pad button .fill {
+    position: absolute; left: 0; right: 0; bottom: 0; height: 0%;
+    background: linear-gradient(0deg, rgba(95, 212, 255, 0.45), rgba(95, 212, 255, 0.05));
+    pointer-events: none; transition: height 60ms linear;
+  }
+  #pad button.held { border-color: var(--accent); color: #fff; }
+  .pad-up { grid-column: 2; grid-row: 1; }
+  .pad-left { grid-column: 1; grid-row: 2; }
+  .pad-down { grid-column: 2; grid-row: 2; }
+  .pad-right { grid-column: 3; grid-row: 2; }
+  .hint { font-size: 11.5px; color: var(--muted); margin-top: 8px; line-height: 1.35; }
+
+  dl.stats { display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; margin: 0; font-size: 12px; }
+  dl.stats dt { color: var(--muted); }
+  dl.stats dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+  .legend { display: grid; grid-template-columns: 16px 1fr; gap: 4px 8px; font-size: 11.5px; color: var(--muted); align-items: center; }
+  .swatch { width: 12px; height: 12px; border-radius: 3px; }
+</style>
+</head>
+<body>
+<header>
+  <strong>VisionFSD robot</strong>
+  <span id="badge" class="badge stale">CONNECTING</span>
+  <span id="detail" class="muted" style="font-size:12px">waiting for the robot</span>
+  <span class="grow"></span>
+  <nav class="tabs" role="tablist" aria-label="Views">
+    <button role="tab" data-tab="lidar" aria-selected="true">LiDAR</button>
+    <button role="tab" data-tab="camera" aria-selected="false">Camera</button>
+    <button role="tab" data-tab="dashboard" aria-selected="false">Dashboard</button>
+  </nav>
+  <span id="version" class="muted" style="font-size:12px"></span>
+</header>
+
+<main>
+  <section>
+    <div id="lidar-view" class="view" data-panel="lidar">
+      <canvas id="lidar" aria-label="LiDAR view"></canvas>
+      <div class="hud hud-top">
+        <div class="intent"><div class="label" id="intent">CONNECTING</div><div class="detail" id="intent-detail">waiting for telemetry</div></div>
+      </div>
+      <div class="view-tools">
+        <button class="tool" id="zoom-in" title="Zoom in">+</button>
+        <button class="tool" id="zoom-out" title="Zoom out">&minus;</button>
+        <button class="tool small" id="orient" aria-pressed="true" title="Heading up / north up">HDG</button>
+        <button class="tool small" id="layer-map" aria-pressed="true" title="Map layer">MAP</button>
+        <button class="tool small" id="layer-mem" aria-pressed="true" title="Obstacle memory">MEM</button>
+      </div>
+      <div class="hud hud-bottom">
+        <div class="chips" id="chips"></div>
+        <div class="gauges">
+          <div class="gauge-row"><span>L</span><div class="bar"><i id="bar-l"></i></div><span id="val-l">0</span></div>
+          <div class="gauge-row" style="margin-top:4px"><span>R</span><div class="bar"><i id="bar-r"></i></div><span id="val-r">0</span></div>
+        </div>
+      </div>
+    </div>
+    <div class="view media-view" data-panel="camera" hidden>
+      <img id="camera-img" alt="Onboard camera">
+      <div class="hud hud-top"><div class="intent"><div class="label" id="cam-intent">CAMERA</div><div class="detail" id="cam-detail">connecting</div></div></div>
+    </div>
+    <div class="view media-view" data-panel="dashboard" hidden>
+      <img id="dash-img" alt="Robot dashboard">
+    </div>
+  </section>
+
+  <aside>
+    <div class="card">
+      <h2>CONTROL</h2>
+      <div class="row">
+        <button class="btn" id="halt" type="button">STOP</button>
+        <button class="btn" id="resume" type="button">RESUME</button>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <button class="btn" id="manual" type="button">MANUAL CONTROL</button>
+      </div>
+      <div id="mode" class="muted">autonomous</div>
+      <div id="pad">
+        <button class="btn pad-up" data-drive="F" type="button" disabled aria-label="Forward"><span class="fill"></span>&#9650;</button>
+        <button class="btn pad-left" data-drive="L" type="button" disabled aria-label="Turn left"><span class="fill"></span>&#9664;</button>
+        <button class="btn pad-down" data-drive="B" type="button" disabled aria-label="Reverse"><span class="fill"></span>&#9660;</button>
+        <button class="btn pad-right" data-drive="R" type="button" disabled aria-label="Turn right"><span class="fill"></span>&#9654;</button>
+      </div>
+      <div class="hint">Hold a direction to move. A short tap is a small nudge; holding longer builds speed. Release stops immediately. Keyboard: arrows or WASD, space to stop.</div>
+    </div>
+
+    <div class="card">
+      <h2>NAVIGATION</h2>
+      <dl class="stats">
+        <dt>Mode</dt><dd id="s-mode">&ndash;</dd>
+        <dt>Goal</dt><dd id="s-goal">&ndash;</dd>
+        <dt>Route</dt><dd id="s-route">&ndash;</dd>
+        <dt>Plan</dt><dd id="s-plan">&ndash;</dd>
+        <dt>Moving objects</dt><dd id="s-movers">&ndash;</dd>
+        <dt>LiDAR points</dt><dd id="s-points">&ndash;</dd>
+        <dt>Link</dt><dd id="s-link">&ndash;</dd>
+      </dl>
+    </div>
+
+    <div class="card">
+      <h2>IMU</h2>
+      <div id="imu-status" class="muted">waiting for telemetry</div>
+      <div id="imu-diagnostic" class="hint" style="overflow-wrap:anywhere;white-space:pre-wrap"></div>
+    </div>
+
+    <div class="card">
+      <h2>LEGEND</h2>
+      <div class="legend">
+        <span class="swatch" style="background:linear-gradient(90deg,#ffb020,#37e1ff)"></span><span>LiDAR return (colour = signal strength)</span>
+        <span class="swatch" style="background:#ff4fa8"></span><span>Possible edge artefact (still used for safety)</span>
+        <span class="swatch" style="background:#2c7f88"></span><span>Remembered obstacle</span>
+        <span class="swatch" style="background:var(--route)"></span><span>Planned route to goal</span>
+        <span class="swatch" style="background:var(--live)"></span><span>Arc the robot is about to drive</span>
+        <span class="swatch" style="background:#ff8a3d"></span><span>Moving object and predicted path</span>
+      </div>
+    </div>
+  </aside>
+</main>
+
+<script>
+(function () {
+  "use strict";
+  var STALE_AFTER = STALE_AFTER_PLACEHOLDER;
+  var $ = function (id) { return document.getElementById(id); };
+
+  // ------------------------------------------------------------------ state
+  var telemetry = null;
+  var lastTelemetryAt = 0;
+  var control = { halted: false, manual: false };
+  var activeTab = "lidar";
+  var socket = null;
+  var socketOpen = false;
+  var reconnectDelay = 500;
+  var rttMs = null;
+  var messageTimes = [];
+
+  // ------------------------------------------------------------------ tabs
+  var tabButtons = Array.prototype.slice.call(document.querySelectorAll("nav.tabs button"));
+  var panels = Array.prototype.slice.call(document.querySelectorAll("[data-panel]"));
+  function selectTab(name) {
+    activeTab = name;
+    tabButtons.forEach(function (b) { b.setAttribute("aria-selected", String(b.dataset.tab === name)); });
+    panels.forEach(function (p) { p.hidden = p.dataset.panel !== name; });
+    // Only open the image streams that are on screen: the robot encodes
+    // nothing for a stream with no viewers.
+    $("camera-img").src = name === "camera" ? "camera.mjpg?t=" + Date.now() : "";
+    $("dash-img").src = name === "dashboard" ? "stream.mjpg?t=" + Date.now() : "";
+    subscribe();
+    if (name === "lidar") { resizeCanvas(); }
+  }
+  tabButtons.forEach(function (b) { b.addEventListener("click", function () { selectTab(b.dataset.tab); }); });
+
+  // ------------------------------------------------------------------ socket
+  function send(message) {
+    if (socketOpen) {
+      try { socket.send(JSON.stringify(message)); return true; } catch (e) { return false; }
+    }
+    return false;
+  }
+  function subscribe() {
+    send({ type: "subscribe", level: activeTab === "lidar" ? "full" : "light" });
+  }
+  function connect() {
+    var scheme = location.protocol === "https:" ? "wss://" : "ws://";
+    try { socket = new WebSocket(scheme + location.host + "/ws"); }
+    catch (e) { scheduleReconnect(); return; }
+    socket.onopen = function () {
+      socketOpen = true; reconnectDelay = 500; subscribe();
+    };
+    socket.onmessage = function (event) {
+      var message;
+      try { message = JSON.parse(event.data); } catch (e) { return; }
+      if (message.type === "telemetry") {
+        telemetry = message; lastTelemetryAt = performance.now();
+        messageTimes.push(lastTelemetryAt);
+        while (messageTimes.length && lastTelemetryAt - messageTimes[0] > 2000) { messageTimes.shift(); }
+        if (message.control) { applyControl(message.control); }
+        if (message.map_seq && message.map_seq !== mapSeq) { requestMap(message.map_seq); }
+        updatePanels();
+      } else if (message.type === "control" || message.type === "hello") {
+        applyControl(message.type === "hello" ? message.control : message);
+        if (message.version) { $("version").textContent = "v" + message.version; }
+      } else if (message.type === "pong") {
+        rttMs = performance.now() - message.c;
+      }
+    };
+    socket.onclose = function () { socketOpen = false; scheduleReconnect(); };
+    socket.onerror = function () { try { socket.close(); } catch (e) {} };
+  }
+  function scheduleReconnect() {
+    setTimeout(connect, reconnectDelay);
+    reconnectDelay = Math.min(4000, reconnectDelay * 1.6);
+  }
+  setInterval(function () { send({ type: "ping", c: performance.now() }); }, 2000);
+
+  // HTTP fallback for control when the socket is down.
+  function postControl(body) {
+    return fetch("control", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })
+      .then(function (r) { return r.json(); }).then(applyControl).catch(function () {});
+  }
+  function sendControl(body) {
+    var message = Object.assign({ type: "control" }, body);
+    if (!send(message)) { postControl(body); }
+  }
+
+  // ------------------------------------------------------------------ control UI
+  var padButtons = Array.prototype.slice.call(document.querySelectorAll("#pad button"));
+  function applyControl(state) {
+    if (!state || typeof state.manual === "undefined") { return; }
+    control = state;
+    $("halt").classList.toggle("active", !!state.halted);
+    $("manual").classList.toggle("active", !!state.manual);
+    padButtons.forEach(function (b) { b.disabled = !state.manual; });
+    $("mode").textContent = state.halted ? "stopped by operator" : (state.manual ? "manual control" : "autonomous");
+    if (!state.manual) { releaseDrive(false); }
+  }
+  $("halt").addEventListener("click", function () { releaseDrive(false); sendControl({ halt: true }); });
+  $("resume").addEventListener("click", function () { sendControl({ resume: true }); });
+  $("manual").addEventListener("click", function () { sendControl({ manual: !control.manual }); });
+
+  // Hold-to-drive. The magnitude grows with how long the button is held, and
+  // the command is refreshed every 50 ms: the robot stops on its own if the
+  // refreshes stop arriving, and stops at once when the button is released.
+  var held = null;
+  function magnitudeFor(elapsed) { return Math.min(1, 0.15 + elapsed / 1400); }
+  function pressDrive(direction, button, pointerId) {
+    if (!control.manual) { return; }
+    if (held && held.direction !== direction) { releaseDrive(true); }
+    if (held) { return; }
+    held = { direction: direction, button: button, pointerId: pointerId, started: performance.now(), timer: null };
+    if (button) { button.classList.add("held"); }
+    var tick = function () {
+      if (!held) { return; }
+      var mag = magnitudeFor(performance.now() - held.started);
+      if (held.button) { held.button.querySelector(".fill").style.height = Math.round(mag * 100) + "%"; }
+      sendControl({ drive: held.direction, mag: mag });
+    };
+    tick();
+    held.timer = setInterval(tick, 50);
+  }
+  function releaseDrive(sendStop) {
+    if (!held) { if (sendStop) { sendControl({ drive: "STOP" }); } return; }
+    clearInterval(held.timer);
+    if (held.button) { held.button.classList.remove("held"); held.button.querySelector(".fill").style.height = "0%"; }
+    held = null;
+    if (sendStop !== false) { sendControl({ drive: "STOP" }); sendControl({ drive: "STOP" }); }
+  }
+  padButtons.forEach(function (button) {
+    var direction = button.getAttribute("data-drive");
+    button.addEventListener("pointerdown", function (event) {
+      event.preventDefault();
+      // Capture keeps the press alive when a finger slides slightly, which
+      // mobile browsers otherwise report as the press being cancelled.
+      try { button.setPointerCapture(event.pointerId); } catch (e) {}
+      pressDrive(direction, button, event.pointerId);
+    });
+    ["pointerup", "pointercancel", "lostpointercapture"].forEach(function (name) {
+      button.addEventListener(name, function (event) { event.preventDefault(); if (held && held.button === button) { releaseDrive(true); } });
+    });
+    button.addEventListener("contextmenu", function (event) { event.preventDefault(); });
+  });
+  var keyMap = { ArrowUp: "F", KeyW: "F", ArrowDown: "B", KeyS: "B", ArrowLeft: "L", KeyA: "L", ArrowRight: "R", KeyD: "R" };
+  window.addEventListener("keydown", function (event) {
+    if (event.code === "Space") { event.preventDefault(); releaseDrive(false); sendControl({ halt: true }); return; }
+    var direction = keyMap[event.code];
+    if (!direction || !control.manual) { return; }
+    event.preventDefault();
+    if (!held) { pressDrive(direction, document.querySelector('#pad [data-drive="' + direction + '"]'), null); }
+  });
+  window.addEventListener("keyup", function (event) {
+    if (keyMap[event.code] && held && held.pointerId === null) { releaseDrive(true); }
+  });
+  window.addEventListener("blur", function () { releaseDrive(true); });
+  document.addEventListener("visibilitychange", function () { if (document.hidden) { releaseDrive(true); } });
+
+  // ------------------------------------------------------------------ map image
+  var mapSeq = 0;
+  var mapCanvas = document.createElement("canvas");
+  var mapReady = false;
+  var mapFetching = false;
+  var lastMapFetch = 0;
+  function requestMap(seq) {
+    if (activeTab !== "lidar" || !layers.map || mapFetching || performance.now() - lastMapFetch < 900) { return; }
+    mapFetching = true; lastMapFetch = performance.now();
+    fetch("map.png?s=" + seq, { cache: "no-store" })
+      .then(function (r) { if (!r.ok) { throw new Error("no map"); } return r.blob(); })
+      .then(function (blob) { return createImageBitmap(blob); })
+      .then(function (bitmap) {
+        mapCanvas.width = bitmap.width; mapCanvas.height = bitmap.height;
+        var c = mapCanvas.getContext("2d");
+        c.drawImage(bitmap, 0, 0);
+        var image = c.getImageData(0, 0, bitmap.width, bitmap.height);
+        var d = image.data;
+        // Grey levels from the robot: 0 unknown, low = seen free, high = occupied.
+        for (var i = 0; i < d.length; i += 4) {
+          var v = d[i];
+          if (v === 0) { d[i + 3] = 0; continue; }
+          if (v < 90) { d[i] = 22; d[i + 1] = 38; d[i + 2] = 52; d[i + 3] = 150; }
+          else {
+            var k = (v - 90) / 165;
+            d[i] = 60 + 90 * k; d[i + 1] = 170 + 70 * k; d[i + 2] = 200 + 55 * k; d[i + 3] = 120 + 135 * k;
+          }
+        }
+        c.putImageData(image, 0, 0);
+        mapReady = true; mapSeq = seq;
+      })
+      .catch(function () {})
+      .then(function () { mapFetching = false; });
+  }
+
+  // ------------------------------------------------------------------ LiDAR canvas
+  var canvas = $("lidar");
+  var ctx = canvas.getContext("2d");
+  var dpr = 1;
+  var zoom = 110;           // pixels per metre (CSS px)
+  var headingUp = true;
+  var layers = { map: true, mem: true };
+  var zoomChosen = false;
+  function resizeCanvas() {
+    var rect = canvas.getBoundingClientRect();
+    if (!zoomChosen && rect.width > 0) {
+      // Start with roughly three metres visible either side of the robot,
+      // whatever the screen size, so a whole room fits on a phone.
+      zoom = Math.max(25, Math.min(600, Math.min(rect.width, rect.height) / 6.5));
+      zoomChosen = true;
+    }
+    dpr = Math.min(2, window.devicePixelRatio || 1);
+    canvas.width = Math.max(1, Math.round(rect.width * dpr));
+    canvas.height = Math.max(1, Math.round(rect.height * dpr));
+  }
+  window.addEventListener("resize", resizeCanvas);
+  $("zoom-in").addEventListener("click", function () { zoom = Math.min(600, zoom * 1.3); });
+  $("zoom-out").addEventListener("click", function () { zoom = Math.max(25, zoom / 1.3); });
+  $("orient").addEventListener("click", function (e) { headingUp = !headingUp; e.currentTarget.setAttribute("aria-pressed", String(headingUp)); e.currentTarget.textContent = headingUp ? "HDG" : "N"; });
+  $("layer-map").addEventListener("click", function (e) { layers.map = !layers.map; e.currentTarget.setAttribute("aria-pressed", String(layers.map)); });
+  $("layer-mem").addEventListener("click", function (e) { layers.mem = !layers.mem; e.currentTarget.setAttribute("aria-pressed", String(layers.mem)); });
+  canvas.addEventListener("wheel", function (e) { e.preventDefault(); zoom = Math.max(25, Math.min(600, zoom * (e.deltaY < 0 ? 1.12 : 1 / 1.12))); }, { passive: false });
+  var pinch = null;
+  var touches = {};
+  canvas.addEventListener("pointerdown", function (e) { touches[e.pointerId] = [e.clientX, e.clientY]; if (Object.keys(touches).length === 2) { pinch = { d: pinchDistance(), z: zoom }; } });
+  canvas.addEventListener("pointermove", function (e) {
+    if (!touches[e.pointerId]) { return; }
+    touches[e.pointerId] = [e.clientX, e.clientY];
+    if (pinch && Object.keys(touches).length === 2) { zoom = Math.max(25, Math.min(600, pinch.z * pinchDistance() / pinch.d)); }
+  });
+  ["pointerup", "pointercancel", "pointerleave"].forEach(function (n) { canvas.addEventListener(n, function (e) { delete touches[e.pointerId]; if (Object.keys(touches).length < 2) { pinch = null; } }); });
+  function pinchDistance() { var p = Object.values(touches); return Math.max(1, Math.hypot(p[0][0] - p[1][0], p[0][1] - p[1][1])); }
+
+  function robotTransform(s, cx, cy, heading) {
+    // Robot frame: +x right, +y ahead. Returns a canvas transform for it.
+    if (headingUp) { return [s, 0, 0, -s, cx, cy]; }
+    var h = heading * Math.PI / 180, c = Math.cos(h), n = Math.sin(h);
+    return [s * c, s * n, s * n, -s * c, cx, cy];
+  }
+  function mapTransformApply(s, cx, cy, pose) {
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.translate(cx / dpr, cy / dpr);
+    if (headingUp) { ctx.rotate(-pose.h * Math.PI / 180); }
+    ctx.scale(s / dpr, s / dpr);
+    ctx.translate(-pose.x, -pose.y);
+  }
+  function intentColour(label) {
+    var map = { "DRIVING": "#57e39a", "CRUISING": "#57e39a", "EXPLORING": "#c89bff", "STEERING AROUND": "#5fd4ff",
+      "CURVING PAST": "#5fd4ff", "BACKING OUT": "#ffb35c", "FREEING ITSELF": "#ff9a4d", "STUCK": "#ff6b81",
+      "REORIENTING": "#ffd166", "HOLDING": "#8397a9", "STANDBY": "#8397a9", "YIELDING": "#ff8a3d", "MANUAL": "#5fd4ff" };
+    return map[label] || "#e6eef5";
+  }
+
+  function draw() {
+    requestAnimationFrame(draw);
+    if (activeTab !== "lidar") { return; }
+    var w = canvas.width, h = canvas.height;
+    if (!w || !h) { resizeCanvas(); return; }
+    var cx = w / 2, cy = h * 0.58;
+    var s = zoom * dpr;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    var bg = ctx.createRadialGradient(cx, cy, 0, cx, cy, Math.max(w, h) * 0.75);
+    bg.addColorStop(0, "#0b121a"); bg.addColorStop(1, "#04070a");
+    ctx.fillStyle = bg; ctx.fillRect(0, 0, w, h);
+
+    var t = telemetry;
+    var full = t && t.level === "full";
+    var pose = t && t.pose ? t.pose : { x: 0, y: 0, h: 0 };
+
+    // Map layer (map frame).
+    if (full && layers.map && mapReady && t.map) {
+      ctx.save();
+      mapTransformApply(s, cx, cy, pose);
+      ctx.imageSmoothingEnabled = false;
+      ctx.globalAlpha = 0.9;
+      ctx.drawImage(mapCanvas, 0, 0, t.map.metres, t.map.metres);
+      ctx.restore();
+    }
+
+    // Range rings.
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.lineWidth = 1 * dpr;
+    for (var m = 1; m <= 12; m++) {
+      var r = m * s;
+      if (r > Math.hypot(w, h)) { break; }
+      ctx.strokeStyle = m % 2 === 0 ? "rgba(120,150,175,0.16)" : "rgba(120,150,175,0.08)";
+      ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.stroke();
+      if (r > 30 * dpr) {
+        ctx.fillStyle = "rgba(131,151,169,0.55)"; ctx.font = (10 * dpr) + "px ui-sans-serif, system-ui";
+        ctx.fillText(m + " m", cx + 4 * dpr, cy - r - 3 * dpr);
+      }
+    }
+
+    if (!t) { return; }
+    var T = robotTransform(s, cx, cy, pose.h);
+    var px = 1 / s; // one device pixel in robot-frame metres
+
+    // Obstacle memory.
+    if (full && layers.mem && t.mem) {
+      ctx.setTransform(T[0], T[1], T[2], T[3], T[4], T[5]);
+      ctx.fillStyle = "rgba(44,127,136,0.55)";
+      var mx = t.mem.x, my = t.mem.y;
+      for (var i = 0; i < mx.length; i++) { ctx.fillRect(mx[i] / 100 - 1.5 * px, my[i] / 100 - 1.5 * px, 3 * px, 3 * px); }
+    }
+
+    // Gap wedge while seeking an opening.
+    if (t.gap && t.gap.active) {
+      ctx.setTransform(T[0], T[1], T[2], T[3], T[4], T[5]);
+      var b = t.gap.b * Math.PI / 180, half = Math.max(4, t.gap.w / 2) * Math.PI / 180, depth = Math.min(3, t.gap.d);
+      ctx.fillStyle = "rgba(87,227,154,0.14)"; ctx.strokeStyle = "rgba(87,227,154,0.55)"; ctx.lineWidth = 1.5 * px;
+      ctx.beginPath(); ctx.moveTo(0, 0);
+      for (var a = -half; a <= half + 1e-6; a += half / 8) { ctx.lineTo(Math.sin(b + a) * depth, Math.cos(b + a) * depth); }
+      ctx.closePath(); ctx.fill(); ctx.stroke();
+    }
+
+    // Planned route (dashed, fading toward the goal).
+    if (full && t.route && t.route.length > 1) {
+      ctx.setTransform(T[0], T[1], T[2], T[3], T[4], T[5]);
+      ctx.lineCap = "round"; ctx.lineJoin = "round";
+      ctx.strokeStyle = "rgba(180,140,255,0.22)"; ctx.lineWidth = 9 * px;
+      ctx.beginPath(); ctx.moveTo(t.route[0][0] / 100, t.route[0][1] / 100);
+      for (var k = 1; k < t.route.length; k++) { ctx.lineTo(t.route[k][0] / 100, t.route[k][1] / 100); }
+      ctx.stroke();
+      ctx.setLineDash([10 * px, 7 * px]); ctx.strokeStyle = "#b48cff"; ctx.lineWidth = 2.5 * px; ctx.stroke(); ctx.setLineDash([]);
+    }
+    if (full && t.target) {
+      ctx.setTransform(T[0], T[1], T[2], T[3], T[4], T[5]);
+      var pulse = 0.5 + 0.5 * Math.sin(performance.now() / 280);
+      ctx.strokeStyle = "rgba(210,120,255," + (0.45 + 0.4 * pulse) + ")"; ctx.lineWidth = 3 * px;
+      ctx.beginPath(); ctx.arc(t.target[0] / 100, t.target[1] / 100, 0.14 + 0.05 * pulse, 0, Math.PI * 2); ctx.stroke();
+      ctx.fillStyle = "#d278ff"; ctx.beginPath(); ctx.arc(t.target[0] / 100, t.target[1] / 100, 4 * px, 0, Math.PI * 2); ctx.fill();
+    }
+
+    // Moving objects: current position, velocity, and predicted positions.
+    if (full && t.movers) {
+      ctx.setTransform(T[0], T[1], T[2], T[3], T[4], T[5]);
+      t.movers.forEach(function (o) {
+        var ox = o.x / 100, oy = o.y / 100, rad = Math.max(0.08, o.r / 100);
+        if (o.m) {
+          for (var step = 1; step <= 4; step++) {
+            var secs = step * 0.4;
+            ctx.strokeStyle = "rgba(255,138,61," + (0.5 - step * 0.1) + ")"; ctx.lineWidth = 1.5 * px;
+            ctx.beginPath(); ctx.arc(ox + o.vx / 100 * secs, oy + o.vy / 100 * secs, rad, 0, Math.PI * 2); ctx.stroke();
+          }
+          ctx.strokeStyle = "#ff8a3d"; ctx.lineWidth = 3 * px;
+          ctx.beginPath(); ctx.moveTo(ox, oy); ctx.lineTo(ox + o.vx / 100, oy + o.vy / 100); ctx.stroke();
+          ctx.fillStyle = "rgba(255,138,61,0.28)";
+        } else {
+          ctx.fillStyle = "rgba(131,151,169,0.10)";
+        }
+        ctx.beginPath(); ctx.arc(ox, oy, rad, 0, Math.PI * 2); ctx.fill();
+      });
+    }
+
+    // Live scan with signal-strength colour and a soft glow.
+    if (full && t.scan) {
+      ctx.setTransform(T[0], T[1], T[2], T[3], T[4], T[5]);
+      var sx = t.scan.x, sy = t.scan.y, si = t.scan.i, sk = t.scan.k;
+      ctx.globalCompositeOperation = "lighter";
+      for (var j = 0; j < sx.length; j++) {
+        var X = sx[j] / 100, Y = sy[j] / 100;
+        if (sk && sk[j] === 0) {
+          ctx.fillStyle = "rgba(255,79,168,0.9)";
+          ctx.fillRect(X - 1.5 * px, Y - 1.5 * px, 3 * px, 3 * px);
+          continue;
+        }
+        var q = Math.min(1, (si ? si[j] : 200) / 230);
+        var rr = Math.round(255 - 200 * q), gg = Math.round(176 + 50 * q), bb = Math.round(32 + 223 * q);
+        ctx.fillStyle = "rgba(" + rr + "," + gg + "," + bb + ",0.22)";
+        ctx.fillRect(X - 4 * px, Y - 4 * px, 8 * px, 8 * px);
+        ctx.fillStyle = "rgb(" + rr + "," + gg + "," + bb + ")";
+        ctx.fillRect(X - 1.5 * px, Y - 1.5 * px, 3 * px, 3 * px);
+      }
+      ctx.globalCompositeOperation = "source-over";
+    }
+
+    // The arc the robot is about to drive.
+    var colour = intentColour(t.intent);
+    if (full && t.arc && t.arc.p && t.arc.p.length > 1) {
+      ctx.setTransform(T[0], T[1], T[2], T[3], T[4], T[5]);
+      var pts = [[0, 0]].concat(t.arc.p.map(function (p) { return [p[0] / 100, p[1] / 100]; }));
+      ctx.lineCap = "round";
+      for (var n = 0; n < pts.length - 1; n++) {
+        var fade = 1 - n / (pts.length - 1);
+        ctx.strokeStyle = t.arc.ok ? "#57e39a" : "#ff6b81";
+        ctx.globalAlpha = 0.25 + 0.75 * fade;
+        ctx.lineWidth = (2 + 8 * fade) * px;
+        ctx.beginPath(); ctx.moveTo(pts[n][0], pts[n][1]); ctx.lineTo(pts[n + 1][0], pts[n + 1][1]); ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
+      var e1 = pts[pts.length - 2], e2 = pts[pts.length - 1];
+      var ang = Math.atan2(e2[1] - e1[1], e2[0] - e1[0]), head = 0.12;
+      ctx.fillStyle = t.arc.ok ? "#57e39a" : "#ff6b81";
+      ctx.beginPath(); ctx.moveTo(e2[0], e2[1]);
+      ctx.lineTo(e2[0] - head * Math.cos(ang - 0.45), e2[1] - head * Math.sin(ang - 0.45));
+      ctx.lineTo(e2[0] - head * Math.cos(ang + 0.45), e2[1] - head * Math.sin(ang + 0.45));
+      ctx.closePath(); ctx.fill();
+    }
+
+    // The chassis at its measured size.
+    var foot = t.foot || { w: 22.9, l: 26.7 };
+    ctx.setTransform(T[0], T[1], T[2], T[3], T[4], T[5]);
+    var fw = foot.w / 100, fl = foot.l / 100;
+    ctx.fillStyle = "rgba(30,42,56,0.95)"; ctx.strokeStyle = colour; ctx.lineWidth = 2 * px;
+    roundRect(-fw / 2, -fl / 2, fw, fl, 0.03); ctx.fill(); ctx.stroke();
+    ctx.fillStyle = colour;
+    ctx.beginPath(); ctx.moveTo(0, fl / 2 + 0.05); ctx.lineTo(-0.05, fl / 2 - 0.02); ctx.lineTo(0.05, fl / 2 - 0.02); ctx.closePath(); ctx.fill();
+    ctx.fillStyle = "#e6eef5"; ctx.beginPath(); ctx.arc(0, 0, 3 * px, 0, Math.PI * 2); ctx.fill();
+
+    // North marker in heading-up mode.
+    if (headingUp) {
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      var na = -pose.h * Math.PI / 180, nr = 18 * dpr, nx = 26 * dpr, ny = h - 90 * dpr;
+      ctx.strokeStyle = "rgba(131,151,169,0.6)"; ctx.lineWidth = 1.5 * dpr;
+      ctx.beginPath(); ctx.arc(nx, ny, nr, 0, Math.PI * 2); ctx.stroke();
+      ctx.fillStyle = "#ff6b81"; ctx.beginPath();
+      ctx.moveTo(nx + Math.sin(na) * nr, ny - Math.cos(na) * nr);
+      ctx.lineTo(nx + Math.sin(na + 2.6) * 7 * dpr, ny - Math.cos(na + 2.6) * 7 * dpr);
+      ctx.lineTo(nx + Math.sin(na - 2.6) * 7 * dpr, ny - Math.cos(na - 2.6) * 7 * dpr);
+      ctx.closePath(); ctx.fill();
+    }
+  }
+  function roundRect(x, y, w, h, r) {
+    ctx.beginPath(); ctx.moveTo(x + r, y); ctx.lineTo(x + w - r, y); ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+    ctx.lineTo(x + w, y + h - r); ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h); ctx.lineTo(x + r, y + h);
+    ctx.quadraticCurveTo(x, y + h, x, y + h - r); ctx.lineTo(x, y + r); ctx.quadraticCurveTo(x, y, x + r, y); ctx.closePath();
+  }
+
+  // ------------------------------------------------------------------ panels
+  function chip(label, level) { return '<span class="chip ' + level + '">' + label + "</span>"; }
+  function setBar(bar, value, text) {
+    var v = Math.max(-255, Math.min(255, value || 0)) / 255;
+    bar.style.left = v >= 0 ? "50%" : (50 + v * 50) + "%";
+    bar.style.width = Math.abs(v) * 50 + "%";
+    bar.style.background = v >= 0 ? "var(--accent)" : "var(--warn)";
+    text.textContent = String(value || 0);
+  }
+  function updateImuHealth(health) {
+    var state = health.imu || "UNKNOWN";
+    var status = state;
+    if (state === "CAL" && typeof health.imu_calibration === "number") {
+      status += " " + health.imu_calibration + "%";
+    }
+    if (typeof health.imu_age_s === "number") {
+      status += " · last sample " + health.imu_age_s.toFixed(2) + " s ago";
+    }
+    var detail = health.imu_error || "";
+    if (!detail && state === "CAL") {
+      detail = "Calibration: " + (health.imu_hold || "waiting for still samples");
+    } else if (!detail && state === "STALE") {
+      detail = "No fresh IMU samples; navigation is using non-IMU mode.";
+    } else if (!detail && state === "OFF") {
+      detail = "IMU unavailable or disabled; no error reported.";
+    }
+    $("imu-status").textContent = status;
+    // USB exception text is data, never HTML. Also clear old errors on recovery.
+    $("imu-diagnostic").textContent = detail;
+  }
+
+  function updatePanels() {
+    var t = telemetry;
+    if (!t) { return; }
+    $("version").textContent = "v" + t.v;
+    $("intent").textContent = t.intent || "";
+    $("intent").style.color = intentColour(t.intent);
+    $("intent-detail").textContent = t.detail || t.reason || "";
+    $("cam-intent").textContent = t.intent || "";
+    $("cam-intent").style.color = intentColour(t.intent);
+    $("cam-detail").textContent = t.detail || "";
+    var hl = t.health || {};
+    updateImuHealth(hl);
+    var chips = [
+      chip("LD19", hl.lidar ? "ok" : "bad"),
+      chip("CAM", hl.camera ? "ok" : "warn"),
+      chip("IMU " + (hl.imu || ""), hl.imu === "LIVE" ? "ok" : (hl.imu === "OFF" ? "" : "warn")),
+      chip("UNO", hl.uno ? "ok" : "bad")
+    ];
+    if (hl.loop && typeof hl.loop.hz === "number") {
+      // Control-loop rate. The 2026-09-21 field run measured about 1 Hz
+      // against a 40 Hz design, which is what expired the command lease and
+      // cut the motors. Showing it makes a slow robot visible from the phone.
+      chips.push(chip(
+        "LOOP " + hl.loop.hz.toFixed(0) + " Hz",
+        hl.loop.hz >= 20 ? "ok" : (hl.loop.hz >= 8 ? "warn" : "bad")
+      ));
+      if (hl.loop.behind) { chips.push(chip("SHEDDING VIEW", "warn")); }
+    }
+    if (hl.lock) { chips.push(chip("TURN LOCK " + (hl.lock > 0 ? "R" : "L"), "warn")); }
+    if (hl.stuck && hl.stuck !== "IDLE") { chips.push(chip("STUCK " + hl.stuck, "bad")); }
+    if (hl.route) { chips.push(chip("ROUTE GUIDED", "ok")); }
+    $("chips").innerHTML = chips.join("");
+    var drive = t.drive || {};
+    setBar($("bar-l"), drive.cmd ? drive.cmd[0] : 0, $("val-l"));
+    setBar($("bar-r"), drive.cmd ? drive.cmd[1] : 0, $("val-r"));
+    var ex = t.explore || {};
+    $("s-mode").textContent = (ex.mode || "-") + (ex.frontiers ? " · " + ex.frontiers + " frontiers" : "");
+    $("s-goal").textContent = ex.target_m ? ex.target_m.toFixed(1) + " m, held " + Math.round(ex.goal_age || 0) + " s" : "none";
+    $("s-route").textContent = ex.route_m ? ex.route_m.toFixed(1) + " m, " + (ex.progress || 0).toFixed(1) + " m gained" : "-";
+    $("s-plan").textContent = drive.arc_ok === false ? "no safe arc" : ("arc " + Math.round(drive.steer || 0) + "°, " + (drive.pwm || 0) + " pwm");
+    var movers = (t.movers || []).filter(function (o) { return o.m; }).length;
+    $("s-movers").textContent = t.level === "full" ? String(movers) : "-";
+    $("s-points").textContent = t.scan ? t.scan.x.length + " live" + (t.mem ? ", " + t.mem.x.length + " remembered" : "") : "-";
+    var rate = messageTimes.length > 1 ? (messageTimes.length - 1) * 1000 / (messageTimes[messageTimes.length - 1] - messageTimes[0]) : 0;
+    $("s-link").textContent = (rttMs === null ? "-" : Math.round(rttMs) + " ms") + " · " + rate.toFixed(1) + " Hz";
+  }
+  setInterval(function () {
+    var badge = $("badge"), detail = $("detail");
+    var age = lastTelemetryAt ? (performance.now() - lastTelemetryAt) / 1000 : Infinity;
+    if (!socketOpen) { badge.className = "badge lost"; badge.textContent = "OFFLINE"; detail.textContent = "reconnecting to the robot"; }
+    else if (age > STALE_AFTER) { badge.className = "badge stale"; badge.textContent = "STALE"; detail.textContent = isFinite(age) ? "no update for " + age.toFixed(1) + " s" : "waiting for telemetry"; }
+    else { badge.className = "badge live"; badge.textContent = "LIVE"; detail.textContent = (rttMs === null ? "" : Math.round(rttMs) + " ms round trip"); }
+  }, 250);
+
+  resizeCanvas();
+  connect();
+  selectTab("lidar");
+  requestAnimationFrame(draw);
+})();
+</script>
+</body>
+</html>
