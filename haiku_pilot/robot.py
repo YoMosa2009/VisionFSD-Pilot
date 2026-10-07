@@ -3,7 +3,7 @@
 An optional experiment, separate from the robot's autonomous runtime. The pilot
 (Claude Haiku 5.5 in the Claude desktop app) runs these commands from this
 computer; each one connects to the robot's dashboard, does one thing, prints
-what the robot now senses, and exits. Standard library only.
+what the robot now senses, and exits.
 
     python haiku_pilot/robot.py status
     python haiku_pilot/robot.py observe
@@ -21,6 +21,12 @@ within 0.35 s if this program stops sending it. This program adds what manual
 mode does not check - it will not reverse into something behind - and caps
 every move. A person pressing STOP or turning Manual Control off on the
 dashboard ends any move at once, and no command here will take control back.
+
+Each report also draws a top-down picture of the LiDAR scan. A model reads the
+shape of a room - openings, doorways, a gap 30 degrees to the left - far more
+reliably from a picture than from hundreds of coordinates. Drawing it uses
+numpy and OpenCV from the project's .venv; everything else is the standard
+library, and without them the report simply has no picture.
 """
 
 from __future__ import annotations
@@ -41,6 +47,13 @@ import urllib.request
 DEFAULT_ROBOT = os.environ.get("VISIONFSD_ROBOT", "192.168.0.17:8080")
 VIEW_DIR = os.path.join(tempfile.gettempdir(), "visionfsd_pilot")
 VIEW_PATH = os.path.join(VIEW_DIR, "latest_view.jpg")
+LIDAR_PATH = os.path.join(VIEW_DIR, "lidar_topdown.png")
+LIDAR_VIEW_RADIUS_M = 3.0
+LIDAR_VIEW_PX = 600
+# A corridor counts as an opening when the robot's own width (plus margin)
+# is clear this far along it.
+OPENING_MIN_M = 0.8
+CORRIDOR_HALF_WIDTH_M = 0.16
 
 DRIVE_MAX_S = 2.0
 TURN_MAX_S = 1.5
@@ -336,6 +349,198 @@ def describe(summary: dict, control: dict) -> str:
     ])
 
 
+def _points(telemetry: dict | None, key: str = "scan") -> list[tuple[float, float]]:
+    block = (telemetry or {}).get(key) or {}
+    return [
+        (x / 100.0, y / 100.0)
+        for x, y in zip(block.get("x", []), block.get("y", []))
+        if math.hypot(x, y) >= 5
+    ]
+
+
+def corridor_clearance(points: list[tuple[float, float]], bearing_deg: float) -> float:
+    """Free distance from the bumper along a robot-wide corridor at a bearing.
+
+    Bearing 0 is straight ahead, positive to the right, negative to the left.
+    """
+    radians = math.radians(bearing_deg)
+    ux, uy = math.sin(radians), math.cos(radians)
+    nearest = math.inf
+    for x, y in points:
+        along = x * ux + y * uy
+        if along <= 0.0:
+            continue
+        if abs(x * uy - y * ux) <= CORRIDOR_HALF_WIDTH_M:
+            nearest = min(nearest, along)
+    return max(0.0, nearest - BODY_OVERHANG_M)
+
+
+def find_openings(points: list[tuple[float, float]], step_deg: int = 5) -> list[dict]:
+    """The standout directions to drive: peaks in robot-wide clear distance.
+
+    A threshold alone is useless in an open room - every direction clears
+    it, and the answer is one 360-degree "opening". What matters is where the
+    space runs on furthest: a doorway, a hallway, the long side of a room. So
+    this finds local peaks of corridor clearance around the robot, keeps those
+    at least OPENING_MIN_M long, drops weaker peaks within 30 degrees of a
+    stronger one, and reports each with the span over which the clearance
+    stays within 70% of its peak without rising into a clearer direction.
+    """
+    if not points:
+        return []
+    bearings = list(range(-180, 180, step_deg))
+    count = len(bearings)
+    clear = [min(corridor_clearance(points, bearing), 9.9) for bearing in bearings]
+    if max(clear) - min(clear) < 1e-9:
+        # Everywhere the same: no direction stands out.
+        peaks = [(count // 2, clear[0])] if clear[0] >= OPENING_MIN_M else []
+    else:
+        # Walk the circle starting at the least clear direction, so a peak or
+        # plateau can never straddle the starting point.
+        origin = clear.index(min(clear))
+        order = [(origin + offset) % count for offset in range(count)]
+        peaks = []
+        position = 1
+        while position < count:
+            run_end = position
+            while run_end + 1 < count and clear[order[run_end + 1]] == clear[order[position]]:
+                run_end += 1
+            value = clear[order[position]]
+            before = clear[order[position - 1]]
+            after = clear[order[(run_end + 1) % count]]
+            if value >= OPENING_MIN_M and value > before and value > after:
+                peaks.append((order[(position + run_end) // 2], value))
+            position = run_end + 1
+    peaks.sort(key=lambda item: -item[1])
+    chosen: list[tuple[int, float]] = []
+    for peak_index, value in peaks:
+        separation = min(
+            (abs((bearings[peak_index] - bearings[other] + 180) % 360 - 180) for other, _v in chosen),
+            default=360,
+        )
+        if separation >= 30:
+            chosen.append((peak_index, value))
+    openings = []
+    for peak_index, value in chosen:
+        span = 1
+        for direction in (-1, 1):
+            step = 1
+            while step < count and 0.7 * value <= clear[(peak_index + direction * step) % count] <= value:
+                span += 1
+                step += 1
+        openings.append({
+            "bearing": bearings[peak_index],
+            "span": min(360, span * step_deg),
+            "clear_m": round(value, 2),
+        })
+    return openings
+
+
+def describe_openings(openings: list[dict]) -> str:
+    if not openings:
+        return "Open corridors wide enough for the robot: none within sensing range"
+    parts = []
+    for item in openings[:4]:
+        bearing = item["bearing"]
+        if bearing == 0:
+            side = "straight ahead"
+        elif bearing > 0:
+            side = f"{bearing} deg right"
+        else:
+            side = f"{-bearing} deg left"
+        if abs(bearing) >= 135:
+            side += " (behind you)"
+        clear = "over 9.9 m" if item["clear_m"] >= 9.9 else f"{item['clear_m']:.1f} m"
+        parts.append(f"{side}: {clear} clear, {item['span']} deg wide")
+    return (
+        "Open corridors wide enough for the robot (0 = ahead, right/left = which way to turn): "
+        + "; ".join(parts)
+    )
+
+
+def draw_lidar(telemetry: dict | None, summary: dict, openings: list[dict],
+               path: str = LIDAR_PATH) -> str | None:
+    """Top-down picture of the scan, robot in the middle facing up.
+
+    Returns the saved path, or None when numpy/OpenCV are unavailable.
+    """
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        return None
+    size = LIDAR_VIEW_PX
+    centre = size // 2
+    scale = (size / 2 - 20) / LIDAR_VIEW_RADIUS_M
+    image = np.full((size, size, 3), 24, dtype=np.uint8)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+
+    def pixel(x: float, y: float) -> tuple[int, int]:
+        return int(round(centre + x * scale)), int(round(centre - y * scale))
+
+    # Distance rings every 0.5 m, labelled every metre.
+    for tenths in range(5, int(LIDAR_VIEW_RADIUS_M * 10) + 1, 5):
+        radius = tenths / 10.0
+        cv2.circle(image, (centre, centre), int(radius * scale), (70, 70, 70), 1, cv2.LINE_AA)
+        if tenths % 10 == 0:
+            cv2.putText(image, f"{radius:.0f} m", (centre + 4, centre - int(radius * scale) + 14),
+                        font, 0.4, (150, 150, 150), 1, cv2.LINE_AA)
+    cv2.line(image, (centre, 0), (centre, size), (50, 50, 50), 1)
+    cv2.line(image, (0, centre), (size, centre), (50, 50, 50), 1)
+    # The lane the robot would drive straight through, green up to the first
+    # thing in it.
+    lane = summary.get("lane_ahead_m")
+    lane_end = min((lane if lane is not None else LIDAR_VIEW_RADIUS_M) + BODY_OVERHANG_M, LIDAR_VIEW_RADIUS_M)
+    overlay = image.copy()
+    cv2.rectangle(overlay, pixel(-LANE_HALF_WIDTH_M, lane_end), pixel(LANE_HALF_WIDTH_M, BODY_OVERHANG_M),
+                  (60, 150, 60), -1)
+    image = cv2.addWeighted(overlay, 0.35, image, 0.65, 0)
+    # Open corridors as arrows, labelled with the turn that faces them.
+    for item in openings[:4]:
+        radians = math.radians(item["bearing"])
+        reach = min(item["clear_m"] + BODY_OVERHANG_M, LIDAR_VIEW_RADIUS_M - 0.25)
+        tip = pixel(math.sin(radians) * reach, math.cos(radians) * reach)
+        cv2.arrowedLine(image, (centre, centre), tip, (40, 210, 250), 2, cv2.LINE_AA, tipLength=0.06)
+        bearing = item["bearing"]
+        label = "ahead" if bearing == 0 else (f"R{bearing}" if bearing > 0 else f"L{-bearing}")
+        cv2.putText(image, label, (tip[0] + 4, tip[1] - 4), font, 0.45, (40, 210, 250), 1, cv2.LINE_AA)
+    # Remembered obstacles from the last few seconds, dim grey.
+    for x, y in _points(telemetry, "mem"):
+        if math.hypot(x, y) <= LIDAR_VIEW_RADIUS_M:
+            cv2.circle(image, pixel(x, y), 1, (110, 110, 110), -1)
+    # Live LiDAR returns, coloured by distance from the robot.
+    for x, y in _points(telemetry, "scan"):
+        distance = math.hypot(x, y)
+        if distance > LIDAR_VIEW_RADIUS_M:
+            continue
+        if distance < 0.5:
+            colour = (60, 60, 255)
+        elif distance < 1.0:
+            colour = (60, 170, 255)
+        else:
+            colour = (235, 235, 235)
+        cv2.circle(image, pixel(x, y), 2, colour, -1)
+    # The robot to scale - 23 cm wide, 27 cm long, LiDAR at its centre - with
+    # an arrow showing which way it faces.
+    cv2.rectangle(image, pixel(-0.115, 0.135), pixel(0.115, -0.135), (255, 160, 60), 2)
+    cv2.arrowedLine(image, (centre, centre), pixel(0.0, 0.30), (255, 160, 60), 2, cv2.LINE_AA, tipLength=0.3)
+    cv2.putText(image, "AHEAD", (centre - 26, 16), font, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+    cv2.putText(image, "LEFT", (6, centre - 6), font, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+    cv2.putText(image, "RIGHT", (size - 56, centre - 6), font, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+    cv2.putText(image, "BEHIND", (centre - 30, size - 8), font, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+    legend = (
+        ("blue box: the robot, arrow = facing", (255, 160, 60)),
+        ("green: clear lane straight ahead", (90, 190, 90)),
+        ("yellow arrows: open corridors (R/L deg)", (40, 210, 250)),
+        ("dots: LiDAR - red <0.5 m, orange <1 m", (60, 170, 255)),
+        ("grey dots: recently seen, out of view", (130, 130, 130)),
+    )
+    for row, (text, colour) in enumerate(legend):
+        cv2.putText(image, text, (8, 18 + row * 16), font, 0.4, colour, 1, cv2.LINE_AA)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    return path if cv2.imwrite(path, image) else None
+
+
 def check_move(kind: str, direction: str, summary: dict) -> str | None:
     """Why this tool refuses the move before asking the robot, or None."""
     rng = summary.get("range") or {}
@@ -403,8 +608,15 @@ def report(link: RobotLink, address: str, heading: str = "", after_count: int = 
     link.wait_for_fresh_scan(after_count)
     telemetry, full, _at, control = link.snapshot()
     summary = summarize(full or telemetry)
+    openings = find_openings(_points(full or telemetry))
     lines = [heading] if heading else []
     lines.append(describe(summary, control))
+    lines.append(describe_openings(openings))
+    picture = draw_lidar(full or telemetry, summary, openings)
+    if picture:
+        lines.append(f"LiDAR map saved: {picture}  (top-down, robot in the middle facing up; open it)")
+    else:
+        lines.append("LiDAR map: not available (numpy/OpenCV missing - use the project's .venv Python)")
     frame = fetch_camera_frame(address)
     if frame:
         os.makedirs(VIEW_DIR, exist_ok=True)

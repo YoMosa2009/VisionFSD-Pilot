@@ -109,6 +109,10 @@ class PilotCommandTests(unittest.TestCase):
         self.assertTrue(os.path.exists(robot.VIEW_PATH))
         with open(robot.VIEW_PATH, "rb") as handle:
             self.assertEqual(handle.read(2), b"\xff\xd8")
+        self.assertIn("LiDAR map saved:", out)
+        self.assertIn("Open corridors", out)
+        with open(robot.LIDAR_PATH, "rb") as handle:
+            self.assertEqual(handle.read(4), b"\x89PNG")
 
     def test_no_move_without_manual_control(self) -> None:
         code, out = run(self.robot.address, "drive", "forward", "0.5")
@@ -190,6 +194,67 @@ class PilotCommandTests(unittest.TestCase):
         code, out = run("127.0.0.1:9", "observe")
         self.assertEqual(code, 2, out)
         self.assertIn("cannot reach the robot", out)
+
+
+def _room_points(robot_x: float = 1.6, robot_y: float = 1.4) -> list[tuple[float, float]]:
+    """A 5 x 4 m room with a doorway in the right-hand wall, as LiDAR points
+    in the robot frame (robot facing +y)."""
+    import math
+
+    walls = [((0, 0), (5, 0)), ((0, 0), (0, 4)), ((0, 4), (5, 4)),
+             ((5, 0), (5, 1.8)), ((5, 2.7), (5, 4))]
+    points = []
+    for step in range(450):
+        angle = math.radians(step * 0.8)
+        dx, dy = math.sin(angle), math.cos(angle)
+        best = None
+        for (x1, y1), (x2, y2) in walls:
+            ex, ey = x2 - x1, y2 - y1
+            denominator = dx * ey - dy * ex
+            if abs(denominator) < 1e-9:
+                continue
+            t = ((x1 - robot_x) * ey - (y1 - robot_y) * ex) / denominator
+            u = ((x1 - robot_x) * dy - (y1 - robot_y) * dx) / denominator
+            if t > 0.05 and 0 <= u <= 1:
+                best = t if best is None else min(best, t)
+        if best is not None and best < 8:
+            points.append((dx * best, dy * best))
+    return points
+
+
+class OpeningTests(unittest.TestCase):
+    def test_a_doorway_is_the_first_opening_listed(self) -> None:
+        openings = robot.find_openings(_room_points())
+        self.assertTrue(openings)
+        first = openings[0]
+        # The doorway is to the right, between 1.8 and 2.7 m up the right wall.
+        self.assertGreater(first["bearing"], 45)
+        self.assertLess(first["bearing"], 110)
+        self.assertGreaterEqual(first["clear_m"], 3.0)
+
+    def test_an_open_room_is_not_one_360_degree_opening(self) -> None:
+        """Every direction clears the minimum in an open room; the list must
+        still single out the directions that run furthest."""
+        openings = robot.find_openings(_room_points())
+        self.assertTrue(all(item["span"] < 360 for item in openings))
+        self.assertLessEqual(len(robot.describe_openings(openings).split(";")), 4)
+
+    def test_a_blocked_lane_is_not_an_opening(self) -> None:
+        wall = [(x / 100.0, 0.35) for x in range(-200, 201, 3)]
+        for item in robot.find_openings(wall):
+            self.assertGreater(abs(item["bearing"]), 30)
+
+    def test_the_picture_is_drawn(self) -> None:
+        import tempfile
+
+        path = os.path.join(tempfile.mkdtemp(), "lidar.png")
+        points = _room_points()
+        telemetry = {"scan": {"x": [int(x * 100) for x, _ in points],
+                              "y": [int(y * 100) for _, y in points]}}
+        summary = robot.summarize(telemetry)
+        saved = robot.draw_lidar(telemetry, summary, robot.find_openings(points), path)
+        self.assertEqual(saved, path)
+        self.assertGreater(os.path.getsize(path), 1000)
 
 
 class PilotDisplayTests(unittest.TestCase):

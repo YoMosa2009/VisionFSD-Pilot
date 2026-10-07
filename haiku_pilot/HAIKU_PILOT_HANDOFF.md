@@ -20,7 +20,8 @@ first command.
    this chat. The same if the operator tells you to stop.
 4. **One move at a time, then look.** Never chain several moves in one command
    or run moves in parallel. After every move, read what it printed and open
-   the new camera image before deciding the next one.
+   **both** new images - the camera view and the LiDAR map - before deciding
+   the next one.
 5. **When unsure, don't move.** Run `observe`, or ask the operator.
 
 ## Where everything is
@@ -32,6 +33,7 @@ first command.
 | The control program | `haiku_pilot/robot.py` |
 | The robot | `192.168.0.17:8080` on the home Wi-Fi (already the default) |
 | The latest camera image | printed by each command, normally `C:\Users\user\AppData\Local\Temp\visionfsd_pilot\latest_view.jpg` |
+| The latest LiDAR map | printed by each command, normally `C:\Users\user\AppData\Local\Temp\visionfsd_pilot\lidar_topdown.png` |
 | The operator's view | `http://192.168.0.17:8080` on their phone. It shows "AI pilot" and your `--say` notes, plus STOP and Manual buttons that override you |
 
 ## Your controls
@@ -45,7 +47,7 @@ Run them exactly like this (works in PowerShell and Bash):
 | Command | What it does |
 |---|---|
 | `status` | Is the robot reachable, and which mode it is in. No camera. |
-| `observe` | Prints what the robot senses and saves a fresh camera image. Does not move. |
+| `observe` | Prints what the robot senses and saves a fresh camera image and LiDAR map. Does not move. |
 | `manual on` | Takes Manual Control. Required before any move. The robot then holds still until you move it. |
 | `drive forward <seconds> [power]` | Drives straight, then stops and reports. seconds 0.1-2.0, power 0-1 (default 0.5). |
 | `drive backward <seconds> [power]` | Reverses straight, then stops and reports. |
@@ -61,7 +63,7 @@ Exit codes tell you what happened:
 
 | Code | Meaning | What to do |
 |---|---|---|
-| 0 | Done | Read the report, open the image, decide the next move |
+| 0 | Done | Read the report, open both images, decide the next move |
 | 2 | Robot unreachable or did not confirm | Wait 15 s and run `status` again |
 | 3 | `REFUSED, nothing moved` - too close to something, or not allowed | Choose a different move (turn away, back up, go around) |
 | 4 | The robot cut the move short: something close ahead | Treat it like a refusal; look and choose again |
@@ -74,11 +76,34 @@ A report looks like this:
 ```
 Did: drive forward for 1.0 s at power 0.5. Estimated change: moved 0.18 m, turned +2 degrees (approximate).
 Mode: Manual Control (you may drive)
-Clear in your own lane: ahead 1.10 m, behind 0.60 m
-Nearest LiDAR return by direction: ahead 1.23 m, ahead-right 1.34 m, right no return, behind-right 0.80 m, behind 0.73 m, behind-left 0.79 m, left no return, ahead-left 1.34 m
+Clear in your own lane: ahead 2.47 m, behind 1.27 m
+Nearest LiDAR return by direction: ahead 1.24 m, ahead-right 1.57 m, right 3.40 m, behind-right 1.52 m, behind 1.40 m, behind-left 1.52 m, left 1.60 m, ahead-left 1.41 m
 Ultrasonic straight ahead: 110 cm
+Open corridors wide enough for the robot (0 = ahead, right/left = which way to turn): 75 deg right: over 9.9 m clear, 10 deg wide; 110 deg right: 3.4 m clear, 40 deg wide; 20 deg right: 2.6 m clear, 35 deg wide; 45 deg left: 2.0 m clear, 110 deg wide
+LiDAR map saved: C:\...\visionfsd_pilot\lidar_topdown.png  (top-down, robot in the middle facing up; open it)
 Camera image saved: C:\...\visionfsd_pilot\latest_view.jpg  (open it to see what the robot sees)
 ```
+
+### The LiDAR map - open it every step
+
+A picture of the room seen from above, 3 m in every direction:
+
+- **The robot** is the blue box in the middle, drawn to scale. Its arrow points
+  the way it faces. **Up in the picture is always straight ahead of the
+  robot**, so the map turns with the robot: after a turn, everything rotates.
+- **Dots are LiDAR returns** - walls, furniture, legs. White is over 1 m away,
+  orange within 1 m, red within 0.5 m. Small separate clusters are usually
+  chair or table legs. Grey dots are things seen in the last few seconds that
+  are out of view now.
+- **Rings** are every 0.5 m, labelled each metre.
+- **The green strip** is the robot's own lane straight ahead, green up to the
+  first thing in it.
+- **Yellow arrows** are the open corridors from the report, labelled `R75`
+  (75 degrees to the right) or `L45` (45 degrees to the left).
+- A gap in a line of wall dots is a doorway or opening. It needs to be clearly
+  wider than the blue box for the robot to fit.
+
+### The numbers
 
 - **Clear in your own lane** is the free distance from the robot's bumper,
   within its own width (0.30 m wide strip). This is what decides whether
@@ -87,13 +112,18 @@ Camera image saved: C:\...\visionfsd_pilot\latest_view.jpg  (open it to see what
   slice around the robot, measured from the sensor in the middle of the robot.
   "no return" means nothing within range in that slice - usually open space,
   occasionally a dark or shiny surface the laser cannot see.
+- **Open corridors** are the standout directions: where a robot-wide path
+  runs furthest before hitting something, longest first. "75 deg right: over
+  9.9 m clear, 10 deg wide" means: turn about 75 degrees right and there is a
+  long, narrow way out - typically a doorway. A wide span means a broad open
+  area; a narrow one means a gap you must line up with carefully.
 - **Ultrasonic** is a narrow beam straight ahead, good for walls and furniture
   directly in front.
 - **The camera** faces forward. Always open the image: it is the only sensor
   that sees doorways, rooms, objects, rug edges, cables, and things above or
   below the LiDAR's scan height.
 - The movement estimate is approximate. Confirm movement by comparing the
-  distances and the image before and after.
+  map, the distances and the camera before and after.
 
 ## The robot
 
@@ -131,16 +161,21 @@ to two minutes to boot and check for updates.
    and try again, for up to three minutes, then tell the operator.
 2. If it says the robot is STOPPED by a person, ask the operator to press
    Resume on the dashboard.
-3. Run `manual on`. The report that follows is your first look; open the
-   image.
+3. Run `manual on`. The report that follows is your first look; open both
+   images.
 4. Tell the operator in one or two sentences what you see and what you plan.
-5. Then repeat: decide, one move with `--say`, read the report, open the image.
+5. Then repeat: decide, one move with `--say`, read the report, open both
+   images.
 
 ## Driving well
 
 - Make small moves: 0.5-1.0 s forward, 0.3-0.6 s turns, power 0.4-0.6. Use
   longer drives only with a lot of clear lane ahead.
-- Before driving forward, check "Clear in your own lane: ahead" and the image.
+- Before driving forward, check "Clear in your own lane: ahead", the green
+  strip on the map, and the camera.
+- To head for an opening, turn toward its bearing (`R75` means turn right
+  about 75 degrees), then check the map: when that opening's yellow arrow
+  points straight up and the green strip is long, drive.
 - To find a way out, turn in steps and look each time, rather than one big
   turn.
 - Keep a short running summary in this chat of where you have been and what
