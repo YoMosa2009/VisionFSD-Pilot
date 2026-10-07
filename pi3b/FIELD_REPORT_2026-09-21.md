@@ -304,3 +304,27 @@ From the first AI-pilot session (v1.9.30, Claude Haiku 5.5 via
    clutter on the map, but if it is part of the robot (cable, battery) it
    blocks every reverse - the pilot's and the autonomous escape's alike.
    Check physically.
+6. **Operator request: no proximity limit in Manual Control.** With Manual
+   Control on (the phone's arrows, or the AI pilot), the robot must be allowed
+   to drive right up to, and into, things - clearance down to zero. Autonomous
+   mode keeps every limit. The limits that apply in manual mode today, all to
+   be removed for manual mode only:
+   - Pi runtime: `_apply_control_mode` refuses forward when the ultrasonic
+     reads under `CLOSE_ULTRASONIC_CM` (26 cm) or the LiDAR straight-ahead
+     limit is under `MANUAL_FORWARD_MIN_M` (0.32 m), reason
+     `STOP:MANUAL_FORWARD_BLOCKED`. (Manual commands already bypass `_plan`,
+     so the emergency brake and the autonomous stops do not apply.)
+   - AI pilot (`haiku_pilot/robot.py`): refuses forward under 0.40 m clear or
+     30 cm ultrasonic, refuses reverse under 0.30 m behind, and refuses forward
+     when nothing is known ahead. Remove these, and update
+     `HAIKU_PILOT_HANDOFF.md`, which tells the pilot the robot refuses close
+     moves.
+   - **Uno firmware: `FORWARD_STOP_DISTANCE_CM = 18`** stops forward travel
+     under 18 cm independently of the Pi. The Pi cannot override it, and an
+     OTA update cannot change it; it only goes away by editing and reflashing
+     `robot/firmware/visionfsd_pi_autonomy/visionfsd_pi_autonomy.ino`, which
+     would also remove it from autonomous mode unless the firmware learns a
+     manual flag. Needs the operator's decision before that part is done.
+   - Keep: STOP from the dashboard, the command lease and the Uno's 350 ms
+     timeout - those stop a robot nobody is controlling, not one that is close
+     to something.
