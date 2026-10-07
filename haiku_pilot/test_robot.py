@@ -256,6 +256,36 @@ class BusyRobotTests(unittest.TestCase):
         self.assertNotIn("F", self.robot.commands)
 
 
+class NoScanTests(unittest.TestCase):
+    """2026-10-07, after a restart: the robot sent no LiDAR scan for the first
+    8.5 s after the pilot connected, and the pilot refused every move. A late
+    scan must never block a move; safety uses the range readings."""
+
+    def setUp(self) -> None:
+        self.robot = FakeRobot(scan_every_s=3600.0)   # one scan at start, then none
+        self.addCleanup(self.robot.close)
+        time.sleep(0.3)                                # the hub now holds light only
+        self._wait = robot.SCAN_WAIT_S
+        robot.SCAN_WAIT_S = 0.5
+        self.addCleanup(setattr, robot, "SCAN_WAIT_S", self._wait)
+
+    def test_moves_work_without_any_scan(self) -> None:
+        code, out = run(self.robot.address, "manual", "on")
+        self.assertEqual(code, 0, out)
+        self.assertIn("no scan received yet", out)
+        code, out = run(self.robot.address, "drive", "forward", "0.3")
+        self.assertEqual(code, 0, out)
+        self.assertIn("F", self.robot.commands)
+        self.assertIn("Clear in your own lane: ahead 2.00 m", out)
+
+    def test_range_readings_still_block_a_move_without_a_scan(self) -> None:
+        run(self.robot.address, "manual", "on")
+        self.robot.ahead_m = 0.25
+        code, out = run(self.robot.address, "drive", "forward", "1.0")
+        self.assertEqual(code, 3, out)
+        self.assertNotIn("F", self.robot.commands)
+
+
 class OpeningTests(unittest.TestCase):
     def test_a_doorway_is_the_first_opening_listed(self) -> None:
         openings = robot.find_openings(_room_points())

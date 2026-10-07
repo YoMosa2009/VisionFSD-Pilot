@@ -70,7 +70,7 @@ TELEMETRY_WAIT_S = 4.0
 # including the range readings manual driving is gated on - keep arriving
 # several times a second. Safety decisions use the light readings; the map
 # and directions use the newest scan, whose age the report states.
-SCAN_WAIT_S = 6.0
+SCAN_WAIT_S = 10.0
 TELEMETRY_STALE_S = 1.5
 
 SECTORS = (
@@ -218,31 +218,37 @@ class RobotLink:
         with self._lock:
             return self.light_count, self.full_count
 
-    def wait_for_fresh(self, after: tuple[int, int] = (0, 0), new_scan: bool = False,
-                       timeout: float = SCAN_WAIT_S) -> None:
+    def wait_for_fresh(self, after: tuple[int, int] = (0, 0), want_new_scan: bool = False,
+                       timeout: float = TELEMETRY_WAIT_S, scan_timeout: float | None = None) -> bool:
         """Wait for telemetry the robot published after the ``after`` marks.
 
-        The robot answers a new connection with its last cached message, so
-        two light messages past the mark guarantee at least one fresh one.
-        With ``new_scan`` a LiDAR scan newer than the mark is also required;
-        otherwise any scan will do, and its age is reported.
+        Fresh light telemetry is required: it carries the range readings
+        every safety decision uses, and the robot sends it several times a
+        second. The robot answers a new connection with its last cached
+        message, so two past the mark guarantee one fresh one.
+
+        A LiDAR scan is only wanted, never required: a busy robot can go
+        several seconds without sending one, and the scan only feeds the map
+        and directions. Returns whether a scan newer than the mark arrived.
         """
         light_mark, full_mark = after
         deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
+        while True:
             with self._lock:
-                light_ok = self.light_count >= light_mark + 2
-                scan_ok = self.full_count >= (full_mark + 1 if new_scan else 1)
-            if light_ok and scan_ok:
-                return
-            if self.closed:
-                break
+                if self.light_count >= light_mark + 2:
+                    break
+            if self.closed or time.monotonic() >= deadline:
+                raise Override("no fresh telemetry from the robot; it may be busy or starting up")
             time.sleep(0.05)
-        with self._lock:
-            light_ok = self.light_count >= light_mark + 2
-        if not light_ok:
-            raise Override("no fresh telemetry from the robot; it may be busy or starting up")
-        raise Override("no LiDAR scan from the robot within a few seconds; it may be busy")
+        if not want_new_scan:
+            return False
+        deadline = time.monotonic() + (SCAN_WAIT_S if scan_timeout is None else scan_timeout)
+        while time.monotonic() < deadline and not self.closed:
+            with self._lock:
+                if self.full_count >= full_mark + 1:
+                    return True
+            time.sleep(0.05)
+        return False
 
     def scan_age(self) -> float | None:
         with self._lock:
@@ -583,7 +589,9 @@ def check_move(kind: str, direction: str, summary: dict) -> str | None:
     rng = summary.get("range") or {}
     if kind == "drive" and direction == "forward":
         lane = summary.get("lane_ahead_m")
-        if lane is not None and lane < FORWARD_MIN_M:
+        if lane is None:
+            return "no LiDAR reading straight ahead, so driving forward would be blind"
+        if lane < FORWARD_MIN_M:
             return f"only {lane:.2f} m clear in your lane ahead (need {FORWARD_MIN_M:.2f} m)"
         ultra = rng.get("ultra_cm")
         if ultra is not None and ultra < ULTRASONIC_MIN_CM:
@@ -641,24 +649,29 @@ def hold(link: RobotLink, command: str, power: float, seconds: float,
 
 
 def report(link: RobotLink, address: str, heading: str = "",
-           after: tuple[int, int] = (0, 0), new_scan: bool = False) -> str:
+           after: tuple[int, int] = (0, 0), new_scan: bool = True) -> str:
     """Current senses as text, and the camera frame saved for viewing."""
-    link.wait_for_fresh(after, new_scan=new_scan)
+    link.wait_for_fresh(after, want_new_scan=new_scan)
     telemetry, full, _at, control = link.snapshot()
     summary = summarize(full or telemetry, fresh=telemetry)
     openings = find_openings(_points(full or telemetry))
     lines = [heading] if heading else []
     lines.append(describe(summary, control))
     lines.append(describe_openings(openings))
-    picture = draw_lidar(full or telemetry, summary, openings)
+    picture = draw_lidar(full, summary, openings) if full is not None else None
     age = link.scan_age()
-    if picture:
+    if full is None:
+        lines.append(
+            "LiDAR map: no scan received yet (the robot sends one every few seconds "
+            "when busy). The lane and range numbers above are current."
+        )
+    elif picture:
         lines.append(
             f"LiDAR map saved: {picture}  (top-down, robot in the middle facing up; open it)"
             + ("" if age is None or age < 1.0 else f" - scan is {age:.1f} s old")
         )
     else:
-        lines.append("LiDAR map: not available (numpy/OpenCV missing - use the project's .venv Python)")
+        lines.append("LiDAR map: not drawn (numpy/OpenCV missing - use the project's .venv Python)")
     frame = fetch_camera_frame(address)
     if frame:
         os.makedirs(VIEW_DIR, exist_ok=True)
@@ -748,7 +761,7 @@ def run(argv: list[str]) -> int:
         cut_short = hold(link, COMMANDS[args.direction], power, seconds)
         time.sleep(SETTLE_S)
         stopped_at = link.marks()
-        link.wait_for_fresh(stopped_at, new_scan=True)
+        link.wait_for_fresh(stopped_at, want_new_scan=True)
         telemetry, full, _at, _control = link.snapshot()
         after = summarize(full or telemetry, fresh=telemetry)
         heading = (
@@ -756,7 +769,8 @@ def run(argv: list[str]) -> int:
             + (cut_short + " " if cut_short else "")
             + pose_change(before.get("pose"), after.get("pose"))
         )
-        print(report(link, args.robot, heading, after=stopped_at, new_scan=True))
+        # The wait for a post-move scan already happened above.
+        print(report(link, args.robot, heading, after=stopped_at, new_scan=False))
         return 4 if cut_short else 0
     except Override as error:
         try:
