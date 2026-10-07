@@ -3534,6 +3534,10 @@ def manual_wheels(
     return 0, 0
 
 
+def _round_or_none(value: float | None, places: int = 2) -> float | None:
+    return None if value is None else round(float(value), places)
+
+
 def _cm(values: np.ndarray) -> list[int]:
     return np.rint(np.asarray(values, dtype=np.float32) * 100.0).astype(np.int32).tolist()
 
@@ -3605,6 +3609,14 @@ def build_telemetry(
             "lock": policy.watchdog.locked_sign,
             "stuck": policy.stuck_phase,
             "route": policy.route_guided,
+            # Raw range evidence: what manual driving is gated on, and what an
+            # AI pilot (haiku_pilot/) reads alongside the camera.
+            "range": {
+                "front_m": _round_or_none(clearance.limit_at(0.0)),
+                "rear_m": _round_or_none(clearance.rear_m),
+                "ultra_cm": None if status.front_cm is None else round(float(status.front_cm)),
+                "uno_blocked": bool(status.blocked),
+            },
             # Loop health, so a slow robot is visible from the phone rather
             # than only in the log.
             "loop": dict(loop) if loop else None,

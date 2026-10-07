@@ -80,6 +80,12 @@ class RobotControl:
         self._magnitude = 0.0
         self._command_at = 0.0
         self.revision = 0
+        # An optional AI pilot (see haiku_pilot/) driving through manual
+        # mode reports what it is doing, so the phone can show it. Display
+        # only: it grants nothing, and it goes stale on its own.
+        self._pilot_note = ""
+        self._pilot_model = ""
+        self._pilot_at = 0.0
 
     @property
     def halted(self) -> bool:
@@ -149,14 +155,33 @@ class RobotControl:
                 return "STOP", 0.0
             return self._command, self._magnitude
 
+    #: A pilot that has not reported for this long is shown as gone. Long
+    #: enough to span a pilot thinking between moves.
+    PILOT_STALE_S = 30.0
+
+    def note_pilot(self, note: str, model: str = "") -> None:
+        """Record what an AI pilot says it is doing, for display."""
+        note = str(note)[:240]
+        model = str(model)[:60]
+        with self._lock:
+            changed = (note, model) != (self._pilot_note, self._pilot_model)
+            self._pilot_note = note
+            self._pilot_model = model
+            self._pilot_at = time.monotonic() if note else 0.0
+            if changed:
+                self.revision += 1
+
     def state(self) -> dict:
         with self._lock:
-            return {
+            state = {
                 "halted": self._halted,
                 "manual": self._manual,
                 "command": self._command,
                 "magnitude": round(self._magnitude, 2),
             }
+            if self._pilot_at and time.monotonic() - self._pilot_at <= self.PILOT_STALE_S:
+                state["pilot"] = {"note": self._pilot_note, "model": self._pilot_model}
+            return state
 
 
 DEFAULT_PORT = 8080
@@ -722,6 +747,8 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
                         next_send_at = 0.0
                     elif kind == "control" and control is not None:
                         self._apply_control(control, message)
+                    elif kind == "pilot" and control is not None:
+                        control.note_pilot(message.get("note", ""), message.get("model", ""))
                     elif kind == "ping":
                         send({"type": "pong", "c": message.get("c")})
                 if control is not None and control.revision != last_control_revision:

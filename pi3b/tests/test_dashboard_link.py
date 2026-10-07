@@ -356,3 +356,36 @@ class TelemetryBuilderTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PilotSupportTests(unittest.TestCase):
+    """v1.9.30: an optional AI pilot (haiku_pilot/, run from another computer)
+    drives through Manual Control and needs the range evidence manual mode is
+    gated on; the phone shows what it is doing."""
+
+    def test_light_telemetry_carries_the_range_evidence(self) -> None:
+        policy = AutonomousPolicy(0.0, 118)
+        mapper = LidarSlamLite()
+        now = time.monotonic()
+        status = ArduinoStatus(front_cm=87.0, motion="S", received_at=now)
+        clearance = SectorClearance(1.2, 1.0, 1.0, True, rear_m=0.9)
+        light, _full = build_telemetry(
+            policy, frame_from_points([], 1), ExplorationState(), mapper.state(),
+            IMUState(), status, clearance, True, True, mapper, now, False,
+        )
+        rng = light["health"]["range"]
+        self.assertEqual(rng["ultra_cm"], 87)
+        self.assertEqual(rng["rear_m"], 0.9)
+        self.assertIn("front_m", rng)
+        self.assertFalse(rng["uno_blocked"])
+
+    def test_pilot_status_is_display_only_and_expires(self) -> None:
+        control = RobotControl()
+        control.note_pilot("turning toward the hallway", "claude-haiku-5-5")
+        state = control.state()
+        self.assertEqual(state["pilot"]["model"], "claude-haiku-5-5")
+        # Display only: a pilot note grants nothing.
+        self.assertFalse(state["manual"])
+        self.assertFalse(control.drive("F"))
+        control._pilot_at -= RobotControl.PILOT_STALE_S + 1.0
+        self.assertNotIn("pilot", control.state())

@@ -1092,6 +1092,23 @@ version made contact in it, so it understates real collisions; treat it as a
 comparison, not a prediction. Desktop tests (475 pass). **Nothing here has run
 on the robot.**
 
+### v1.9.30: support for an optional AI pilot (Claude Haiku 5.5)
+
+An experiment, off unless the operator starts it: Claude Haiku 5.5, running in
+the Claude desktop app on another computer, drives the robot through Manual
+Control using `haiku_pilot/robot.py` (outside this folder; see
+`haiku_pilot/HAIKU_PILOT_HANDOFF.md`). It drives exactly the way a person does
+from the phone, so every manual-mode check applies to it unchanged, and STOP or
+turning Manual off on the dashboard ends its control at once.
+
+Two small runtime changes support it; neither changes how the robot drives:
+
+- Light telemetry carries `health.range`: the straight-ahead LiDAR limit, rear
+  clearance, the ultrasonic distance and the Uno's blocked flag - the evidence
+  manual driving is gated on, previously visible only in the log.
+- The dashboard shows "AI pilot (model): note" while a pilot reports what it is
+  doing. Display only: a note grants nothing, and it goes stale after 30 s.
+
 ### v1.9.29: a plan that finishes, stall detection that can fire, an IMU that can start
 
 From the third field run (2026-09-23, v1.9.28), and the operator watching it:

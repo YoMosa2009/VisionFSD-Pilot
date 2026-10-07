@@ -324,7 +324,14 @@
     $("halt").classList.toggle("active", !!state.halted);
     $("manual").classList.toggle("active", !!state.manual);
     padButtons.forEach(function (b) { b.disabled = !state.manual; });
-    $("mode").textContent = state.halted ? "stopped by operator" : (state.manual ? "manual control" : "autonomous");
+    var pilot = state.pilot;
+    var mode = state.halted ? "stopped by operator" : (state.manual ? "manual control" : "autonomous");
+    if (pilot && state.manual && !state.halted) {
+      // An AI pilot (haiku_pilot/) is driving through manual mode. STOP and
+      // the manual toggle still belong to whoever holds this page.
+      mode = "AI pilot" + (pilot.model ? " (" + pilot.model + ")" : "") + ": " + (pilot.note || "");
+    }
+    $("mode").textContent = mode;
     if (!state.manual) { releaseDrive(false); }
   }
   $("halt").addEventListener("click", function () { releaseDrive(false); sendControl({ halt: true }); });
