@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import argparse
 import math
+import multiprocessing
 import os
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -251,17 +253,18 @@ CONTROL_PERIOD_S = 0.025
 # the same boosted level as an escape pivot, because they fight the same tyre
 # scrub. Forward is deliberately the movement floor: manual driving exists to
 # nudge the robot out of somewhere, not to race it.
-MANUAL_FORWARD_MIN_M = 0.32
 OPENING_HALF_WIDTH_DEG = 5
 # The HDMI panel is a status screen, not a video feed, and drawing it costs
 # more than anything else on the control thread. The 2026-09-21 field run
 # measured the loop at about 1 Hz with this at 10 fps.
 DISPLAY_PERIOD_S = 0.33
 # Advisory work is skipped while the average control gap is above this, and
-# resumed below the lower figure. Both are well inside the 250 ms command
-# lease, so shedding starts before the motors can be cut.
-LOOP_LATE_MS = 150.0
-LOOP_RECOVERED_MS = 80.0
+# resumed below the lower figure. Both sit inside the 250 ms command lease, so
+# shedding starts before the motors can be cut. Until v1.9.31 these were 150
+# and 80 ms, but the Pi's normal loop gap is about 175 ms, so the robot counted
+# itself "behind" permanently and never stopped shedding.
+LOOP_LATE_MS = 220.0
+LOOP_RECOVERED_MS = 190.0
 # However busy the robot is, the screen and the phone still refresh this often.
 LOOP_MAX_SKIP_S = 2.0
 # Upper bound on LD19 returns serialised into one full telemetry message. A
@@ -991,6 +994,14 @@ class LD19Link:
             )
         return points, fresh
 
+    def packet_age_s(self, now: float | None = None) -> float | None:
+        """Seconds since the last LD19 packet, or None before the first."""
+        with self._lock:
+            last = self._last_packet_at
+        if not last:
+            return None
+        return (time.monotonic() if now is None else now) - last
+
     def scan_frame(self) -> ScanFrame:
         """The current scan window as arrays, filtered for mixed pixels."""
         points, _fresh = self.snapshot()
@@ -1704,19 +1715,15 @@ class AutonomousPolicy:
         left, right = manual_wheels(
             command, magnitude, self.speed, self.min_move_pwm
         )
-        forward = left > 0 and right > 0
-        if forward:
-            straight = lidar.limit_at(0.0)
-            if straight is None:
-                straight = lidar.front_m
-            blocked = (
-                arduino.front_cm is not None
-                and arduino.front_cm < CLOSE_ULTRASONIC_CM
-            ) or (straight is not None and straight < MANUAL_FORWARD_MIN_M)
-            if blocked:
-                self.reason = "STOP:MANUAL_FORWARD_BLOCKED"
-                self.drive_confidence = 0.0
-                return self._set_output("STOP", 0, 0)
+        # No proximity limit in Manual Control, at the operator's request
+        # (v1.9.31): whoever is driving - a person on the phone or the AI
+        # pilot - may take the robot right up to, and into, things. Until
+        # v1.9.30 forward was refused under 0.32 m on the LiDAR or 26 cm on
+        # the ultrasonic. Autonomous driving keeps every limit. What still
+        # stops a manually driven robot is what stops one nobody controls:
+        # the dashboard STOP, the expiring command and the command lease.
+        # The Uno firmware's own 18 cm forward stop is separate and remains
+        # until the firmware is reflashed.
         self.reason = (
             f"MANUAL:{command}" if command == "STOP" else f"MANUAL:{command} {magnitude:.0%}"
         )
@@ -3723,6 +3730,44 @@ def encode_map_png(local_map: LidarSlamLite) -> bytes | None:
     return buffer.tobytes() if ok else None
 
 
+#: How often the runtime logs a SYS line.
+SYSTEM_LOG_PERIOD_S = 30.0
+
+
+def system_snapshot() -> str:
+    """Power, heat, load and thread state, for lining up against a slowdown.
+
+    Each part is optional: on a desktop, or without vcgencmd, the field is
+    simply left out. Logged every SYSTEM_LOG_PERIOD_S, never per tick.
+    """
+    parts = []
+    try:
+        result = subprocess.run(
+            ["vcgencmd", "get_throttled"], capture_output=True, text=True, timeout=1.0
+        )
+        if result.returncode == 0 and "=" in result.stdout:
+            parts.append("throttled=" + result.stdout.strip().split("=", 1)[1])
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        with open("/sys/class/thermal/thermal_zone0/temp", encoding="ascii") as handle:
+            parts.append(f"cpu_c={int(handle.read().strip()) / 1000.0:.1f}")
+    except (OSError, ValueError):
+        pass
+    try:
+        one, five, _fifteen = os.getloadavg()
+        parts.append(f"load={one:.2f}/{five:.2f}")
+    except (AttributeError, OSError):
+        pass
+    parts.append(f"threads={threading.active_count()}")
+    try:
+        children = multiprocessing.active_children()
+        parts.append(f"children={len(children)}")
+    except Exception:
+        pass
+    return "SYS " + " ".join(parts)
+
+
 def _mark(timer: StageTimer, name: str, started: float) -> float:
     """Record one stage and return the clock for the next."""
     now = time.perf_counter()
@@ -3900,6 +3945,8 @@ def main() -> int:
     map_worker = MapWorker(local_map, explorer)
     last_submitted_scan = -1.0
     last_stuck_phase = "IDLE"
+    last_lidar_fresh: bool | None = None
+    next_system_log_at = 0.0
     scan_motion = ScanMotionTracker()
     mover_tracker = MovingObjectTracker()
     slam_lite = local_map.state()
@@ -4009,6 +4056,10 @@ def main() -> int:
                         now + IMU_CALIBRATION_DIAGNOSTIC_PERIOD_S
                     )
             policy.observe_imu(imu_state)
+            # `sense` is split so the log names which part is slow. On
+            # 2026-10-07 it tripled (115 -> 320 ms) after an IMU reconnect and
+            # stayed there; the cause could not be told from one number.
+            stage_clock = _mark(stage_timer, "sense_imu", stage_clock)
             imu_start_ready = (
                 imu is None
                 or imu_calibration_complete
@@ -4021,6 +4072,7 @@ def main() -> int:
             if imu_start_ready:
                 camera.start(now)
             camera.tick(policy.left_pwm, policy.right_pwm)
+            stage_clock = _mark(stage_timer, "sense_cam", stage_clock)
             clearance = lidar.clearance()
             status = arduino.status()
             camera_ready = camera.ready(now)
@@ -4028,7 +4080,26 @@ def main() -> int:
             # Arrays for every consumer below, built once per new packet batch
             # rather than once per consumer per control tick.
             scan = lidar.scan_frame()
-            stage_clock = _mark(stage_timer, "sense", stage_clock)
+            stage_clock = _mark(stage_timer, "sense_lidar", stage_clock)
+            if clearance.fresh != last_lidar_fresh:
+                # A real LD19 dropout is logged here, with how long since the
+                # last packet. A viewer seeing gaps between scans is not one:
+                # on 2026-10-07 the AI pilot reported "LiDAR dropped out" when
+                # the robot was only sending it scans every ~2 s.
+                if last_lidar_fresh is not None:
+                    age = lidar.packet_age_s(now)
+                    print(
+                        f"LD19_EVENT fresh={int(clearance.fresh)} "
+                        f"packet_age_ms={'none' if age is None else f'{age * 1000.0:.0f}'} "
+                        f"points={len(points)}"
+                    )
+                last_lidar_fresh = clearance.fresh
+            if now >= next_system_log_at:
+                next_system_log_at = now + SYSTEM_LOG_PERIOD_S
+                # vcgencmd can take a while; never on the control thread.
+                threading.Thread(
+                    target=lambda: print(system_snapshot()), name="sys-log", daemon=True
+                ).start()
             imu_yaw_rate = (
                 imu_state.gyro_z_dps
                 if imu_state.connected and imu_state.calibrated and imu_state.fresh
@@ -4219,10 +4290,11 @@ def main() -> int:
             # the robot builds no telemetry, encodes no map and compresses no
             # camera frame for a page nobody has open.
             if telemetry_hub.wants("light") and now >= next_telemetry_publish_at:
-                # A full message carries every LD19 return and is built on this
-                # thread. While the loop is late the phone still gets the light
-                # message, which is what the status chips need.
-                wants_full = telemetry_hub.wants("full") and advisory_ok
+                # Full telemetry is not shed. Thinned to TELEMETRY_SCAN_POINTS it
+                # costs 1-3 ms, and shedding it - permanently, under the old
+                # thresholds - left the phone's LiDAR view and the AI pilot
+                # with one scan every ~2 s, and once none for 8.5 s.
+                wants_full = telemetry_hub.wants("full")
                 light, full = build_telemetry(
                     policy, scan, exploration, slam_lite, imu_state, status,
                     clearance, camera_ready, arduino.differential_ready,

@@ -1092,6 +1092,36 @@ version made contact in it, so it understates real collisions; treat it as a
 comparison, not a prediction. Desktop tests (475 pass). **Nothing here has run
 on the robot.**
 
+### v1.9.31: no proximity limit in Manual Control, scans for viewers, better diagnostics
+
+From the first AI-pilot session (2026-10-07) and the operator.
+
+- **No proximity limit in Manual Control**, at the operator's request.
+  Whoever drives manually - a person on the phone or the AI pilot - may take
+  the robot right up to, and into, things. Until now forward was refused under
+  0.32 m on the LiDAR or 26 cm on the ultrasonic. Autonomous driving keeps every
+  limit. The dashboard STOP, the expiring command and the command lease still
+  stop a manually driven robot. **The Uno firmware's own 18 cm forward stop is
+  unchanged** - only reflashing can remove it.
+- **Viewers get LiDAR scans again.** The advisory budget counted the loop
+  "behind" above a 150 ms average gap, but the Pi's normal gap is about 175 ms,
+  so it shed permanently: the phone's LiDAR view and the AI pilot got one scan
+  every ~2 s, once none for 8.5 s. Full telemetry is no longer shed (it costs
+  1-3 ms), and the thresholds are 220 / 190 ms, still inside the 250 ms lease.
+- **Diagnostics for the post-IMU-reconnect slowdown.** On 2026-10-07 `sense`
+  tripled (115 -> 320 ms) after the IMU dropped out and reconnected, and stayed
+  there until a restart. The cause is not established, so this release
+  measures rather than guesses: `sense` is split into `sense_imu`,
+  `sense_cam` and `sense_lidar`, and a `SYS` line every 30 s logs power
+  throttling, CPU temperature, load, thread count and child processes (from a
+  background thread, never the control loop).
+- **Real LiDAR dropouts are logged** as `LD19_EVENT fresh=0/1` with the time
+  since the last packet, to tell an actual LD19 dropout from a viewer seeing
+  gaps between scans - which is what the AI pilot reported as "LiDAR dropped
+  out" while scans were being shed.
+
+546 tests pass. **Desktop tests only.**
+
 ### v1.9.30: support for an optional AI pilot (Claude Haiku 5.5)
 
 An experiment, off unless the operator starts it: Claude Haiku 5.5, running in

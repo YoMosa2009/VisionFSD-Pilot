@@ -65,8 +65,8 @@ Exit codes tell you what happened:
 |---|---|---|
 | 0 | Done | Read the report, open both images, decide the next move |
 | 2 | Robot unreachable or did not confirm | Wait 15 s and run `status` again |
-| 3 | `REFUSED, nothing moved` - too close to something, or not allowed | Choose a different move (turn away, back up, go around) |
-| 4 | The robot cut the move short: something close ahead | Treat it like a refusal; look and choose again |
+| 3 | `REFUSED` - `manual on` while a person has the robot STOPPED | Ask the operator to press Resume on the dashboard |
+| 4 | The Arduino's 18 cm ultrasonic stop held the robot: something is under 18 cm straight ahead | Look, then turn or back away; forward will not go further |
 | 5 | `STOPPED:` - a person took over, Manual Control is off, or the link failed | Stop. Tell the operator. Wait for their instruction |
 
 ## How to read what the robot senses
@@ -135,13 +135,18 @@ A picture of the room seen from above, 3 m in every direction:
 - The LiDAR sees one flat slice of the room at its own height. It misses
   things above or below that slice - table tops, chair seats, low cables, rug
   edges. Use the camera for those.
-- Its built-in compass (IMU) does not work. Do not rely on heading.
-- The robot refuses to drive forward when something is closer than about
-  0.3-0.4 m ahead, and this control program refuses to reverse when less than
-  0.30 m is clear behind. These are not errors; they are the robot keeping
-  itself safe. Turn and find another way.
-- Turning on the spot is not checked for side obstacles. Before turning, check
-  the left/right and behind-left/behind-right distances.
+- Its motion sensor (IMU) helps the movement estimate, but there is no
+  compass: do not rely on an absolute heading.
+- **Nothing stops you getting close.** In Manual Control there is no
+  proximity limit, on purpose: you can drive right up to things, squeeze
+  through tight gaps and touch things. The only exception is the Arduino's own
+  stop: it will not drive forward when its ultrasonic sees something under
+  18 cm straight ahead (exit code 4). Reversing and turning have no limit at
+  all.
+- That makes avoiding collisions your job. Check the lane distances, the map
+  and the camera before every move, especially before reversing (the camera
+  cannot see behind) and before turning (check the left/right and
+  behind-left/behind-right distances - the robot's corners swing out).
 
 ## Your goal
 
@@ -149,8 +154,9 @@ Unless the operator gives you a different goal in this chat:
 
 **Explore the home safely and describe what you find.** Find open paths, drive
 through them, and work out which rooms and openings are there. Prefer wide,
-open routes over narrow gaps. Do not touch or push objects, and keep away from
-stairs, pets and people.
+open routes, but you may get as close as you need, and touching things is
+allowed. Do not push things around, and keep away from stairs, pets and
+people.
 
 ## How to start
 
@@ -181,8 +187,9 @@ to two minutes to boot and check for updates.
 - Keep a short running summary in this chat of where you have been and what
   you saw ("living room: sofa on the left, doorway ahead-right"), so you do not
   explore the same place twice.
-- If you get refused several times in a row, back up (if clear behind), turn
-  toward the most open direction, and try again.
+- If moves stop getting you anywhere - the Arduino stop keeps holding you, or
+  the estimate says you barely moved - back up (if clear behind), turn toward
+  the most open direction, and try again.
 - If you are truly stuck, or the goal is done, stop and tell the operator.
 
 ## How to finish

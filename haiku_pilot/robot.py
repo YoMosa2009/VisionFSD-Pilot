@@ -14,13 +14,14 @@ what the robot now senses, and exits.
     python haiku_pilot/robot.py manual off
 
 Moves go through the dashboard's Manual Control, exactly like the phone's
-arrow buttons, so every manual-mode check on the robot still applies: forward
-is refused when the ultrasonic or LiDAR sees something close ahead, the Uno's
-18 cm stop and command timeout sit beneath that, and a held command expires
-within 0.35 s if this program stops sending it. This program adds what manual
-mode does not check - it will not reverse into something behind - and caps
-every move. A person pressing STOP or turning Manual Control off on the
-dashboard ends any move at once, and no command here will take control back.
+arrow buttons. At the operator's request there is no proximity limit in
+Manual Control (robot v1.9.31 onwards): the robot may drive right up to, and
+into, things, and this program does not refuse close moves either. What still
+stops it is what stops a robot nobody controls: STOP or turning Manual
+Control off on the dashboard ends any move at once, a held command expires
+within 0.35 s if this program stops sending it, and every move is capped.
+The Arduino's own 18 cm ultrasonic stop straight ahead also remains, because
+only reflashing its firmware can remove it; a move it holds back is reported.
 
 Each report also draws a top-down picture of the LiDAR scan. A model reads the
 shape of a room - openings, doorways, a gap 30 degrees to the left - far more
@@ -59,9 +60,6 @@ DRIVE_MAX_S = 2.0
 TURN_MAX_S = 1.5
 HOLD_PERIOD_S = 0.05          # the dashboard refreshes a held button this often
 SETTLE_S = 0.5                # let the chassis stop and a fresh scan arrive
-FORWARD_MIN_M = 0.40          # this tool's forward gate (the robot's own is 0.32 m)
-ULTRASONIC_MIN_CM = 30.0
-REVERSE_MIN_M = 0.30          # manual mode does not check behind; this tool does
 LANE_HALF_WIDTH_M = 0.15      # the chassis is 0.23 m wide
 BODY_OVERHANG_M = 0.13        # the chassis extends this far ahead of and behind the LiDAR
 TELEMETRY_WAIT_S = 4.0
@@ -584,27 +582,6 @@ def draw_lidar(telemetry: dict | None, summary: dict, openings: list[dict],
     return path if cv2.imwrite(path, image) else None
 
 
-def check_move(kind: str, direction: str, summary: dict) -> str | None:
-    """Why this tool refuses the move before asking the robot, or None."""
-    rng = summary.get("range") or {}
-    if kind == "drive" and direction == "forward":
-        lane = summary.get("lane_ahead_m")
-        if lane is None:
-            return "no LiDAR reading straight ahead, so driving forward would be blind"
-        if lane < FORWARD_MIN_M:
-            return f"only {lane:.2f} m clear in your lane ahead (need {FORWARD_MIN_M:.2f} m)"
-        ultra = rng.get("ultra_cm")
-        if ultra is not None and ultra < ULTRASONIC_MIN_CM:
-            return f"the ultrasonic sees something {ultra} cm ahead"
-    if kind == "drive" and direction == "backward":
-        lane = summary.get("lane_behind_m")
-        if lane is None:
-            return "no LiDAR returns behind, so reversing would be blind"
-        if lane < REVERSE_MIN_M:
-            return f"only {lane:.2f} m clear in your lane behind (need {REVERSE_MIN_M:.2f} m)"
-    return None
-
-
 def pose_change(before, after) -> str:
     try:
         moved = math.hypot(after[0] - before[0], after[1] - before[1])
@@ -639,8 +616,15 @@ def hold(link: RobotLink, command: str, power: float, seconds: float,
             check_override(link, clock)
             link.send({"type": "control", "drive": command, "mag": power})
             telemetry, _full, _at, _control = link.snapshot()
-            if ((telemetry or {}).get("reason") or "").startswith("STOP:MANUAL_FORWARD_BLOCKED"):
+            reason = (telemetry or {}).get("reason") or ""
+            rng = ((telemetry or {}).get("health") or {}).get("range") or {}
+            if reason.startswith("STOP:MANUAL_FORWARD_BLOCKED"):
+                # Robots before v1.9.31 still refuse close forward moves.
                 note = "The robot cut the move short: something is close ahead."
+                break
+            if command == "F" and rng.get("uno_blocked"):
+                note = ("The Arduino's 18 cm ultrasonic stop is holding the robot: "
+                        "something is under 18 cm straight ahead.")
                 break
             sleep(HOLD_PERIOD_S)
     finally:
@@ -752,10 +736,6 @@ def run(argv: list[str]) -> int:
         limit = DRIVE_MAX_S if args.command == "drive" else TURN_MAX_S
         seconds = min(limit, max(0.1, args.seconds))
         power = min(1.0, max(0.0, args.power))
-        refusal = check_move(args.command, args.direction, before)
-        if refusal:
-            print(report(link, args.robot, f"REFUSED, nothing moved: {refusal}. Choose a different move."))
-            return 3
         note = args.say or f"{args.command} {args.direction} {seconds:.1f}s"
         link.send({"type": "pilot", "note": note[:240], "model": "claude-haiku-5-5"})
         cut_short = hold(link, COMMANDS[args.direction], power, seconds)

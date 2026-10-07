@@ -38,6 +38,7 @@ class FakeRobot:
         # A busy robot sheds full telemetry: LiDAR points only this often.
         self.scan_every_s = scan_every_s
         self._next_scan_at = 0.0
+        self.uno_blocked = False
         self.control = RobotControl()
         self.hub = TelemetryHub()
         started = start_dashboard_server(
@@ -76,7 +77,7 @@ class FakeRobot:
             light = {
                 "v": "9.9.9", "reason": reason, "pose": {"x": 3.0, "y": 3.0, "h": 0.0},
                 "health": {"range": {"front_m": self.ahead_m, "rear_m": self.behind_m,
-                                     "ultra_cm": int(self.ahead_m * 100), "uno_blocked": False}},
+                                     "ultra_cm": int(self.ahead_m * 100), "uno_blocked": self.uno_blocked}},
                 "control": self.control.state(),
             }
             now = time.monotonic()
@@ -139,30 +140,29 @@ class PilotCommandTests(unittest.TestCase):
         time.sleep(0.4)
         self.assertEqual(self.robot.control.manual_input()[0], "STOP")
 
-    def test_forward_into_something_close_is_refused_before_moving(self) -> None:
-        self.robot.ahead_m = 0.25
+    def test_forward_close_to_something_is_allowed(self) -> None:
+        """Manual Control has no proximity limit (v1.9.31, operator request)."""
+        self.robot.ahead_m = 0.05
         run(self.robot.address, "manual", "on")
-        code, out = run(self.robot.address, "drive", "forward", "1.0")
-        self.assertEqual(code, 3, out)
-        self.assertIn("REFUSED, nothing moved", out)
-        self.assertNotIn("F", self.robot.commands)
+        code, out = run(self.robot.address, "drive", "forward", "0.3")
+        self.assertEqual(code, 0, out)
+        self.assertIn("F", self.robot.commands)
 
-    def test_stale_cached_telemetry_cannot_authorise_a_move(self) -> None:
-        """A new connection first gets the robot's last cached telemetry. An
-        obstacle that appeared since must still stop the move."""
+    def test_reversing_close_to_something_is_allowed(self) -> None:
+        self.robot.behind_m = 0.03
         run(self.robot.address, "manual", "on")
-        time.sleep(0.3)                 # the hub now caches a clear lane
-        self.robot.ahead_m = 0.25       # then something appears ahead
-        code, out = run(self.robot.address, "drive", "forward", "1.0")
-        self.assertEqual(code, 3, out)
-        self.assertNotIn("F", self.robot.commands)
+        code, out = run(self.robot.address, "drive", "backward", "0.3")
+        self.assertEqual(code, 0, out)
+        self.assertIn("B", self.robot.commands)
 
-    def test_reversing_into_something_close_is_refused(self) -> None:
-        self.robot.behind_m = 0.2
+    def test_the_arduinos_18_cm_stop_is_reported(self) -> None:
+        """Only reflashing can remove the firmware's own forward stop; a move
+        it holds back must say so, not look like a move that did nothing."""
         run(self.robot.address, "manual", "on")
-        code, out = run(self.robot.address, "drive", "backward", "1.0")
-        self.assertEqual(code, 3, out)
-        self.assertNotIn("B", self.robot.commands)
+        self.robot.uno_blocked = True
+        code, out = run(self.robot.address, "drive", "forward", "1.0")
+        self.assertEqual(code, 4, out)
+        self.assertIn("18 cm ultrasonic stop", out)
 
     def test_the_robots_own_refusal_cuts_a_move_short(self) -> None:
         run(self.robot.address, "manual", "on")
@@ -246,16 +246,6 @@ class BusyRobotTests(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertIn("F", self.robot.commands)
 
-    def test_an_obstacle_between_scans_still_blocks_the_move(self) -> None:
-        """Safety uses the light messages' range readings, which arrive
-        several times a second, not the scan, which may be seconds old."""
-        run(self.robot.address, "manual", "on")
-        self.robot.ahead_m = 0.25
-        code, out = run(self.robot.address, "drive", "forward", "1.0")
-        self.assertEqual(code, 3, out)
-        self.assertNotIn("F", self.robot.commands)
-
-
 class NoScanTests(unittest.TestCase):
     """2026-10-07, after a restart: the robot sent no LiDAR scan for the first
     8.5 s after the pilot connected, and the pilot refused every move. A late
@@ -277,14 +267,6 @@ class NoScanTests(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertIn("F", self.robot.commands)
         self.assertIn("Clear in your own lane: ahead 2.00 m", out)
-
-    def test_range_readings_still_block_a_move_without_a_scan(self) -> None:
-        run(self.robot.address, "manual", "on")
-        self.robot.ahead_m = 0.25
-        code, out = run(self.robot.address, "drive", "forward", "1.0")
-        self.assertEqual(code, 3, out)
-        self.assertNotIn("F", self.robot.commands)
-
 
 class OpeningTests(unittest.TestCase):
     def test_a_doorway_is_the_first_opening_listed(self) -> None:

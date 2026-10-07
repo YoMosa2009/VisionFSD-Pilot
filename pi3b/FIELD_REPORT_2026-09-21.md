@@ -269,7 +269,12 @@ checks, VERSION bump, README, push to `origin/codex/pi3b-runtime`.
 
 ---
 
-## Queued for the next robot update (noted 2026-10-07, not yet worked on)
+## Queued for the next robot update (noted 2026-10-07)
+
+**Status (v1.9.31):** items 1, 2 and 6 done (6 without the firmware part,
+held for the operator's decision); items 3 and 4 instrumented, to be diagnosed
+from the next run's `sense_*`, `SYS` and `LD19_EVENT` log lines; item 5 needs
+a physical check.
 
 From the first AI-pilot session (v1.9.30, Claude Haiku 5.5 via
 `haiku_pilot/`) and live measurements taken during it.

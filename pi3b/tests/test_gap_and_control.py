@@ -21,7 +21,6 @@ from robot_autonomy import (
     FRONT_OVERHANG_M,
     GAP_ALIGNED_DEG,
     MANUAL_DRIVE,
-    MANUAL_FORWARD_MIN_M,
     MAX_PWM_RATE_PER_S,
     MAX_STEERING_RATE_DPS,
     MIN_MOVE_PWM,
@@ -400,22 +399,23 @@ class OperatorControlPolicyTests(unittest.TestCase):
         self.assertGreater(policy.left_pwm, 0)
         self.assertLess(policy.right_pwm, 0)
 
-    def test_manual_forward_is_refused_against_a_close_obstacle(self) -> None:
-        """Manual driving keeps the independent safety layers underneath it.
-        Reverse and pivots stay free, because driving out of somewhere the
-        planner could not is the whole point."""
+    def test_manual_forward_has_no_proximity_limit(self) -> None:
+        """v1.9.31, at the operator's request: in Manual Control the robot may
+        drive right up to and into things. Autonomous driving keeps every
+        limit; the Uno firmware's 18 cm stop is separate."""
         policy, control = self._policy()
-        now = time.monotonic()
         control.set_manual(True)
-        control.drive("F")
-        blocked = SectorClearance(
-            0.20, 2.0, 2.0, True, 2.0, 2.0, rear_m=2.0, scan_at=now
-        )
 
-        command = policy.decide(blocked, _status(now), False, now)
+        def blocked(tick):
+            return SectorClearance(
+                0.02, 2.0, 2.0, True, 2.0, 2.0, rear_m=2.0, scan_at=tick
+            )
 
-        self.assertEqual(command, "STOP")
-        self.assertEqual(policy.reason, "STOP:MANUAL_FORWARD_BLOCKED")
+        self._hold(policy, control, "F", blocked)
+
+        self.assertTrue(policy.reason.startswith("MANUAL:F"))
+        self.assertGreater(policy.left_pwm, 0)
+        self.assertGreater(policy.right_pwm, 0)
 
     def test_manual_reverse_is_allowed_against_a_close_front_obstacle(self) -> None:
         policy, control = self._policy()
@@ -431,17 +431,35 @@ class OperatorControlPolicyTests(unittest.TestCase):
         self.assertTrue(policy.reason.startswith("MANUAL:B"))
         self.assertLess(policy.left_pwm, 0)
 
-    def test_manual_forward_is_refused_on_the_ultrasonic_alone(self) -> None:
+    def test_manual_forward_ignores_a_close_ultrasonic_reading(self) -> None:
         policy, control = self._policy()
-        now = time.monotonic()
         control.set_manual(True)
-        control.drive("F")
+        tick = time.monotonic()
+        for index in range(40):
+            tick = time.monotonic()
+            control.drive("F")
+            policy.decide(self._clear(tick), _status(tick, front_cm=3.0), False, tick)
+        self.assertGreater(policy.left_pwm, 0)
 
-        command = policy.decide(
-            self._clear(now), _status(now, front_cm=12.0), False, now
+    def test_autonomous_driving_still_stops_for_a_close_obstacle(self) -> None:
+        """The limit is removed for Manual Control only."""
+        policy, _control = self._policy()
+        policy.started_at = -999.0
+        now = time.monotonic()
+        blocked = SectorClearance(
+            0.05, 0.05, 0.05, True, 0.05, 0.05, rear_m=2.0, scan_at=now
         )
+        policy.decide(blocked, _status(now, front_cm=5.0), False, now)
+        self.assertFalse(policy.left_pwm > 0 and policy.right_pwm > 0)
 
-        self.assertEqual(command, "STOP")
+    def test_a_dashboard_stop_still_stops_manual_driving(self) -> None:
+        policy, control = self._policy()
+        control.set_manual(True)
+        self._hold(policy, control, "F", self._clear)
+        control.halt()
+        now = time.monotonic()
+        policy.decide(self._clear(now), _status(now), False, now)
+        self.assertEqual((policy.left_pwm, policy.right_pwm), (0, 0))
 
     def test_an_expired_manual_command_stops_the_robot(self) -> None:
         policy, control = self._policy()
@@ -459,7 +477,6 @@ class OperatorControlPolicyTests(unittest.TestCase):
     def test_manual_forward_uses_the_movement_floor(self) -> None:
         self.assertEqual(MANUAL_DRIVE["F"], (MIN_MOVE_PWM, MIN_MOVE_PWM))
         self.assertEqual(MANUAL_DRIVE["STOP"], (0, 0))
-        self.assertGreater(MANUAL_FORWARD_MIN_M, 0.0)
 
 
 class ProgressWatchdogTests(unittest.TestCase):
