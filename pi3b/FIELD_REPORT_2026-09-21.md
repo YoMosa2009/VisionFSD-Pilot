@@ -266,3 +266,41 @@ navigation is tuning noise.
 
 Each step follows the standing rules: regressions first, full suite, static
 checks, VERSION bump, README, push to `origin/codex/pi3b-runtime`.
+
+---
+
+## Queued for the next robot update (noted 2026-10-07, not yet worked on)
+
+From the first AI-pilot session (v1.9.30, Claude Haiku 5.5 via
+`haiku_pilot/`) and live measurements taken during it.
+
+1. **Full telemetry is shed permanently.** The advisory budget marks the
+   loop "behind" above a 150 ms average gap and recovers below 80 ms, but the
+   robot's normal gap is about 175 ms, so it never recovers. Full telemetry
+   (LiDAR points for the phone and the pilot) then goes out only on the
+   forced pass every ~2 s, and only when that pass coincides with a telemetry
+   tick. Measured: one scan every ~2 s, and once none for 8.5 s. Building a
+   full message now costs 1-3 ms, so it should not be shed at all, or the
+   thresholds should be recalibrated to the loop the Pi actually achieves.
+2. **A new viewer gets no scan until the next full message.** When the last
+   publish was light-only, the hub holds no full message, so a newly
+   connected phone or pilot has no LiDAR picture to start with.
+3. **The loop collapses after an IMU reconnect.** The IMU now works (fixed
+   in v1.9.29: the adapter helper is forked instead of spawned). After it
+   calibrated, the loop held ~5.5 Hz. When it later dropped out (`no reply
+   to an I2C transaction within 0.75 s`) and reconnected, `sense` went from
+   ~115 ms to ~320 ms per tick and the loop to 2.4 Hz until a restart.
+   Suspect the mid-run re-fork of the adapter helper from a large,
+   multi-threaded process. Needs instrumentation before a fix.
+4. **"LiDAR dropped out several times"**, reported by the pilot, which then
+   steered on the ultrasonic and camera until it came back. Not yet
+   established whether the LD19 itself stopped (`health.lidar` false,
+   `lidar=0` in the log) or the pilot only saw gaps between scans, which
+   items 1 and 2 would produce on their own. Check the log for `lidar=0`
+   and LD19 packet gaps over that session before treating it as a sensor
+   fault.
+5. **Something reads 4-5 cm behind the rear bumper** (`rear_m` 0.04 m, a
+   cluster ~0.18-0.22 m behind-right of the LiDAR centre). Looked like real
+   clutter on the map, but if it is part of the robot (cable, battery) it
+   blocks every reverse - the pilot's and the autonomous escape's alike.
+   Check physically.
