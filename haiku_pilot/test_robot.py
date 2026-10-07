@@ -32,9 +32,12 @@ class FakeRobot:
     """Publishes telemetry like the runtime, and applies the manual-mode
     forward guard the real policy applies."""
 
-    def __init__(self, ahead_m: float = 2.0, behind_m: float = 1.5) -> None:
+    def __init__(self, ahead_m: float = 2.0, behind_m: float = 1.5, scan_every_s: float = 0.0) -> None:
         self.ahead_m = ahead_m
         self.behind_m = behind_m
+        # A busy robot sheds full telemetry: LiDAR points only this often.
+        self.scan_every_s = scan_every_s
+        self._next_scan_at = 0.0
         self.control = RobotControl()
         self.hub = TelemetryHub()
         started = start_dashboard_server(
@@ -76,7 +79,12 @@ class FakeRobot:
                                      "ultra_cm": int(self.ahead_m * 100), "uno_blocked": False}},
                 "control": self.control.state(),
             }
-            self.hub.publish(light, dict(light, scan=self._scan()))
+            now = time.monotonic()
+            if now >= self._next_scan_at:
+                self.hub.publish(light, dict(light, scan=self._scan()))
+                self._next_scan_at = now + self.scan_every_s
+            else:
+                self.hub.publish(light, None)
             if self.server.camera is not None and self.server.camera.viewers > 0:
                 self.server.camera.publish(np.full((240, 320, 3), 90, dtype=np.uint8))
             time.sleep(0.05)
@@ -220,6 +228,32 @@ def _room_points(robot_x: float = 1.6, robot_y: float = 1.4) -> list[tuple[float
         if best is not None and best < 8:
             points.append((dx * best, dy * best))
     return points
+
+
+class BusyRobotTests(unittest.TestCase):
+    """2026-10-07: the robot's loop slowed to 2.4 Hz and it sent LiDAR points
+    only every ~2 s. The pilot demanded two fresh scans within 4 s and failed
+    every command with "no fresh LiDAR data"."""
+
+    def setUp(self) -> None:
+        self.robot = FakeRobot(scan_every_s=2.0)
+        self.addCleanup(self.robot.close)
+
+    def test_observe_and_move_still_work(self) -> None:
+        code, out = run(self.robot.address, "manual", "on")
+        self.assertEqual(code, 0, out)
+        code, out = run(self.robot.address, "drive", "forward", "0.3")
+        self.assertEqual(code, 0, out)
+        self.assertIn("F", self.robot.commands)
+
+    def test_an_obstacle_between_scans_still_blocks_the_move(self) -> None:
+        """Safety uses the light messages' range readings, which arrive
+        several times a second, not the scan, which may be seconds old."""
+        run(self.robot.address, "manual", "on")
+        self.robot.ahead_m = 0.25
+        code, out = run(self.robot.address, "drive", "forward", "1.0")
+        self.assertEqual(code, 3, out)
+        self.assertNotIn("F", self.robot.commands)
 
 
 class OpeningTests(unittest.TestCase):
