@@ -4,7 +4,7 @@ import sys
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import cv2
 import numpy as np
@@ -15,6 +15,7 @@ from visionfsd_pi import (
     Detection,
     LaneEstimate,
     LowCostLaneDetector,
+    LatestCamera,
     RUNTIME_VERSION,
     Rates,
     SceneObjectTracker,
@@ -35,6 +36,18 @@ from visionfsd_pi import (
 
 
 class PiCoreTests(unittest.TestCase):
+    def test_v4l_by_id_camera_uses_v4l2_and_releases_failed_capture(self) -> None:
+        capture = Mock()
+        capture.isOpened.return_value = False
+        with patch("visionfsd_pi.cv2.VideoCapture", return_value=capture) as open_camera:
+            with self.assertRaisesRegex(RuntimeError, "Could not open camera"):
+                LatestCamera("/dev/v4l/by-id/usb-test-video-index0", 640, 480, 25)
+        open_camera.assert_called_once_with(
+            "/dev/v4l/by-id/usb-test-video-index0",
+            cv2.CAP_V4L2,
+        )
+        capture.release.assert_called_once()
+
     def test_range_and_bearing_are_bounded(self) -> None:
         box = (270, 250, 370, 430)
         self.assertGreater(estimate_car_range_m(box, 640, 70), 5.0)

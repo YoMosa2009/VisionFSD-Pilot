@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=VisionFSD Pi Robot
+Comment=Starts VisionFSD robot standby/autonomy after the Pi desktop appears
+Exec=__VISIONFSD_RUN_ROBOT__
+Terminal=false
+X-GNOME-Autostart-enabled=true
