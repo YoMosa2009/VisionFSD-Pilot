@@ -9,8 +9,12 @@ tracked is kept in small JSON files next to the saved images.
 * ``Track`` adds up the measured moves since ``manual on`` into a position
   relative to where Manual Control started, and remembers marked targets
   (the capsule, the bucket) in the same frame, so they can be found again
-  after they leave the camera's view. It drifts a little with every move;
-  re-mark a target whenever it is seen.
+  after they leave the camera's view. Adding up moves drifts a little with
+  every one, so the track also keeps "keyframes" - still scans with the pose
+  they were taken at - and after each move re-anchors the pose by matching
+  the new scan against the nearest keyframe directly (2026-10-09: 93 chained
+  moves left the marks noticeably off). A re-anchor far from the chained
+  estimate is rejected rather than trusted.
 
 Frame: x to the right of the starting pose, y straight ahead of it, metres;
 heading in degrees, positive to the LEFT of the starting direction.
@@ -32,6 +36,16 @@ OFFSET_LIMITS = (-10.0, 30.0)
 MIN_PIVOT_S = 0.03
 MAX_PIVOT_S = 1.5
 KEEP_OBSERVATIONS = 16
+# Keyframes: a new one once the robot is this far from every existing one;
+# re-anchor against one within the wider limits; accept the result only if
+# it is this close to the chained estimate.
+KEYFRAME_NEW_M = 0.4
+KEYFRAME_NEW_DEG = 35.0
+KEYFRAME_USE_M = 1.2
+KEYFRAME_USE_DEG = 60.0
+REANCHOR_MAX_M = 0.25
+REANCHOR_MAX_DEG = 8.0
+KEEP_KEYFRAMES = 40
 
 
 def _load(path: str) -> dict:
@@ -106,6 +120,10 @@ class Track:
 
     def __init__(self, path: str) -> None:
         self.path = path
+        self.keyframe_path = os.path.splitext(path)[0] + "_keyframes.json"
+        frames = _load(self.keyframe_path).get("frames") or []
+        self.keyframes = [frame for frame in frames
+                          if isinstance(frame, dict) and isinstance(frame.get("scan"), dict)]
         data = _load(path)
         self.x = float(data.get("x", 0.0))
         self.y = float(data.get("y", 0.0))
@@ -123,6 +141,7 @@ class Track:
         self.x = self.y = self.heading = 0.0
         self.moves = self.unmeasured = 0
         self.marks = {}
+        self.keyframes = []
 
     def save(self) -> None:
         _save(self.path, {
@@ -130,6 +149,60 @@ class Track:
             "moves": self.moves, "unmeasured": self.unmeasured,
             "marks": {name: [round(x, 3), round(y, 3), at] for name, (x, y, at) in self.marks.items()},
         })
+        _save(self.keyframe_path, {"frames": self.keyframes[-KEEP_KEYFRAMES:]})
+
+    def reanchor(self, scan: dict | None, match) -> str:
+        """Correct the pose against the nearest keyframe; maybe add one.
+
+        ``match(before, after, **search)`` is scan_match.match (or None when
+        unavailable) and returns a trusted Motion or None. Returns a short
+        note for the report, or "".
+        """
+        if not scan:
+            return ""
+        note = ""
+        nearest = None
+        for frame in self.keyframes:
+            distance = math.hypot(self.x - frame["x"], self.y - frame["y"])
+            turn = abs((self.heading - frame["heading"] + 180.0) % 360.0 - 180.0)
+            if distance <= KEYFRAME_USE_M and turn <= KEYFRAME_USE_DEG:
+                score = distance + turn / 90.0
+                if nearest is None or score < nearest[0]:
+                    nearest = (score, frame)
+        if nearest is not None and match is not None:
+            frame = nearest[1]
+            radians = math.radians(frame["heading"])
+            forward = (-math.sin(radians), math.cos(radians))
+            right = (math.cos(radians), math.sin(radians))
+            dx, dy = self.x - frame["x"], self.y - frame["y"]
+            guess_forward = dx * forward[0] + dy * forward[1]
+            guess_right = dx * right[0] + dy * right[1]
+            guess_turn = (self.heading - frame["heading"] + 180.0) % 360.0 - 180.0
+            motion = match(frame["scan"], scan, guess_turn_deg=guess_turn, search_deg=10.0,
+                           guess_forward_m=guess_forward, search_forward_m=0.1,
+                           guess_right_m=guess_right, search_step_deg=2.0)
+            if motion is not None:
+                x = frame["x"] + motion.forward_m * forward[0] + motion.right_m * right[0]
+                y = frame["y"] + motion.forward_m * forward[1] + motion.right_m * right[1]
+                heading = (frame["heading"] + motion.turn_deg + 180.0) % 360.0 - 180.0
+                shift = math.hypot(x - self.x, y - self.y)
+                turn = abs((heading - self.heading + 180.0) % 360.0 - 180.0)
+                if shift <= REANCHOR_MAX_M and turn <= REANCHOR_MAX_DEG:
+                    if shift >= 0.02 or turn >= 1.0:
+                        note = (f"Position re-anchored to an earlier LiDAR view "
+                                f"(corrected {shift * 100:.0f} cm, {turn:.0f} deg).")
+                    self.x, self.y, self.heading = x, y, heading
+        far = all(
+            math.hypot(self.x - frame["x"], self.y - frame["y"]) > KEYFRAME_NEW_M
+            or abs((self.heading - frame["heading"] + 180.0) % 360.0 - 180.0) > KEYFRAME_NEW_DEG
+            for frame in self.keyframes
+        )
+        if far:
+            self.keyframes.append({"x": round(self.x, 3), "y": round(self.y, 3),
+                                   "heading": round(self.heading, 1),
+                                   "scan": {"x": list(scan.get("x") or []), "y": list(scan.get("y") or [])}})
+            self.keyframes = self.keyframes[-KEEP_KEYFRAMES:]
+        return note
 
     def _axes(self) -> tuple[tuple[float, float], tuple[float, float]]:
         radians = math.radians(self.heading)

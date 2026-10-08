@@ -49,9 +49,9 @@ Run them exactly like this (works in PowerShell and Bash):
 | `status` | Is the robot reachable, and which mode it is in. No camera. |
 | `observe` | Prints what the robot senses and saves a fresh camera image and LiDAR map. Does not move. |
 | `manual on` | Takes Manual Control. Required before any move. The robot then holds still until you move it. |
-| `drive forward <seconds> [power]` | Drives straight for exactly that long, then stops and reports. seconds 0.05-2.0, power 0-1 (default 0.5). |
+| `drive forward <seconds> [power]` | Drives straight for that long, then stops and reports. Drives over 0.7 s go in steps, and any veer is turned back out between steps so you end up pointing where you started (add `--no-straighten` to skip that). seconds 0.05-2.0, power 0-1 (default 0.5). |
 | `drive backward <seconds> [power]` | Reverses straight, then stops and reports. |
-| `turn left <degrees> [power]` | Turns on the spot **by that many degrees** (1-180) in short pivots, each measured by LiDAR, to within about 3 degrees; then reports. Power default 0.3. |
+| `turn left <degrees> [power]` | Turns on the spot **by that many degrees** (1-180) in short pivots, each measured by LiDAR, to within about 2 degrees; then reports. Power default 0.3. |
 | `turn right <degrees> [power]` | Same, to the right. |
 | `stop` | Stops at once. |
 | `mark <name> <left\|right\|ahead> <degrees> <metres>` | Remembers a target you can see now, e.g. `mark capsule left 20 0.4`. Every report then says where it is from you, and the LiDAR map shows it as a pink cross. |
@@ -69,7 +69,8 @@ Exit codes tell you what happened:
 | 2 | Robot unreachable or did not confirm | Wait 15 s and run `status` again |
 | 3 | `REFUSED` - `manual on` while a person has the robot STOPPED, or the robot refused a move ("Did not move: ...") | Read the reason; ask the operator to press Resume if STOP is pressed |
 | 4 | The Arduino's 18 cm ultrasonic stop held the robot: something is under 18 cm straight ahead | Look, then turn or back away; forward will not go further |
-| 5 | `STOPPED:` - a person took over, Manual Control is off, or the link failed | Stop. Tell the operator. Wait for their instruction |
+| 5 | `STOPPED:` - a person took over, or Manual Control is off | Stop. Tell the operator. Wait for their instruction |
+| 6 | `CONNECTION:` - the Wi-Fi link dropped or stalled. Nobody took over; the robot stopped on its own | Run `observe`. If it works, carry on. Re-mark targets you can see (the last move may be missing from the tracking) |
 
 ## How to read what the robot senses
 
@@ -127,9 +128,10 @@ A picture of the room seen from above, 3 m in every direction:
 - Every move is measured by comparing LiDAR scans from before and after
   ("Measured by LiDAR: 0.31 m forward, 2 cm left, heading unchanged"). Each
   report also says where you are since `manual on` and where your marked
-  targets are. That tracking drifts a little with every move, more when a
-  move says the LiDAR could not measure it - re-`mark` a target whenever you
-  see it. Low objects (the capsule) are not in the LiDAR scan, so marks are
+  targets are. After each move the position is also re-anchored against
+  still LiDAR views remembered along the way ("Position re-anchored ..."),
+  so it drifts much less than adding moves up would; still re-`mark` a
+  target whenever you see it. Low objects (the capsule) are not in the LiDAR scan, so marks are
   how you find them again.
 - Images are saved under a new file name every time; open the path the
   report prints.
@@ -138,13 +140,15 @@ A picture of the room seen from above, 3 m in every direction:
 
 - About 23 cm wide and 27 cm long. Indoor floors only; it cannot climb.
 - Speed at power 0.5 is roughly 0.2 m/s: 1 s forward covers about 15-25 cm.
-- Turns are in degrees and land within about 3 degrees: the turn is made in
+- Turns are in degrees and land within about 2 degrees: the turn is made in
   short pivots and each is measured by LiDAR, e.g. "asked 30 degrees ...,
   turned 31 degrees (measured by LiDAR, 2 pivots)". Small turns (2-10
   degrees) work. If a report says the LiDAR could not confirm a turn, check
   the angle with the camera and the map.
-- Straight drives hold their heading (the chassis veers on its own; the
-  robot corrects it once it has seen one turn this session).
+- Straight drives hold their heading: the robot steers against the
+  chassis's veer with its gyro, and the control program measures each step
+  by LiDAR and turns any remaining veer back out. The report says "Veer
+  turned back out ... heading kept" when it did.
 - Lower power turns more slowly and stops more precisely; 0.3 is a good
   default, 0 is the slowest.
 - The LiDAR sees one flat slice of the room at its own height. It misses

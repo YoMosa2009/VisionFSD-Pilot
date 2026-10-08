@@ -84,11 +84,21 @@ LEGACY_TURN_DPS = 140.0
 MOVE_REPORT_GRACE_S = 5.0
 # LiDAR-measured turns (robot v1.9.33+): pivots until within this of the
 # angle asked, at most this many. The first pivot of a big turn aims short.
-TURN_TOLERANCE_DEG = 3.0
-TURN_MAX_PIVOTS = 5
+# 2026-10-09 (4): the learned pivots were repeatable to about +/-2 deg, so
+# 3 deg let a 5 deg ask come back as 8. Two is what the pivots support.
+TURN_TOLERANCE_DEG = 2.0
+TURN_MAX_PIVOTS = 6
 FIRST_PIVOT_FRACTION = 0.85
 # Rough drive speed at power 0.5, only to centre the LiDAR match's search.
 DRIVE_GUESS_MPS = 0.25
+# A drive is made in steps this long; after each, a LiDAR-measured veer
+# beyond STRAIGHTEN_DEG is turned back out, so a push ends pointing where it
+# started (2026-10-09: drives still ended 4-14 deg off).
+DRIVE_STEP_S = 0.7
+STRAIGHTEN_DEG = 2.0
+# While the robot runs a move itself, a gap in telemetry does not matter -
+# it stops on its own - so the wait for its result tolerates this much.
+MOVE_LINK_GRACE_S = 8.0
 HOLD_PERIOD_S = 0.05          # the dashboard refreshes a held button this often
 SETTLE_S = 0.5                # let the chassis stop and a fresh scan arrive
 LANE_HALF_WIDTH_M = 0.15      # the chassis is 0.23 m wide
@@ -116,6 +126,11 @@ COMMANDS = {"forward": "F", "backward": "B", "left": "L", "right": "R"}
 
 class Override(Exception):
     """A person took over, or the robot could not be reached."""
+
+
+class LinkTrouble(Override):
+    """The Wi-Fi link dropped or stalled. Nobody took over: the robot
+    stopped on its own, and the pilot may check and carry on."""
 
 
 # --------------------------------------------------------------------------- robot link
@@ -272,7 +287,7 @@ class RobotLink:
                 if self.light_count >= light_mark + 2:
                     break
             if self.closed or time.monotonic() >= deadline:
-                raise Override("no fresh telemetry from the robot; it may be busy or starting up")
+                raise LinkTrouble("no fresh telemetry from the robot; it may be busy or starting up")
             time.sleep(0.05)
         if not want_new_scan:
             return False
@@ -315,7 +330,7 @@ class RobotLink:
             time.sleep(0.05)
         telemetry, _full, _at, _control = self.snapshot()
         if telemetry is None:
-            raise Override("no telemetry from the robot; it may still be starting up")
+            raise LinkTrouble("no telemetry from the robot; it may still be starting up")
 
     def wait_for_control(self, predicate, timeout: float = 2.0) -> bool:
         """Wait until the robot's control state satisfies predicate."""
@@ -754,16 +769,17 @@ def pose_change(before, after) -> str:
 # --------------------------------------------------------------------------- actions
 
 
-def check_override(link: RobotLink, clock=time.monotonic) -> None:
+def check_override(link: RobotLink, clock=time.monotonic,
+                   stale_s: float = TELEMETRY_STALE_S) -> None:
     _telemetry, _full, at, control = link.snapshot()
     if control.get("halted"):
         raise Override("STOP was pressed on the dashboard - a person has taken over")
     if control and not control.get("manual"):
         raise Override("Manual Control is off - the robot is not yours to drive right now")
     if link.closed:
-        raise Override("the connection to the robot was lost")
-    if at and clock() - at > TELEMETRY_STALE_S:
-        raise Override("telemetry from the robot stopped arriving")
+        raise LinkTrouble("the connection to the robot was lost")
+    if at and clock() - at > stale_s:
+        raise LinkTrouble("telemetry from the robot stopped arriving")
 
 
 def hold(link: RobotLink, command: str, power: float, seconds: float,
@@ -808,11 +824,11 @@ def precise_move(link: RobotLink, kind: str, direction: str, amount: float, powe
     link.send({"type": "control", "move": {
         "kind": kind, "dir": direction, "amount": amount, "mag": power, "id": move_id,
     }})
-    expected = amount if kind == "drive" else 0.0
-    deadline = clock() + expected + MOVE_REPORT_GRACE_S
+    expected = amount if kind in ("drive", "pivot") else 0.0
+    deadline = clock() + expected + MOVE_REPORT_GRACE_S + MOVE_LINK_GRACE_S
     try:
         while clock() < deadline:
-            check_override(link, clock)
+            check_override(link, clock, stale_s=MOVE_LINK_GRACE_S)
             _telemetry, _full, _at, control = link.snapshot()
             result = control.get("move") or {}
             if result.get("id") == move_id:
@@ -822,7 +838,7 @@ def precise_move(link: RobotLink, kind: str, direction: str, amount: float, powe
         link.send({"type": "control", "drive": "STOP"})
         raise
     link.send({"type": "control", "drive": "STOP"})
-    raise Override("the robot did not report the move finishing")
+    raise LinkTrouble("the robot did not report the move finishing")
 
 
 def _strip(note: str, prefix: str) -> str:
@@ -842,10 +858,19 @@ def describe_move(kind: str, direction: str, amount: float, power: float, result
                 f"turned {turned:.0f} degrees ({how}).")
     else:
         drove = float(result.get("drove_s") or 0.0)
-        text = f"Did: drive {direction} for {drove:.2f} s at power {power:.1f}."
+        text = f"Did: drive {direction} for {drove:.2f} s at power {power:.1f}{_hold_text(result)}."
     if note:
         text += f" Cut short: {_strip(note, 'stopped: ')}."
     return text
+
+
+def _hold_text(result: dict) -> str:
+    """Whether the robot's own gyro heading hold was steering the drive."""
+    if result.get("hold_note"):
+        return f" (robot heading hold {result['hold_note']})"
+    if "held" in result:
+        return " (robot heading hold on)" if result.get("held") else " (robot heading hold off)"
+    return ""
 
 
 def _match(before: dict | None, after: dict | None, **search):
@@ -861,19 +886,22 @@ def _match(before: dict | None, after: dict | None, **search):
 
 
 def lidar_turn(link: RobotLink, direction: str, target: float, power: float,
-               model: PivotModel) -> tuple[str, float, bool, str]:
+               model: PivotModel, start: dict | None = None) -> dict:
     """Turn ``target`` degrees in timed pivots, each measured by LiDAR.
 
-    Returns (description, turn in degrees with left positive, whether the
-    LiDAR measured it, note when the robot cut a pivot short).
+    Every pivot is measured against the same still scan from before the
+    turn, so errors do not add up; a pivot the LiDAR cannot place is
+    counted from the gyro, and the next one is tried against the LiDAR
+    again. Returns text, turn_left (degrees, left positive), measured,
+    note (why a pivot was cut short) and scan (the last still scan).
     """
     sign = 1.0 if direction == "left" else -1.0
-    start = link.still_scan(count=1)
-    turned = 0.0                    # toward the asked side, measured
+    start = start or link.still_scan(count=1)
+    turned = 0.0                    # toward the asked side
     measured = start is not None
+    last_scan = start
     pivots = 0
     note = ""
-    gyro_total = 0.0
     while pivots < TURN_MAX_PIVOTS:
         remaining = target - turned
         if abs(remaining) <= TURN_TOLERANCE_DEG:
@@ -884,29 +912,95 @@ def lidar_turn(link: RobotLink, direction: str, target: float, power: float,
         result = precise_move(link, "pivot", COMMANDS[side], round(seconds, 3), power)
         pivots += 1
         if result.get("state") == "refused" or result.get("note"):
-            note = (result.get("note") or "refused").removeprefix("stopped: ")
+            note = _strip(result.get("note") or "refused", "stopped: ")
             break
-        step_gyro = float(result.get("turned_deg") or 0.0) * (1 if side == direction else -1)
-        gyro_total += step_gyro
-        after = link.still_scan() if measured else None
-        expected = turned + (model.predict(seconds) if side == direction else -model.predict(seconds))
+        toward = 1.0 if side == direction else -1.0
+        gyro_step = float(result.get("turned_deg") or 0.0) * toward
+        expected = turned + toward * model.predict(seconds)
+        after = link.still_scan() if start is not None else None
         motion = _match(start, after, guess_turn_deg=sign * expected,
                         search_deg=max(25.0, 0.6 * model.predict(seconds)))
+        if after is not None:
+            last_scan = after
         if motion is None:
             measured = False
-            turned += step_gyro
+            turned += gyro_step
             continue
+        measured = True
         now = motion.turn_deg * sign
-        step = now - turned
-        model.add(seconds, abs(step) if (step > 0) == (side == direction) else 0.0)
+        step = (now - turned) * toward
+        model.add(seconds, max(0.0, step))
         turned = now
     model.save()
     how = (f"measured by LiDAR, {pivots} pivot{'s' if pivots != 1 else ''}" if measured
            else "gyro estimate - the LiDAR could not confirm it; check the camera")
-    text = f"Did: turn {direction} - asked {target:.0f} degrees at power {power:.1f}, turned {turned:.0f} degrees ({how})."
+    text = (f"Did: turn {direction} - asked {target:.0f} degrees at power {power:.1f}, "
+            f"turned {turned:.0f} degrees ({how}).")
     if note:
         text += f" Cut short: {note}."
-    return text, sign * turned, measured, note
+    return {"text": text, "turn_left": sign * turned, "measured": measured,
+            "note": note, "scan": last_scan}
+
+
+def straight_drive(link: RobotLink, command: str, seconds: float, power: float,
+                   track: Track, straighten: bool, can_pivot: bool) -> dict:
+    """Drive in steps, measuring each by LiDAR and turning any veer back out."""
+    steps = max(1, math.ceil(seconds / DRIVE_STEP_S - 1e-9))
+    step_s = seconds / steps
+    sign = 1.0 if command == "F" else -1.0
+    scan = link.still_scan(count=1)
+    forward = right = 0.0
+    corrected = 0.0
+    drove = 0.0
+    measured = scan is not None
+    note = ""
+    hold = ""
+    for _ in range(steps):
+        result = precise_move(link, "drive", command, round(step_s, 3), power)
+        if result.get("state") == "refused":
+            return {"refused": describe_move("drive", "", seconds, power, result)}
+        drove += float(result.get("drove_s") or 0.0)
+        hold = _hold_text(result) or hold
+        after = link.still_scan()
+        guess = sign * DRIVE_GUESS_MPS * float(result.get("drove_s") or step_s) * (0.5 + power)
+        motion = _match(scan, after, guess_turn_deg=0.0, search_deg=30.0,
+                        guess_forward_m=guess, search_forward_m=max(0.3, abs(guess)))
+        if motion is None:
+            measured = False
+            track.apply(float(result.get("heading_deg") or 0.0), 0.0, 0.0, False)
+        else:
+            forward += motion.forward_m
+            right += motion.right_m
+            track.apply(motion.turn_deg, motion.forward_m, motion.right_m, True)
+        scan = after or scan
+        if result.get("note"):
+            note = _strip(result["note"], "stopped: ")
+            break
+        if (straighten and can_pivot and motion is not None
+                and abs(motion.turn_deg) > STRAIGHTEN_DEG):
+            back = "right" if motion.turn_deg > 0 else "left"
+            fix = lidar_turn(link, back, abs(motion.turn_deg), TURN_DEFAULT_POWER,
+                             PivotModel(PIVOT_MODEL_PATH, TURN_DEFAULT_POWER), start=after)
+            track.apply(fix["turn_left"], 0.0, 0.0, fix["measured"])
+            corrected += abs(fix["turn_left"])
+            scan = fix["scan"] or scan
+            if fix["note"]:
+                note = fix["note"]
+                break
+    direction = "forward" if command == "F" else "backward"
+    text = f"Did: drive {direction} for {drove:.2f} s at power {power:.1f}"
+    text += f" in {steps} steps" if steps > 1 else ""
+    text += hold + "."
+    if measured:
+        text += (f" Measured by LiDAR: {abs(forward):.2f} m {'forward' if forward >= 0 else 'backward'},"
+                 f" {abs(right) * 100:.0f} cm {'right' if right >= 0 else 'left'} of the line.")
+        if corrected:
+            text += f" Veer turned back out as it went ({corrected:.0f} deg in total): heading kept."
+    else:
+        text += " (The LiDAR could not measure all of this drive; check the camera.)"
+    if note:
+        text += f" Cut short: {note}."
+    return {"text": text, "measured": measured, "note": note, "scan": scan}
 
 
 def report(link: RobotLink, address: str, heading: str = "",
@@ -966,6 +1060,9 @@ def run(argv: list[str]) -> int:
         move.add_argument("amount", type=float, help=unit)
         move.add_argument("power", type=float, nargs="?", default=default_power)
         move.add_argument("--say", default="", help="short note shown on the dashboard")
+        if name == "drive":
+            move.add_argument("--no-straighten", action="store_true",
+                              help="do not turn veer back out between steps")
     sub.add_parser("stop", help="stop immediately")
     mark = sub.add_parser("mark", help="remember a target you can see, to find it again later")
     mark.add_argument("name")
@@ -1024,6 +1121,7 @@ def run(argv: list[str]) -> int:
                     return 2
                 track = Track(TRACK_PATH)
                 track.reset()
+                track.reanchor(link.still_scan(count=1), None)
                 track.save()
                 print(report(link, args.robot, "Manual Control is on. The robot will only move when you tell it to."
                              " Position tracking starts here.", track=track))
@@ -1052,49 +1150,42 @@ def run(argv: list[str]) -> int:
         link.send({"type": "pilot", "note": note[:240], "model": "claude-haiku-5-5"})
         command = COMMANDS[args.direction]
         track = Track(TRACK_PATH)
-        before_scan = (full or {}).get("scan")
-        motion = None
         measured = False
         cut_short = ""
+        last_scan = None
         if args.command == "turn" and control.get("pivots"):
             model = PivotModel(PIVOT_MODEL_PATH, power)
-            done, turn_left, measured, note = lidar_turn(link, args.direction, amount, power, model)
-            cut_short = note if "18 cm" in note else ""
-            track.apply(turn_left, 0.0, 0.0, measured)
+            turn = lidar_turn(link, args.direction, amount, power, model)
+            done, measured, last_scan = turn["text"], turn["measured"], turn["scan"]
+            cut_short = turn["note"] if "18 cm" in turn["note"] else ""
+            track.apply(turn["turn_left"], 0.0, 0.0, measured)
+        elif args.command == "drive" and control.get("moves"):
+            drive = straight_drive(link, command, amount, power, track,
+                                   straighten=not args.no_straighten,
+                                   can_pivot=bool(control.get("pivots")))
+            if "refused" in drive:
+                print(drive["refused"])
+                return 3
+            done, measured, last_scan = drive["text"], drive["measured"], drive["scan"]
+            cut_short = drive["note"] if "18 cm" in drive["note"] else ""
         elif control.get("moves"):
-            if args.command == "drive":
-                before_scan = link.still_scan(count=1) or before_scan
             result = precise_move(link, args.command, command, amount, power)
             done = describe_move(args.command, args.direction, amount, power, result)
             if result.get("state") == "refused":
                 print(done)
                 return 3
-            cut_short = "18 cm" in (result.get("note") or "")
-            if args.command == "drive":
-                sign = 1.0 if command == "F" else -1.0
-                guess = sign * DRIVE_GUESS_MPS * float(result.get("drove_s") or amount) * (0.5 + power)
-                motion = _match(before_scan, link.still_scan(), guess_turn_deg=0.0, search_deg=30.0,
-                                guess_forward_m=guess, search_forward_m=max(0.3, abs(guess)))
-                if motion is not None:
-                    measured = True
-                    done += (f" Measured by LiDAR: {abs(motion.forward_m):.2f} m "
-                             f"{'forward' if motion.forward_m >= 0 else 'backward'}, "
-                             f"{abs(motion.right_m) * 100:.0f} cm {'right' if motion.right_m >= 0 else 'left'}, "
-                             f"heading {'unchanged' if abs(motion.turn_deg) < 1 else f'{abs(motion.turn_deg):.0f} deg ' + ('left' if motion.turn_deg > 0 else 'right')}.")
-                    track.apply(motion.turn_deg, motion.forward_m, motion.right_m, True)
-                else:
-                    heading_deg = result.get("heading_deg")
-                    done += " (The LiDAR could not measure this move.)"
-                    track.apply(float(heading_deg or 0.0), 0.0, 0.0, False)
-            else:
-                turned = float(result.get("turned_deg") or 0.0)
-                track.apply(turned if command == "L" else -turned, 0.0, 0.0, False)
+            turned = float(result.get("turned_deg") or 0.0)
+            track.apply(turned if command == "L" else -turned, 0.0, 0.0, False)
         else:
             seconds = amount if args.command == "drive" else amount / LEGACY_TURN_DPS
             cut_short = hold(link, command, power, seconds)
             done = (f"Did: {args.command} {args.direction} {unit} at power {power:.1f} "
                     "(roughly timed - this robot is older than v1.9.32; restart it to update)."
                     + (" " + cut_short if cut_short else ""))
+        if measured and last_scan is not None:
+            anchored = track.reanchor(last_scan, _match)
+            if anchored:
+                done += " " + anchored
         track.save()
         time.sleep(SETTLE_S if not measured else 0.0)
         stopped_at = link.marks()
@@ -1105,6 +1196,15 @@ def run(argv: list[str]) -> int:
         # The wait for a post-move scan already happened above.
         print(report(link, args.robot, heading, after=stopped_at, new_scan=False, track=track))
         return 4 if cut_short else 0
+    except LinkTrouble as error:
+        try:
+            link.send({"type": "control", "drive": "STOP"})
+        except OSError:
+            pass
+        print(f"CONNECTION: {error}. The robot stopped on its own; nobody took over. "
+              "Run `observe` - if it works, carry on (the last move may not be in the "
+              "position tracking, so re-mark targets you can see).")
+        return 6
     except Override as error:
         try:
             link.send({"type": "control", "drive": "STOP"})

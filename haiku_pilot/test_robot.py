@@ -76,6 +76,8 @@ class FakeChassis:
         # Position in the simulated room (FakeRobot(room=True)), metres.
         self.x = 1.6
         self.y = 1.4
+        # Straight drives veer like the real chassis: forward clockwise.
+        self.veer_dps = 0.0
         self.imu_live = True
         self._at = time.monotonic()
         self._lock = threading.Lock()
@@ -84,7 +86,13 @@ class FakeChassis:
         now = time.monotonic()
         elapsed, self._at = now - self._at, now
         left, right = self.output
-        target = (right - left) / 2.0 * 1.25 if left * right < 0 else 0.0   # ~150 deg/s at 120 PWM
+        if left * right < 0:
+            target = (right - left) / 2.0 * 1.25            # ~150 deg/s at 120 PWM
+        elif left * right > 0:
+            veer = -self.veer_dps if left > 0 else self.veer_dps
+            target = 0.6 * (right - left) + veer
+        else:
+            target = 0.0
         # First-order response, ~60 ms: spins up and coasts down.
         blend = min(1.0, elapsed / 0.06)
         self.rate += (target - self.rate) * blend
@@ -143,6 +151,7 @@ class FakeRobot:
         self.uno_blocked = False
         self.frame_number = 0
         self.frame_value = 0
+        self.silent = False          # stop publishing telemetry (a Wi-Fi stall)
         self.commands: list[str] = []
         # Pivots (LiDAR-measured turns) need a scan that turns with the
         # chassis, so only the simulated room offers them.
@@ -203,6 +212,9 @@ class FakeRobot:
                 "control": self.control.state(),
             }
             now = time.monotonic()
+            if self.silent:
+                time.sleep(0.05)
+                continue
             if now >= self._next_scan_at:
                 self.hub.publish(light, dict(light, scan=self._scan()))
                 self._next_scan_at = now + self.scan_every_s
@@ -497,10 +509,13 @@ class MeasuredMoveTests(unittest.TestCase):
         x1, y1, _yaw = self.robot.chassis.pose()
         moved = math.hypot(x1 - x0, y1 - y0)
         self.assertIn("Measured by LiDAR:", out)
-        self.assertIn(f"{moved:.2f} m forward", out)
+        self.assertRegex(out, r"Measured by LiDAR: 0\.\d\d m forward")
+        reported = float(out.split("Measured by LiDAR: ")[1].split(" m")[0])
+        self.assertAlmostEqual(reported, moved, delta=0.02)
+        self.assertIn("in 2 steps", out)
         track = robot.Track(robot.TRACK_PATH)
         self.assertAlmostEqual(track.y, moved, delta=0.03)
-        self.assertIn("Since `manual on` (1 moves)", out)
+        self.assertIn("Since `manual on` (2 moves)", out)
 
     def test_a_marked_target_is_found_again_after_turning(self) -> None:
         code, out = run(self.robot.address, "mark", "capsule", "right", "30", "1.0")
@@ -510,6 +525,50 @@ class MeasuredMoveTests(unittest.TestCase):
         self.assertRegex(out, r"Marked 'capsule': about 1\.0\d m away, (straight ahead|[0-4] deg (left|right))")
         code, out = run(self.robot.address, "unmark", "capsule")
         self.assertIn("Forgot 'capsule'", out)
+
+    def test_a_veering_drive_is_straightened(self) -> None:
+        """2026-10-09 (4): straight drives still ended 4-14 deg off."""
+        self.robot.chassis.veer_dps = 12.0
+        before = self.robot.chassis.yaw
+        code, out = run(self.robot.address, "drive", "forward", "1.4")
+        self.assertEqual(code, 0, out)
+        self.assertIn("Veer turned back out", out)
+        self.assertLess(abs(self._turned(before)), robot.STRAIGHTEN_DEG + 1.5, out)
+
+    def test_straightening_can_be_turned_off(self) -> None:
+        self.robot.chassis.veer_dps = 12.0
+        before = self.robot.chassis.yaw
+        code, out = run(self.robot.address, "drive", "forward", "1.4", "--no-straighten")
+        self.assertEqual(code, 0, out)
+        self.assertGreater(abs(self._turned(before)), 8.0, out)
+
+    def test_drifted_tracking_is_re_anchored_to_an_earlier_view(self) -> None:
+        """93 chained moves left the marks off; the pose is now re-anchored
+        against still scans remembered along the way."""
+        track = robot.Track(robot.TRACK_PATH)
+        self.assertEqual(len(track.keyframes), 1)          # from `manual on`
+        track.x += 0.10                                    # simulated drift
+        track.heading += 4.0
+        track.save()
+        before = self.robot.chassis.yaw
+        code, out = run(self.robot.address, "turn", "left", "10")
+        self.assertEqual(code, 0, out)
+        self.assertIn("re-anchored", out)
+        track = robot.Track(robot.TRACK_PATH)
+        self.assertAlmostEqual(track.x, 0.0, delta=0.03)
+        self.assertAlmostEqual(track.heading, self._turned(before), delta=1.5)
+
+    def test_a_wifi_stall_is_not_reported_as_a_person_taking_over(self) -> None:
+        for name, value in (("MOVE_LINK_GRACE_S", 1.0), ("TELEMETRY_WAIT_S", 1.5)):
+            original = getattr(robot, name)
+            setattr(robot, name, value)
+            self.addCleanup(setattr, robot, name, original)
+        threading.Timer(0.6, setattr, (self.robot, "silent", True)).start()
+        code, out = run(self.robot.address, "drive", "forward", "2.0", "--no-straighten")
+        self.assertEqual(code, 6, out)
+        self.assertIn("CONNECTION:", out)
+        self.assertIn("nobody took over", out)
+        self.robot.silent = False
 
     def test_a_person_pressing_stop_ends_a_measured_turn(self) -> None:
         threading.Timer(0.3, self.robot.control.halt).start()

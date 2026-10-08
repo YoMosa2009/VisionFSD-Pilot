@@ -81,13 +81,15 @@ def _score(after: np.ndarray, before: np.ndarray, rotation: np.ndarray,
 
 def match(before_scan: dict | None, after_scan: dict | None,
           guess_turn_deg: float = 0.0, search_deg: float = 45.0,
-          guess_forward_m: float = 0.0, search_forward_m: float = 0.0) -> Motion | None:
+          guess_forward_m: float = 0.0, search_forward_m: float = 0.0,
+          guess_right_m: float = 0.0, search_step_deg: float = 1.0) -> Motion | None:
     """The robot's motion between two still scans, or None if unmeasurable.
 
     ``guess_turn_deg`` (left positive) centres the coarse search - the
     commanded or gyro angle - so a turn is not confused with a symmetric room.
     A drive also searches ``guess_forward_m`` +/- ``search_forward_m``, so a
-    long move cannot settle into the wrong wall.
+    long move cannot settle into the wrong wall. ``guess_right_m`` starts
+    the search off to the side (re-anchoring against an older scan).
     """
     before = points_from_scan(before_scan)
     after = points_from_scan(after_scan)
@@ -99,10 +101,11 @@ def match(before_scan: dict | None, after_scan: dict | None,
     forwards = (np.arange(-search_forward_m, search_forward_m + 1e-9, 0.05) + guess_forward_m
                 if search_forward_m > 0 else np.array([guess_forward_m]))
     best = None
-    for degrees in np.arange(guess_turn_deg - search_deg, guess_turn_deg + search_deg + 0.5, 1.0):
+    for degrees in np.arange(guess_turn_deg - search_deg,
+                             guess_turn_deg + search_deg + search_step_deg / 2, search_step_deg):
         rotation = _rotation(float(degrees))
         for forward in forwards:
-            shift = np.array([0.0, float(forward)])
+            shift = np.array([float(guess_right_m), float(forward)])
             score = _score(sample, before, rotation, shift)
             if best is None or score < best[0]:
                 best = (score, float(degrees), shift)
