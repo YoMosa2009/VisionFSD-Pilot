@@ -1092,6 +1092,33 @@ version made contact in it, so it understates real collisions; treat it as a
 comparison, not a prediction. Desktop tests (475 pass). **Nothing here has run
 on the robot.**
 
+### v1.9.33: LiDAR-measured turns, heading hold, move tracking
+
+From the third AI-pilot session (2026-10-09). Gyro-ended turns could not do
+small angles - asked 5-25 degrees, the robot turned 18-41 - because the IMU
+is read every 50-100 ms over the MCP2221 USB bridge and filtered, so a turn
+was well past its target before the gyro said so. Forward drives veered
+right (~10 deg/s) and reverse veered left: one side's motors are stronger.
+
+- **Timed pivots** (`"kind": "pivot"`, 0.03-1.5 s) on the 50 Hz move thread.
+  The AI pilot now turns in pivots and measures each one by matching still
+  LiDAR scans from before and after (`haiku_pilot/scan_match.py`, on the
+  PC); it learns degrees-per-second per power and stops within 3 degrees.
+  On the robot's own scans, two still scans agree to 0.1 degrees.
+- **Heading hold for drives**: the gyro's lag does not matter at drift rates,
+  so a drive steers its two wheels against drift relative to its own start
+  (never an absolute heading), keeping both at or above the PWM floor, and
+  learns a per-direction trim. It waits until a turn this session has shown
+  which way the gyro counts, and gives up past 15 degrees rather than make
+  a wrong-signed correction worse.
+- The pilot measures every move by LiDAR, tracks position since `manual on`,
+  can `mark` targets and report where they are, and saves every camera image
+  and map under a new name (an image viewer could show a cached copy).
+
+Desktop tests against simulated chassis, gyro and room only. **Not yet run on
+the robot**: the real pivot rate, the scan matching in clutter and the drift
+correction are what the next session shows.
+
 ### v1.9.32: precise turns and drives for the AI pilot
 
 From the second AI-pilot session (2026-10-08). The pilot's turns were held

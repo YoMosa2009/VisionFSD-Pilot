@@ -4026,6 +4026,7 @@ def main() -> int:
         lambda command, magnitude: manual_wheels(
             command, magnitude, policy.speed, policy.min_move_pwm
         ),
+        min_pwm=policy.min_move_pwm,
     )
     policy.manual_move = manual_move
     telemetry_hub = TelemetryHub()

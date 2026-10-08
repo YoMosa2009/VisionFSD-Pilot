@@ -10,6 +10,7 @@ what the robot now senses, and exits.
     python haiku_pilot/robot.py manual on
     python haiku_pilot/robot.py drive forward 1.0 0.5 --say "heading for the doorway"
     python haiku_pilot/robot.py turn left 30 0.3
+    python haiku_pilot/robot.py mark capsule left 20 0.4
     python haiku_pilot/robot.py stop
     python haiku_pilot/robot.py manual off
 
@@ -17,7 +18,13 @@ Moves go through the dashboard's Manual Control. From robot v1.9.32 the
 robot runs each move itself on a fast timer: a drive lasts exactly the
 seconds asked, and a turn is in DEGREES, stopped by the robot's gyro when it
 has turned that far. Older robots fall back to holding the command like the
-phone's arrow buttons, which is only roughly timed. At the operator's request there is no proximity limit in
+phone's arrow buttons, which is only roughly timed.
+
+From v1.9.33 a turn is a series of short timed pivots, each measured by
+comparing still LiDAR scans before and after - the gyro is read too slowly
+to stop a turn precisely. Drives hold their heading on the robot, and every
+move is measured the same way and added to a position since `manual on`,
+in which targets can be marked and found again. At the operator's request there is no proximity limit in
 Manual Control (robot v1.9.31 onwards): the robot may drive right up to, and
 into, things, and this program does not refuse close moves either. What still
 stops it is what stops a robot nobody controls: STOP or turning Manual
@@ -48,10 +55,17 @@ import threading
 import time
 import urllib.request
 
+from pilot_state import PivotModel, Track
+
 DEFAULT_ROBOT = os.environ.get("VISIONFSD_ROBOT", "192.168.0.17:8080")
 VIEW_DIR = os.path.join(tempfile.gettempdir(), "visionfsd_pilot")
 VIEW_PATH = os.path.join(VIEW_DIR, "latest_view.jpg")
 LIDAR_PATH = os.path.join(VIEW_DIR, "lidar_topdown.png")
+PIVOT_MODEL_PATH = os.path.join(VIEW_DIR, "pivot_model.json")
+TRACK_PATH = os.path.join(VIEW_DIR, "track.json")
+# Every report also saves its images under a new name: an image viewer can
+# show a cached copy of a file it has opened before (2026-10-09).
+KEEP_NUMBERED_IMAGES = 6
 LIDAR_VIEW_RADIUS_M = 3.0
 LIDAR_VIEW_PX = 600
 # A corridor counts as an opening when the robot's own width (plus margin)
@@ -68,6 +82,13 @@ LEGACY_TURN_DPS = 140.0
 # Beyond the move itself: a turn the gyro cannot confirm ends after 3 s on
 # the robot, then it measures the coast for 0.35 s.
 MOVE_REPORT_GRACE_S = 5.0
+# LiDAR-measured turns (robot v1.9.33+): pivots until within this of the
+# angle asked, at most this many. The first pivot of a big turn aims short.
+TURN_TOLERANCE_DEG = 3.0
+TURN_MAX_PIVOTS = 5
+FIRST_PIVOT_FRACTION = 0.85
+# Rough drive speed at power 0.5, only to centre the LiDAR match's search.
+DRIVE_GUESS_MPS = 0.25
 HOLD_PERIOD_S = 0.05          # the dashboard refreshes a held button this often
 SETTLE_S = 0.5                # let the chassis stop and a fresh scan arrive
 LANE_HALF_WIDTH_M = 0.15      # the chassis is 0.23 m wide
@@ -262,6 +283,22 @@ class RobotLink:
                     return True
             time.sleep(0.05)
         return False
+
+    def still_scan(self, count: int = 2, timeout: float = SCAN_WAIT_S) -> dict | None:
+        """A scan taken after this call, once ``count`` new ones have come.
+
+        The robot publishes the scan of its latest control tick, which can
+        have started before the chassis stopped; the second new one cannot.
+        """
+        with self._lock:
+            mark = self.full_count
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and not self.closed:
+            with self._lock:
+                if self.full_count >= mark + count:
+                    return (self.full or {}).get("scan")
+            time.sleep(0.05)
+        return None
 
     def scan_age(self) -> float | None:
         with self._lock:
@@ -569,7 +606,7 @@ def describe_openings(openings: list[dict]) -> str:
 
 
 def draw_lidar(telemetry: dict | None, summary: dict, openings: list[dict],
-               path: str = LIDAR_PATH) -> str | None:
+               path: str = LIDAR_PATH, marks: list | None = None) -> str | None:
     """Top-down picture of the scan, robot in the middle facing up.
 
     Returns the saved path, or None when numpy/OpenCV are unavailable.
@@ -630,6 +667,12 @@ def draw_lidar(telemetry: dict | None, summary: dict, openings: list[dict],
         else:
             colour = (235, 235, 235)
         cv2.circle(image, pixel(x, y), 2, colour, -1)
+    # Marked targets where the tracked moves put them now.
+    for name, x, y in marks or []:
+        if math.hypot(x, y) <= LIDAR_VIEW_RADIUS_M:
+            cv2.drawMarker(image, pixel(x, y), (255, 80, 255), cv2.MARKER_CROSS, 14, 2)
+            cv2.putText(image, name, (pixel(x, y)[0] + 8, pixel(x, y)[1] - 6), font, 0.45,
+                        (255, 80, 255), 1, cv2.LINE_AA)
     # The robot to scale - 23 cm wide, 27 cm long, LiDAR at its centre - with
     # an arrow showing which way it faces.
     cv2.rectangle(image, pixel(-0.115, 0.135), pixel(0.115, -0.135), (255, 160, 60), 2)
@@ -644,11 +687,59 @@ def draw_lidar(telemetry: dict | None, summary: dict, openings: list[dict],
         ("yellow arrows: open corridors (R/L deg)", (40, 210, 250)),
         ("dots: LiDAR - red <0.5 m, orange <1 m", (60, 170, 255)),
         ("grey dots: recently seen, out of view", (130, 130, 130)),
+        ("pink crosses: your marked targets (estimated)", (255, 80, 255)),
     )
     for row, (text, colour) in enumerate(legend):
         cv2.putText(image, text, (8, 18 + row * 16), font, 0.4, colour, 1, cv2.LINE_AA)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     return path if cv2.imwrite(path, image) else None
+
+
+def numbered_copy(path: str) -> str:
+    """Copy ``path`` to a new numbered name and return it; prune old copies."""
+    folder, name = os.path.split(path)
+    stem, extension = os.path.splitext(name)
+    stamp = f"{int(time.time() * 1000) % 100_000_000:08d}"
+    target = os.path.join(folder, f"{stem}_{stamp}{extension}")
+    with open(path, "rb") as source, open(target, "wb") as copy:
+        copy.write(source.read())
+    older = sorted(
+        entry for entry in os.listdir(folder)
+        if entry.startswith(stem + "_") and entry.endswith(extension)
+    )
+    for entry in older[:-KEEP_NUMBERED_IMAGES]:
+        try:
+            os.remove(os.path.join(folder, entry))
+        except OSError:
+            pass
+    return target
+
+
+def describe_track(track: Track | None) -> list[str]:
+    if track is None:
+        return []
+    lines = []
+    if track.moves:
+        side = "left" if track.x < 0 else "right"
+        facing = ("the way you started" if abs(track.heading) < 1.0 else
+                  f"{abs(track.heading):.0f} deg {'left' if track.heading > 0 else 'right'} of where you started")
+        unmeasured = (f"; {track.unmeasured} of {track.moves} moves not LiDAR-measured"
+                      if track.unmeasured else "")
+        lines.append(
+            f"Since `manual on` ({track.moves} moves{unmeasured}): you are {track.y:+.2f} m ahead, "
+            f"{abs(track.x):.2f} m {side} of where you started, facing {facing}."
+        )
+    for name in sorted(track.marks):
+        distance, bearing, since = track.relative(name)
+        direction = ("straight ahead" if abs(bearing) < 2 else
+                     f"{abs(bearing):.0f} deg {'right' if bearing > 0 else 'left'}")
+        if abs(bearing) > 135:
+            direction += " (behind you)"
+        lines.append(
+            f"Marked '{name}': about {distance:.2f} m away, {direction}"
+            f" (marked {since} move{'s' if since != 1 else ''} ago - re-mark it when you see it)"
+        )
+    return lines
 
 
 def pose_change(before, after) -> str:
@@ -757,8 +848,70 @@ def describe_move(kind: str, direction: str, amount: float, power: float, result
     return text
 
 
+def _match(before: dict | None, after: dict | None, **search):
+    """LiDAR-measured motion between two still scans, or None."""
+    if not before or not after:
+        return None
+    try:
+        import scan_match
+    except ImportError:          # numpy missing: use the project's .venv
+        return None
+    motion = scan_match.match(before, after, **search)
+    return motion if motion is not None and motion.trusted else None
+
+
+def lidar_turn(link: RobotLink, direction: str, target: float, power: float,
+               model: PivotModel) -> tuple[str, float, bool, str]:
+    """Turn ``target`` degrees in timed pivots, each measured by LiDAR.
+
+    Returns (description, turn in degrees with left positive, whether the
+    LiDAR measured it, note when the robot cut a pivot short).
+    """
+    sign = 1.0 if direction == "left" else -1.0
+    start = link.still_scan(count=1)
+    turned = 0.0                    # toward the asked side, measured
+    measured = start is not None
+    pivots = 0
+    note = ""
+    gyro_total = 0.0
+    while pivots < TURN_MAX_PIVOTS:
+        remaining = target - turned
+        if abs(remaining) <= TURN_TOLERANCE_DEG:
+            break
+        side = direction if remaining > 0 else ("right" if direction == "left" else "left")
+        want = abs(remaining) * (FIRST_PIVOT_FRACTION if abs(remaining) > 20 else 1.0)
+        seconds = model.seconds_for(want)
+        result = precise_move(link, "pivot", COMMANDS[side], round(seconds, 3), power)
+        pivots += 1
+        if result.get("state") == "refused" or result.get("note"):
+            note = (result.get("note") or "refused").removeprefix("stopped: ")
+            break
+        step_gyro = float(result.get("turned_deg") or 0.0) * (1 if side == direction else -1)
+        gyro_total += step_gyro
+        after = link.still_scan() if measured else None
+        expected = turned + (model.predict(seconds) if side == direction else -model.predict(seconds))
+        motion = _match(start, after, guess_turn_deg=sign * expected,
+                        search_deg=max(25.0, 0.6 * model.predict(seconds)))
+        if motion is None:
+            measured = False
+            turned += step_gyro
+            continue
+        now = motion.turn_deg * sign
+        step = now - turned
+        model.add(seconds, abs(step) if (step > 0) == (side == direction) else 0.0)
+        turned = now
+    model.save()
+    how = (f"measured by LiDAR, {pivots} pivot{'s' if pivots != 1 else ''}" if measured
+           else "gyro estimate - the LiDAR could not confirm it; check the camera")
+    text = f"Did: turn {direction} - asked {target:.0f} degrees at power {power:.1f}, turned {turned:.0f} degrees ({how})."
+    if note:
+        text += f" Cut short: {note}."
+    return text, sign * turned, measured, note
+
+
 def report(link: RobotLink, address: str, heading: str = "",
-           after: tuple[int, int] = (0, 0), new_scan: bool = True) -> str:
+           after: tuple[int, int] = (0, 0), new_scan: bool = True,
+           track: Track | None = None) -> str:
     """Current senses as text, and the camera frame saved for viewing."""
     link.wait_for_fresh(after, want_new_scan=new_scan)
     telemetry, full, _at, control = link.snapshot()
@@ -767,7 +920,12 @@ def report(link: RobotLink, address: str, heading: str = "",
     lines = [heading] if heading else []
     lines.append(describe(summary, control))
     lines.append(describe_openings(openings))
-    picture = draw_lidar(full, summary, openings) if full is not None else None
+    lines.extend(describe_track(track))
+    picture = (draw_lidar(full, summary, openings,
+                          marks=None if track is None else track.in_robot_frame())
+               if full is not None else None)
+    if picture:
+        picture = numbered_copy(picture)
     age = link.scan_age()
     if full is None:
         lines.append(
@@ -786,7 +944,7 @@ def report(link: RobotLink, address: str, heading: str = "",
         os.makedirs(VIEW_DIR, exist_ok=True)
         with open(VIEW_PATH, "wb") as handle:
             handle.write(frame)
-        lines.append(f"Camera image saved: {VIEW_PATH}  (open it to see what the robot sees)")
+        lines.append(f"Camera image saved: {numbered_copy(VIEW_PATH)}  (a new file every time; open it)")
     else:
         lines.append("Camera image: not available right now.")
     return "\n".join(lines)
@@ -809,6 +967,13 @@ def run(argv: list[str]) -> int:
         move.add_argument("power", type=float, nargs="?", default=default_power)
         move.add_argument("--say", default="", help="short note shown on the dashboard")
     sub.add_parser("stop", help="stop immediately")
+    mark = sub.add_parser("mark", help="remember a target you can see, to find it again later")
+    mark.add_argument("name")
+    mark.add_argument("side", choices=("left", "right", "ahead"))
+    mark.add_argument("degrees", type=float, help="how far to that side it is (0 for ahead)")
+    mark.add_argument("metres", type=float, help="how far away it is")
+    unmark = sub.add_parser("unmark", help="forget a marked target")
+    unmark.add_argument("name")
     args = parser.parse_args(argv)
 
     try:
@@ -817,6 +982,19 @@ def run(argv: list[str]) -> int:
         print(f"ERROR: {error}")
         return 2
     try:
+        if args.command in ("mark", "unmark"):
+            track = Track(TRACK_PATH)
+            if args.command == "mark":
+                bearing = 0.0 if args.side == "ahead" else (
+                    args.degrees if args.side == "right" else -args.degrees)
+                track.mark(args.name[:24], bearing, max(0.0, args.metres))
+                track.save()
+                print(f"Marked '{args.name[:24]}'. Every report now says where it is from you.")
+            else:
+                found = track.marks.pop(args.name, None)
+                track.save()
+                print(f"Forgot '{args.name}'." if found else f"No mark called '{args.name}'.")
+            return 0
         if args.command == "stop":
             link.send({"type": "control", "drive": "STOP"})
             link.wait_for_telemetry(need_scan=False)
@@ -844,7 +1022,11 @@ def run(argv: list[str]) -> int:
                 if not link.wait_for_control(lambda state: state.get("manual") is True):
                     print("ERROR: the robot did not confirm Manual Control. Try `manual on` again.")
                     return 2
-                print(report(link, args.robot, "Manual Control is on. The robot will only move when you tell it to."))
+                track = Track(TRACK_PATH)
+                track.reset()
+                track.save()
+                print(report(link, args.robot, "Manual Control is on. The robot will only move when you tell it to."
+                             " Position tracking starts here.", track=track))
             else:
                 link.send({"type": "control", "manual": False})
                 link.send({"type": "pilot", "note": ""})
@@ -869,27 +1051,59 @@ def run(argv: list[str]) -> int:
         note = args.say or f"{args.command} {args.direction} {unit}"
         link.send({"type": "pilot", "note": note[:240], "model": "claude-haiku-5-5"})
         command = COMMANDS[args.direction]
-        if control.get("moves"):
+        track = Track(TRACK_PATH)
+        before_scan = (full or {}).get("scan")
+        motion = None
+        measured = False
+        cut_short = ""
+        if args.command == "turn" and control.get("pivots"):
+            model = PivotModel(PIVOT_MODEL_PATH, power)
+            done, turn_left, measured, note = lidar_turn(link, args.direction, amount, power, model)
+            cut_short = note if "18 cm" in note else ""
+            track.apply(turn_left, 0.0, 0.0, measured)
+        elif control.get("moves"):
+            if args.command == "drive":
+                before_scan = link.still_scan(count=1) or before_scan
             result = precise_move(link, args.command, command, amount, power)
             done = describe_move(args.command, args.direction, amount, power, result)
             if result.get("state") == "refused":
                 print(done)
                 return 3
             cut_short = "18 cm" in (result.get("note") or "")
+            if args.command == "drive":
+                sign = 1.0 if command == "F" else -1.0
+                guess = sign * DRIVE_GUESS_MPS * float(result.get("drove_s") or amount) * (0.5 + power)
+                motion = _match(before_scan, link.still_scan(), guess_turn_deg=0.0, search_deg=30.0,
+                                guess_forward_m=guess, search_forward_m=max(0.3, abs(guess)))
+                if motion is not None:
+                    measured = True
+                    done += (f" Measured by LiDAR: {abs(motion.forward_m):.2f} m "
+                             f"{'forward' if motion.forward_m >= 0 else 'backward'}, "
+                             f"{abs(motion.right_m) * 100:.0f} cm {'right' if motion.right_m >= 0 else 'left'}, "
+                             f"heading {'unchanged' if abs(motion.turn_deg) < 1 else f'{abs(motion.turn_deg):.0f} deg ' + ('left' if motion.turn_deg > 0 else 'right')}.")
+                    track.apply(motion.turn_deg, motion.forward_m, motion.right_m, True)
+                else:
+                    heading_deg = result.get("heading_deg")
+                    done += " (The LiDAR could not measure this move.)"
+                    track.apply(float(heading_deg or 0.0), 0.0, 0.0, False)
+            else:
+                turned = float(result.get("turned_deg") or 0.0)
+                track.apply(turned if command == "L" else -turned, 0.0, 0.0, False)
         else:
             seconds = amount if args.command == "drive" else amount / LEGACY_TURN_DPS
             cut_short = hold(link, command, power, seconds)
             done = (f"Did: {args.command} {args.direction} {unit} at power {power:.1f} "
                     "(roughly timed - this robot is older than v1.9.32; restart it to update)."
                     + (" " + cut_short if cut_short else ""))
-        time.sleep(SETTLE_S)
+        track.save()
+        time.sleep(SETTLE_S if not measured else 0.0)
         stopped_at = link.marks()
         link.wait_for_fresh(stopped_at, want_new_scan=True)
         telemetry, full, _at, _control = link.snapshot()
         after = summarize(full or telemetry, fresh=telemetry)
-        heading = done + " " + pose_change(before.get("pose"), after.get("pose"))
+        heading = done + ("" if measured else " " + pose_change(before.get("pose"), after.get("pose")))
         # The wait for a post-move scan already happened above.
-        print(report(link, args.robot, heading, after=stopped_at, new_scan=False))
+        print(report(link, args.robot, heading, after=stopped_at, new_scan=False, track=track))
         return 4 if cut_short else 0
     except Override as error:
         try:

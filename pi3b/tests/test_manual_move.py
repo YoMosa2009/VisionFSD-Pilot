@@ -43,12 +43,15 @@ class SimChassis:
     rotation after a stop; ``sign`` flips the gyro like an inverted mount."""
 
     def __init__(self, rate_dps: float = 150.0, coast_s: float = 0.08, sign: float = 1.0,
-                 stuck: bool = False) -> None:
+                 stuck: bool = False, drift_dps: float = 0.0) -> None:
         self.differential_ready = True
         self.rate_dps = rate_dps
         self.coast_s = coast_s
         self.sign = sign
         self.stuck = stuck
+        # Straight drives veer: forward clockwise, reverse anticlockwise, as
+        # the robot did on 2026-10-08 (one side's motors are stronger).
+        self.drift_dps = drift_dps
         self.output = (0, 0)
         self.writes: list[tuple[int, int]] = []
         self.yaw = 0.0
@@ -61,6 +64,11 @@ class SimChassis:
         left, right = self.output
         if left * right < 0 and not self.stuck:
             self.rate = self.rate_dps * (1 if right > left else -1)
+        elif left * right > 0:
+            # Differential steers (0.6 deg/s per PWM); the built-in veer
+            # turns forward clockwise and reverse anticlockwise.
+            veer = -self.drift_dps if left > 0 else self.drift_dps
+            self.rate = 0.6 * (right - left) + veer
         elif self.rate:
             # Exponential coast: total extra rotation = rate * coast_s.
             decay = min(1.0, dt / self.coast_s)
@@ -186,6 +194,69 @@ class TurnTests(unittest.TestCase):
 
         result = run_move(executor, chassis, control, during=press)
         self.assertEqual(result["state"], "stopped")
+
+
+class PivotTests(unittest.TestCase):
+    def test_a_pivot_lasts_the_seconds_asked_and_reports_the_gyro(self) -> None:
+        control, chassis, executor = setup()
+        control.request_move({"kind": "pivot", "dir": "R", "amount": 0.1, "id": "p"})
+        result = run_move(executor, chassis, control)
+        self.assertEqual(result["kind"], "pivot")
+        self.assertAlmostEqual(result["drove_s"], 0.1, delta=MOVE_PERIOD_S + 1e-9)
+        self.assertTrue(result["measured"])
+        self.assertGreater(result["turned_deg"], 10.0)
+
+    def test_pivots_are_bounded(self) -> None:
+        self.assertEqual(parse_move({"kind": "pivot", "dir": "L", "amount": 0.001}).amount, 0.03)
+        self.assertEqual(parse_move({"kind": "pivot", "dir": "L", "amount": 9}).amount, 1.5)
+        self.assertIsNone(parse_move({"kind": "pivot", "dir": "F", "amount": 0.2}))
+
+
+class HeadingHoldTests(unittest.TestCase):
+    def _drift_after(self, executor, chassis, control, direction: str, seconds: float = 1.0) -> float:
+        start = chassis.yaw
+        control.request_move({"kind": "drive", "dir": direction, "amount": seconds,
+                              "mag": 0.5, "id": direction})
+        run_move(executor, chassis, control)
+        return (chassis.yaw - start + 180.0) % 360.0 - 180.0
+
+    def test_no_hold_until_a_turn_has_shown_which_way_the_gyro_counts(self) -> None:
+        control, chassis, executor = setup(drift_dps=12.0)
+        self.assertLess(self._drift_after(executor, chassis, control, "F"), -8.0)
+        self.assertIsNone(executor.ccw_sign)
+
+    def test_forward_and_reverse_drives_hold_their_heading(self) -> None:
+        for sign in (1.0, -1.0):
+            control, chassis, executor = setup(drift_dps=12.0, sign=sign)
+            control.request_move({"kind": "turn", "dir": "L", "amount": 30, "id": "t"})
+            run_move(executor, chassis, control)
+            self.assertEqual(executor.ccw_sign, sign)
+            for direction in ("F", "B", "F", "B"):
+                drift = self._drift_after(executor, chassis, control, direction)
+                self.assertLess(abs(drift), 4.0, (sign, direction, drift))
+            self.assertLess(executor.trim_pwm["F"], 0.0)   # forward veers clockwise
+            self.assertGreater(executor.trim_pwm["B"], 0.0)
+
+    def test_the_drive_reports_its_heading_change(self) -> None:
+        control, chassis, executor = setup(drift_dps=12.0)
+        control.request_move({"kind": "turn", "dir": "R", "amount": 30, "id": "t"})
+        run_move(executor, chassis, control)
+        control.request_move({"kind": "drive", "dir": "F", "amount": 1.0, "id": "d"})
+        result = run_move(executor, chassis, control)
+        self.assertTrue(result["held"])
+        self.assertIn("heading_deg", result)
+
+    def test_corrections_keep_both_wheels_driving(self) -> None:
+        control, chassis, executor = setup(drift_dps=40.0)
+        control.request_move({"kind": "turn", "dir": "L", "amount": 30, "id": "t"})
+        run_move(executor, chassis, control)
+        chassis.writes.clear()
+        control.request_move({"kind": "drive", "dir": "B", "amount": 1.0, "id": "d"})
+        run_move(executor, chassis, control)
+        for left, right in chassis.writes:
+            if (left, right) != (0, 0):
+                self.assertTrue(left < 0 and right < 0)
+                self.assertGreaterEqual(min(abs(left), abs(right)), 105)
 
 
 class DriveTests(unittest.TestCase):

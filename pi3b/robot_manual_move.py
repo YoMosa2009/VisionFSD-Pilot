@@ -13,6 +13,12 @@ the IMU's measured rotation, stopping early by the coast it has learned. The
 IMU is used only for how far this one turn has gone, never as a heading.
 Without a fresh, calibrated IMU a turn falls back to time at a learned rate.
 
+v1.9.33, from the third pilot session: gyro-ended turns could not do small
+angles (the IMU is read every 50-100 ms over USB), so the pilot now turns in
+timed pivots and measures each from still LiDAR scans on its own side. A
+drive holds its heading against the chassis's built-in drift with the gyro
+(relative to the drive's own start only) and learns a trim for the next one.
+
 Every move is bounded in time, ends on a dashboard STOP, on any manual drive
 command, on leaving Manual Control, and - if this thread itself stalls - on
 the Uno link's 250 ms lease and the firmware's 350 ms timeout.
@@ -47,13 +53,34 @@ TURN_RATE_GUESS_DPS = 140.0
 # Hold the Uno link for this long past every write; the control loop's own
 # commands are ignored until then.
 CLAIM_S = 0.2
+# A pivot is a timed burst (v1.9.33). The 2026-10-08 gyro turns could not do
+# small angles: the IMU is read every 50-100 ms over USB and filtered, so a
+# turn was 10-25 degrees past its target before the gyro said so. The pilot
+# now turns in short pivots and measures each one from still LiDAR scans.
+PIVOT_MIN_S = 0.03
+PIVOT_MAX_S = 1.5
+# Heading hold for drives (v1.9.33): forward drives drifted right ~10 deg/s
+# and reversing drifted left - one side's motors are stronger. The gyro's
+# lag is harmless at that rate. PWM of differential per degree of drift,
+# the most either wheel is moved, and how far past the base a wheel may go.
+HOLD_KP_PWM_PER_DEG = 2.5
+HOLD_MAX_CORRECTION_PWM = 30
+HOLD_MAX_BOOST_PWM = 30
+# Drift this large means the correction is not working (or its sign is
+# wrong): stop correcting rather than make it worse.
+HOLD_GIVE_UP_DEG = 15.0
+# A learned trim carries the average correction into the next drive.
+HOLD_TRIM_LEARN = 0.5
+HOLD_TRIM_MAX_PWM = 25.0
+# A turn this large, measured once still, fixes which way the gyro counts.
+SIGN_MIN_DEG = 10.0
 
 
 @dataclass(frozen=True)
 class MoveRequest:
-    kind: str          # "turn" or "drive"
-    direction: str     # L/R for a turn, F/B for a drive
-    amount: float      # degrees for a turn, seconds for a drive
+    kind: str          # "turn", "pivot" or "drive"
+    direction: str     # L/R for a turn or pivot, F/B for a drive
+    amount: float      # degrees for a turn, seconds for a pivot or drive
     magnitude: float   # 0..1 of the manual PWM range
     move_id: str
 
@@ -74,6 +101,8 @@ def parse_move(payload: object) -> MoveRequest | None:
     magnitude = min(1.0, max(0.0, magnitude))
     if kind == "turn" and direction in ("L", "R"):
         amount = min(TURN_MAX_DEG, max(TURN_MIN_DEG, amount))
+    elif kind == "pivot" and direction in ("L", "R"):
+        amount = min(PIVOT_MAX_S, max(PIVOT_MIN_S, amount))
     elif kind == "drive" and direction in ("F", "B"):
         amount = min(DRIVE_MAX_S, max(DRIVE_MIN_S, amount))
     else:
@@ -96,12 +125,24 @@ class ManualMoveExecutor:
         wheels_for: Callable[[str, float], tuple[int, int]],
         clock: Callable[[], float] = time.monotonic,
         start_thread: bool = True,
+        min_pwm: int = 105,
     ) -> None:
         self._control = control
         self._link = link
         self._imu = imu
         self._wheels_for = wheels_for
+        self._min_pwm = int(min_pwm)
         self._clock = clock
+        # Which way the gyro counts a left turn (+1 or -1), learned from this
+        # session's own turns; heading hold waits for it.
+        self.ccw_sign: float | None = None
+        # Learned straight-drive trim per direction, PWM of differential.
+        self.trim_pwm = {"F": 0.0, "B": 0.0}
+        self._base = (0, 0)
+        self._hold = False
+        self._hold_note = ""
+        self._p_sum = 0.0
+        self._p_count = 0
         self._lock = threading.Lock()
         self._move: MoveRequest | None = None
         self._phase = "IDLE"
@@ -142,7 +183,8 @@ class ManualMoveExecutor:
             if move is None:
                 return "MOVE"
             amount = f"{move.amount:.0f}deg" if move.kind == "turn" else f"{move.amount:.2f}s"
-            return f"MOVE {move.direction} {amount}" + (" settling" if self._phase == "SETTLING" else "")
+            kind = "PIVOT" if move.kind == "pivot" else "MOVE"
+            return f"{kind} {move.direction} {amount}" + (" settling" if self._phase == "SETTLING" else "")
 
     # ------------------------------------------------------------------ loop
 
@@ -196,6 +238,14 @@ class ManualMoveExecutor:
         with self._lock:
             self._move = request
             self._phase = "RUNNING"
+            self._base = (left, right)
+            self._hold = (request.kind == "drive" and imu is not None
+                          and self.ccw_sign is not None)
+            self._hold_note = ""
+            self._p_sum = 0.0
+            self._p_count = 0
+            if request.kind == "drive":
+                left, right = self._held_wheels(0.0)
             self._output = (left, right)
             self._started = now
             self._stopped_at = None
@@ -223,10 +273,29 @@ class ManualMoveExecutor:
         self._turned = abs(self._signed)
         return abs(imu.gyro_z_dps)
 
+    def _held_wheels(self, p_term: float) -> tuple[int, int]:
+        """Drive wheels with a differential correction (+ = turn clockwise).
+
+        Both wheels keep the drive's sign and stay at or above the PWM
+        floor, so a correction never stalls a wheel or pivots the chassis.
+        """
+        move = self._move
+        base = abs(self._base[0])
+        correction = p_term + self.trim_pwm.get(move.direction, 0.0)
+        correction = min(HOLD_MAX_CORRECTION_PWM, max(-HOLD_MAX_CORRECTION_PWM, correction))
+        top = base + HOLD_MAX_BOOST_PWM
+
+        def clamp(value: float) -> int:
+            return int(round(min(top, max(self._min_pwm, value))))
+
+        if move.direction == "F":
+            return clamp(base + correction), clamp(base - correction)
+        return -clamp(base - correction), -clamp(base + correction)
+
     def _drive_step(self, now: float) -> None:
         move = self._move
         elapsed = now - self._started
-        rate = self._measure() if move.kind == "turn" else 0.0
+        rate = self._measure() if self._imu_used else 0.0
         reason = None
         if self._control.move_cancelled():
             reason = "stopped: STOP, a manual command or Manual Control off"
@@ -235,6 +304,22 @@ class ManualMoveExecutor:
                 reason = "done"
             elif move.direction == "F" and getattr(self._link.status(), "blocked", False):
                 reason = "stopped: the Arduino's 18 cm ultrasonic stop"
+            elif self._hold and self._imu_used:
+                drift = self._signed * self.ccw_sign      # + = drifted left
+                if abs(drift) > HOLD_GIVE_UP_DEG:
+                    self._hold = False
+                    self._hold_note = f"heading hold gave up at {drift:+.0f} deg"
+                    with self._lock:
+                        self._output = self._held_wheels(0.0)
+                else:
+                    p_term = HOLD_KP_PWM_PER_DEG * drift
+                    self._p_sum += p_term
+                    self._p_count += 1
+                    with self._lock:
+                        self._output = self._held_wheels(p_term)
+        elif move.kind == "pivot":
+            if elapsed >= move.amount:
+                reason = "done"
         elif self._imu_used:
             if self._turned + rate * self.coast_lead_s >= move.amount:
                 reason = "done"
@@ -256,13 +341,26 @@ class ManualMoveExecutor:
 
     def _settle_step(self, now: float) -> None:
         move = self._move
-        if move.kind == "turn":
+        if self._imu_used:
             self._measure()
         if now - self._stopped_at < SETTLE_S:
             self._write(now)
             return
         driven = self._stopped_at - self._started
-        if move.kind == "turn" and self._imu_used:
+        if (move.kind in ("turn", "pivot") and self._imu_used and not self._note
+                and self._turned >= SIGN_MIN_DEG):
+            counted_left = self._signed > 0.0
+            self.ccw_sign = 1.0 if counted_left == (move.direction == "L") else -1.0
+        heading = None
+        if move.kind == "drive":
+            if self._imu_used and self.ccw_sign is not None:
+                heading = self._signed * self.ccw_sign
+            if self._p_count and not self._hold_note and not self._note:
+                learned = self.trim_pwm[move.direction] + HOLD_TRIM_LEARN * self._p_sum / self._p_count
+                self.trim_pwm[move.direction] = min(HOLD_TRIM_MAX_PWM, max(-HOLD_TRIM_MAX_PWM, learned))
+        if move.kind == "pivot":
+            turned = self._turned if self._imu_used else driven * self.turn_rate_dps
+        elif move.kind == "turn" and self._imu_used:
             coast = self._turned - self._turned_at_stop
             if self._rate_at_stop >= 20.0 and not self._note:
                 sample = min(COAST_LEAD_MAX_S, max(0.0, coast / self._rate_at_stop))
@@ -276,7 +374,12 @@ class ManualMoveExecutor:
         else:
             turned = 0.0
         result = self._result(move, "stopped" if self._note else "done", turned, driven,
-                              self._imu_used and move.kind == "turn", self._note)
+                              self._imu_used and move.kind != "drive", self._note)
+        if move.kind == "drive":
+            result["held"] = bool(self._p_count) and not self._hold_note
+            result["hold_note"] = self._hold_note
+            if heading is not None:
+                result["heading_deg"] = round(heading, 1)
         with self._lock:
             self._phase = "IDLE"
             self._move = None
@@ -321,7 +424,7 @@ class ManualMoveExecutor:
             "drove_s": round(driven, 2),
             "note": note,
         }
-        if move.kind == "turn":
+        if move.kind in ("turn", "pivot"):
             result["turned_deg"] = round(turned, 1)
             result["measured"] = measured
         return result

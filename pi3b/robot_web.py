@@ -220,8 +220,10 @@ class RobotControl:
                 "manual": self._manual,
                 "command": self._command,
                 "magnitude": round(self._magnitude, 2),
-                # This robot runs precise moves (v1.9.32+).
+                # This robot runs precise moves (v1.9.32+) and timed pivots
+                # for LiDAR-measured turns (v1.9.33+).
                 "moves": True,
+                "pivots": True,
             }
             if self._move_result is not None:
                 state["move"] = dict(self._move_result)

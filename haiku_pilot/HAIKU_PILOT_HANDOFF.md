@@ -51,9 +51,11 @@ Run them exactly like this (works in PowerShell and Bash):
 | `manual on` | Takes Manual Control. Required before any move. The robot then holds still until you move it. |
 | `drive forward <seconds> [power]` | Drives straight for exactly that long, then stops and reports. seconds 0.05-2.0, power 0-1 (default 0.5). |
 | `drive backward <seconds> [power]` | Reverses straight, then stops and reports. |
-| `turn left <degrees> [power]` | Turns on the spot **by that many degrees** (1-180), measured by the robot's gyro, then stops and reports. Power default 0.3. |
+| `turn left <degrees> [power]` | Turns on the spot **by that many degrees** (1-180) in short pivots, each measured by LiDAR, to within about 3 degrees; then reports. Power default 0.3. |
 | `turn right <degrees> [power]` | Same, to the right. |
 | `stop` | Stops at once. |
+| `mark <name> <left\|right\|ahead> <degrees> <metres>` | Remembers a target you can see now, e.g. `mark capsule left 20 0.4`. Every report then says where it is from you, and the LiDAR map shows it as a pink cross. |
+| `unmark <name>` | Forgets a mark. |
 | `manual off` | Hands the robot back to its own autonomous driving. Only when the operator asks. |
 
 Add `--say "short note"` to any `drive` or `turn` to show the operator what you
@@ -122,19 +124,27 @@ A picture of the room seen from above, 3 m in every direction:
 - **The camera** faces forward. Always open the image: it is the only sensor
   that sees doorways, rooms, objects, rug edges, cables, and things above or
   below the LiDAR's scan height.
-- The movement estimate is approximate. Confirm movement by comparing the
-  map, the distances and the camera before and after.
+- Every move is measured by comparing LiDAR scans from before and after
+  ("Measured by LiDAR: 0.31 m forward, 2 cm left, heading unchanged"). Each
+  report also says where you are since `manual on` and where your marked
+  targets are. That tracking drifts a little with every move, more when a
+  move says the LiDAR could not measure it - re-`mark` a target whenever you
+  see it. Low objects (the capsule) are not in the LiDAR scan, so marks are
+  how you find them again.
+- Images are saved under a new file name every time; open the path the
+  report prints.
 
 ## The robot
 
 - About 23 cm wide and 27 cm long. Indoor floors only; it cannot climb.
 - Speed at power 0.5 is roughly 0.2 m/s: 1 s forward covers about 15-25 cm.
-- Turns are in degrees. The robot runs the turn itself and stops it when
-  its gyro has measured the angle; the report says how far it actually
-  turned, e.g. "asked 30 degrees ..., turned 32 degrees (measured by the
-  robot's gyro)". Expect within a few degrees once it has done a few turns
-  (it learns how far it coasts). If the report says "ESTIMATED from time",
-  the gyro was unavailable: check the angle with the camera and the map.
+- Turns are in degrees and land within about 3 degrees: the turn is made in
+  short pivots and each is measured by LiDAR, e.g. "asked 30 degrees ...,
+  turned 31 degrees (measured by LiDAR, 2 pivots)". Small turns (2-10
+  degrees) work. If a report says the LiDAR could not confirm a turn, check
+  the angle with the camera and the map.
+- Straight drives hold their heading (the chassis veers on its own; the
+  robot corrects it once it has seen one turn this session).
 - Lower power turns more slowly and stops more precisely; 0.3 is a good
   default, 0 is the slowest.
 - The LiDAR sees one flat slice of the room at its own height. It misses

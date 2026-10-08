@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import contextlib
 import io
+import math
 import os
 import pathlib
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -35,6 +37,16 @@ class LegacyControl(RobotControl):
     def state(self) -> dict:
         state = super().state()
         state.pop("moves", None)
+        state.pop("pivots", None)
+        return state
+
+
+class GyroTurnControl(RobotControl):
+    """A v1.9.32 robot: precise moves, but no timed pivots."""
+
+    def state(self) -> dict:
+        state = super().state()
+        state.pop("pivots", None)
         return state
 
 
@@ -61,6 +73,9 @@ class FakeChassis:
         self.output = (0, 0)
         self.yaw = 0.0
         self.rate = 0.0
+        # Position in the simulated room (FakeRobot(room=True)), metres.
+        self.x = 1.6
+        self.y = 1.4
         self.imu_live = True
         self._at = time.monotonic()
         self._lock = threading.Lock()
@@ -74,6 +89,11 @@ class FakeChassis:
         blend = min(1.0, elapsed / 0.06)
         self.rate += (target - self.rate) * blend
         self.yaw = (self.yaw + self.rate * elapsed + 180.0) % 360.0 - 180.0
+        if left * right > 0:
+            speed = 0.25 if left > 0 else -0.25
+            radians = math.radians(self.yaw)
+            self.x += -math.sin(radians) * speed * elapsed
+            self.y += math.cos(radians) * speed * elapsed
 
     def publish_drive(self, left: int, right: int, owner=None) -> None:
         with self._lock:
@@ -93,6 +113,11 @@ class FakeChassis:
     def status(self):
         return _Status(self.robot.uno_blocked)
 
+    def pose(self) -> tuple[float, float, float]:
+        with self._lock:
+            self._advance()
+            return self.x, self.y, self.yaw
+
     def state(self):
         with self._lock:
             self._advance()
@@ -106,7 +131,10 @@ class FakeRobot:
     forward guard the real policy applies."""
 
     def __init__(self, ahead_m: float = 2.0, behind_m: float = 1.5, scan_every_s: float = 0.0,
-                 legacy: bool = False) -> None:
+                 legacy: bool = False, room: bool = False) -> None:
+        # room=True: the scan is ray-cast from the chassis's simulated pose
+        # in a 5 x 4 m room, so LiDAR-measured moves can be checked.
+        self.room = room
         self.ahead_m = ahead_m
         self.behind_m = behind_m
         # A busy robot sheds full telemetry: LiDAR points only this often.
@@ -116,7 +144,10 @@ class FakeRobot:
         self.frame_number = 0
         self.frame_value = 0
         self.commands: list[str] = []
-        self.control = LegacyControl() if legacy else RobotControl()
+        # Pivots (LiDAR-measured turns) need a scan that turns with the
+        # chassis, so only the simulated room offers them.
+        self.control = (LegacyControl() if legacy else
+                        RobotControl() if room else GyroTurnControl())
         # The robot's real precise-move executor, on a simulated chassis.
         self.chassis = FakeChassis(self)
         self.mover = None if legacy else ManualMoveExecutor(
@@ -140,6 +171,11 @@ class FakeRobot:
         threading.Thread(target=self._run, daemon=True).start()
 
     def _scan(self) -> dict:
+        if self.room:
+            x, y, yaw = self.chassis.pose()
+            points = _room_points(x, y, yaw)
+            return {"x": [int(round(px * 100)) for px, _py in points],
+                    "y": [int(round(py * 100)) for _px, py in points]}
         xs, ys = [], []
         for x in np.arange(-1.0, 1.0, 0.03):
             xs.append(x)
@@ -293,17 +329,21 @@ class PilotCommandTests(unittest.TestCase):
         self.assertIn("cannot reach the robot", out)
 
 
-def _room_points(robot_x: float = 1.6, robot_y: float = 1.4) -> list[tuple[float, float]]:
-    """A 5 x 4 m room with a doorway in the right-hand wall, as LiDAR points
-    in the robot frame (robot facing +y)."""
-    import math
-
+def _room_points(robot_x: float = 1.6, robot_y: float = 1.4,
+                 yaw_deg: float = 0.0) -> list[tuple[float, float]]:
+    """A 5 x 4 m room with a doorway in the right-hand wall and a box in it,
+    as LiDAR points in the robot frame (robot facing +y when yaw is 0; yaw
+    positive = turned left)."""
     walls = [((0, 0), (5, 0)), ((0, 0), (0, 4)), ((0, 4), (5, 4)),
-             ((5, 0), (5, 1.8)), ((5, 2.7), (5, 4))]
+             ((5, 0), (5, 1.8)), ((5, 2.7), (5, 4)),
+             ((0.8, 3.0), (1.4, 3.0)), ((1.4, 3.0), (1.4, 3.5))]
+    yaw = math.radians(yaw_deg)
     points = []
     for step in range(450):
         angle = math.radians(step * 0.8)
-        dx, dy = math.sin(angle), math.cos(angle)
+        rx, ry = math.sin(angle), math.cos(angle)
+        dx = rx * math.cos(yaw) - ry * math.sin(yaw)
+        dy = rx * math.sin(yaw) + ry * math.cos(yaw)
         best = None
         for (x1, y1), (x2, y2) in walls:
             ex, ey = x2 - x1, y2 - y1
@@ -315,7 +355,7 @@ def _room_points(robot_x: float = 1.6, robot_y: float = 1.4) -> list[tuple[float
             if t > 0.05 and 0 <= u <= 1:
                 best = t if best is None else min(best, t)
         if best is not None and best < 8:
-            points.append((dx * best, dy * best))
+            points.append((rx * best, ry * best))
     return points
 
 
@@ -365,7 +405,7 @@ class FieldIssueTests(unittest.TestCase):
         self.addCleanup(self.robot.close)
         run(self.robot.address, "manual", "on")
 
-    def test_a_turn_stops_at_the_angle_asked(self) -> None:
+    def test_a_v1_9_32_robot_still_turns_by_gyro(self) -> None:
         """2026-10-08 (2): a 0.1 s turn rotated 93 degrees and the same turn
         anywhere from 0 to 178. A turn is now in degrees, run by the robot and
         ended by its gyro."""
@@ -421,6 +461,72 @@ class FieldIssueTests(unittest.TestCase):
         text = robot.describe(summary, {"manual": True})
         self.assertIn("right corner", text)
         self.assertIn("narrow beam", text)
+
+
+class MeasuredMoveTests(unittest.TestCase):
+    """2026-10-09 (3): gyro-ended turns over- and undershot by up to 27 deg,
+    drives veered, and the pilot lost track of the capsule and the bucket.
+    Turns are now LiDAR-measured pivots; moves are measured and tracked."""
+
+    def setUp(self) -> None:
+        folder = tempfile.mkdtemp()
+        for name in ("PIVOT_MODEL_PATH", "TRACK_PATH"):
+            original = getattr(robot, name)
+            setattr(robot, name, os.path.join(folder, os.path.basename(original)))
+            self.addCleanup(setattr, robot, name, original)
+        self.robot = FakeRobot(room=True)
+        self.addCleanup(self.robot.close)
+        run(self.robot.address, "manual", "on")
+
+    def _turned(self, before: float) -> float:
+        return (self.robot.chassis.yaw - before + 180.0) % 360.0 - 180.0
+
+    def test_turns_land_within_a_few_degrees(self) -> None:
+        for direction, asked in (("left", 30), ("right", 10), ("left", 5), ("right", 60)):
+            before = self.robot.chassis.yaw
+            code, out = run(self.robot.address, "turn", direction, str(asked))
+            self.assertEqual(code, 0, out)
+            self.assertIn("measured by LiDAR", out)
+            actual = self._turned(before) * (1 if direction == "left" else -1)
+            self.assertAlmostEqual(actual, asked, delta=robot.TURN_TOLERANCE_DEG + 1.0, msg=out)
+
+    def test_a_drive_is_measured_and_tracked(self) -> None:
+        x0, y0, _yaw = self.robot.chassis.pose()
+        code, out = run(self.robot.address, "drive", "forward", "1.0")
+        self.assertEqual(code, 0, out)
+        x1, y1, _yaw = self.robot.chassis.pose()
+        moved = math.hypot(x1 - x0, y1 - y0)
+        self.assertIn("Measured by LiDAR:", out)
+        self.assertIn(f"{moved:.2f} m forward", out)
+        track = robot.Track(robot.TRACK_PATH)
+        self.assertAlmostEqual(track.y, moved, delta=0.03)
+        self.assertIn("Since `manual on` (1 moves)", out)
+
+    def test_a_marked_target_is_found_again_after_turning(self) -> None:
+        code, out = run(self.robot.address, "mark", "capsule", "right", "30", "1.0")
+        self.assertEqual(code, 0, out)
+        code, out = run(self.robot.address, "turn", "right", "30")
+        self.assertEqual(code, 0, out)
+        self.assertRegex(out, r"Marked 'capsule': about 1\.0\d m away, (straight ahead|[0-4] deg (left|right))")
+        code, out = run(self.robot.address, "unmark", "capsule")
+        self.assertIn("Forgot 'capsule'", out)
+
+    def test_a_person_pressing_stop_ends_a_measured_turn(self) -> None:
+        threading.Timer(0.3, self.robot.control.halt).start()
+        code, out = run(self.robot.address, "turn", "left", "180", "0.0")
+        self.assertEqual(code, 5, out)
+        self.assertIn("STOP was pressed", out)
+
+    def test_every_report_saves_images_under_new_names(self) -> None:
+        names = []
+        for _ in range(2):
+            code, out = run(self.robot.address, "observe")
+            self.assertEqual(code, 0, out)
+            line = next(line for line in out.splitlines() if line.startswith("Camera image saved:"))
+            names.append(line.split(": ", 1)[1].split("  ")[0])
+            time.sleep(0.01)
+        self.assertNotEqual(names[0], names[1])
+        self.assertTrue(all(os.path.exists(name) for name in names))
 
 
 class LegacyRobotTests(unittest.TestCase):
