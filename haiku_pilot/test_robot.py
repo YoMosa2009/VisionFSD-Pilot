@@ -39,6 +39,11 @@ class FakeRobot:
         self.scan_every_s = scan_every_s
         self._next_scan_at = 0.0
         self.uno_blocked = False
+        # Actual wheel power ramps 4 PWM per 20 ms, as the Arduino does.
+        self.actual = [0, 0]
+        self.driving_ticks = 0
+        self.frame_number = 0
+        self.frame_value = 0
         self.control = RobotControl()
         self.hub = TelemetryHub()
         started = start_dashboard_server(
@@ -67,6 +72,19 @@ class FakeRobot:
             command, _magnitude = self.control.manual_input()
             if command != "STOP":
                 self.commands.append(command)
+            target = {"F": (110, 110), "B": (-110, -110), "L": (-125, 125),
+                      "R": (125, -125)}.get(command, (0, 0))
+            for wheel in (0, 1):
+                step = 10   # 4 PWM per 20 ms over this 50 ms loop
+                current = self.actual[wheel]
+                if target[wheel] == 0:
+                    self.actual[wheel] = 0
+                elif abs(target[wheel] - current) <= step:
+                    self.actual[wheel] = target[wheel]
+                else:
+                    self.actual[wheel] = current + (step if target[wheel] > current else -step)
+            if min(abs(v) for v in self.actual) >= 100:
+                self.driving_ticks += 1
             reason = "EXPLORE_FRONTIER"
             if self.control.manual:
                 reason = f"MANUAL:{command}"
@@ -79,6 +97,7 @@ class FakeRobot:
                 "health": {"range": {"front_m": self.ahead_m, "rear_m": self.behind_m,
                                      "ultra_cm": int(self.ahead_m * 100), "uno_blocked": self.uno_blocked}},
                 "control": self.control.state(),
+                "drive": {"cmd": list(target), "act": list(self.actual)},
             }
             now = time.monotonic()
             if now >= self._next_scan_at:
@@ -87,7 +106,13 @@ class FakeRobot:
             else:
                 self.hub.publish(light, None)
             if self.server.camera is not None and self.server.camera.viewers > 0:
-                self.server.camera.publish(np.full((240, 320, 3), 90, dtype=np.uint8))
+                self.frame_number += 1
+                # Each frame a distinct solid shade, so a test can tell which
+                # frame the pilot saved.
+                self.frame_value = 30 + (self.frame_number * 40) % 200
+                self.server.camera.publish(
+                    np.full((240, 320, 3), self.frame_value, dtype=np.uint8)
+                )
             time.sleep(0.05)
 
     def close(self) -> None:
@@ -112,7 +137,8 @@ class PilotCommandTests(unittest.TestCase):
             os.remove(robot.VIEW_PATH)
         code, out = run(self.robot.address, "observe")
         self.assertEqual(code, 0, out)
-        self.assertIn("Clear in your own lane: ahead 2.00 m, behind 1.50 m", out)
+        self.assertIn("Clear in your own lane: ahead 2.00 m (across your whole width), "
+                      "behind 1.50 m (across your whole width)", out)
         self.assertIn("Ultrasonic straight ahead: 200 cm", out)
         self.assertIn("autonomous", out)
         self.assertTrue(os.path.exists(robot.VIEW_PATH))
@@ -267,6 +293,63 @@ class NoScanTests(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertIn("F", self.robot.commands)
         self.assertIn("Clear in your own lane: ahead 2.00 m", out)
+
+class FieldIssueTests(unittest.TestCase):
+    """2026-10-08, from the operator's AI-pilot session."""
+
+    def setUp(self) -> None:
+        self.robot = FakeRobot()
+        self.addCleanup(self.robot.close)
+        run(self.robot.address, "manual", "on")
+
+    def test_short_moves_drive_for_their_full_time(self) -> None:
+        """A 0.6 s forward moved ~1 cm and short turns did nothing: the
+        Arduino's ramp took ~0.5 s of each move before the wheels drove."""
+        self.robot.driving_ticks = 0
+        code, out = run(self.robot.address, "drive", "forward", "0.6")
+        self.assertEqual(code, 0, out)
+        # 0.6 s of driving at the fake's 50 ms loop is about 12 ticks.
+        self.assertGreaterEqual(self.robot.driving_ticks, 9)
+        self.assertIn("to reach driving power", out)
+
+    def test_short_turns_drive_too(self) -> None:
+        self.robot.driving_ticks = 0
+        code, out = run(self.robot.address, "turn", "left", "0.4")
+        self.assertEqual(code, 0, out)
+        self.assertGreaterEqual(self.robot.driving_ticks, 5)
+
+    def test_the_camera_image_is_not_the_cached_frame(self) -> None:
+        import cv2
+
+        run(self.robot.address, "observe")
+        time.sleep(0.5)                       # nobody watching: no new frames
+        stale_value = self.robot.frame_value  # what the robot has cached
+        run(self.robot.address, "observe")
+        image = cv2.imread(robot.VIEW_PATH)
+        self.assertIsNotNone(image)
+        self.assertGreater(abs(float(image.mean()) - stale_value), 10.0)
+
+    def test_a_short_telemetry_pause_does_not_end_a_move(self) -> None:
+        """Gaps of ~0.9 s are normal; 1.5 s ended moves as a 'dropout'."""
+        self.assertGreaterEqual(robot.TELEMETRY_STALE_S, 3.0)
+
+    def test_a_low_object_only_the_ultrasonic_sees_is_flagged(self) -> None:
+        """2026-10-08: LiDAR lane 1.68 m clear, a 10 cm bottle 35 cm ahead."""
+        wall = {"x": [x for x in range(-20, 21, 3)], "y": [181] * 14}
+        summary = robot.summarize({"scan": wall, "health": {"range": {"ultra_cm": 35}}})
+        text = robot.describe(summary, {"manual": True})
+        self.assertIn("WARNING: the ultrasonic sees something 35 cm ahead", text)
+        agreeing = robot.summarize({"scan": wall, "health": {"range": {"ultra_cm": 170}}})
+        self.assertNotIn("WARNING", robot.describe(agreeing, {"manual": True}))
+
+    def test_the_lane_says_where_the_nearest_thing_is(self) -> None:
+        summary = robot.summarize({"scan": {"x": [12, 12], "y": [20, 22]},
+                                   "health": {"range": {"ultra_cm": 35}}})
+        self.assertEqual(summary["lane_ahead_m"], 0.07)
+        text = robot.describe(summary, {"manual": True})
+        self.assertIn("right corner", text)
+        self.assertIn("narrow beam", text)
+
 
 class OpeningTests(unittest.TestCase):
     def test_a_doorway_is_the_first_opening_listed(self) -> None:

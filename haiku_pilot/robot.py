@@ -69,7 +69,19 @@ TELEMETRY_WAIT_S = 4.0
 # several times a second. Safety decisions use the light readings; the map
 # and directions use the newest scan, whose age the report states.
 SCAN_WAIT_S = 10.0
-TELEMETRY_STALE_S = 1.5
+# Telemetry arrives every ~0.36 s from an idle robot and gaps of 0.9 s are
+# normal (measured 2026-10-08); 1.5 s ended moves on ordinary Wi-Fi or CPU
+# hiccups, which the pilot reported as "LiDAR dropouts". The robot itself
+# stops within 0.35 s of this program going quiet, so waiting longer here
+# costs no safety.
+TELEMETRY_STALE_S = 3.0
+# The Arduino ramps motor power up by 4 PWM every 20 ms, so from a standstill
+# the wheels need about half a second to reach driving power, plus one robot
+# control tick to pick the command up. A move's seconds are counted from when
+# the wheels are actually driving - seen in telemetry, or after this long.
+# Before, a 0.6 s forward command moved ~1 cm and short turns did nothing.
+SPINUP_MAX_S = 0.7
+DRIVING_PWM = 100
 
 SECTORS = (
     ("ahead", 0.0), ("ahead-right", 45.0), ("right", 90.0), ("behind-right", 135.0),
@@ -297,12 +309,16 @@ class RobotLink:
 
 
 def fetch_camera_frame(address: str, timeout: float = 4.0) -> bytes | None:
-    """One JPEG from the robot's webcam stream, or None.
+    """One current JPEG from the robot's webcam stream, or None.
 
-    The robot only encodes camera frames while someone is watching; opening
-    the stream counts as watching, so the first frame can take a moment.
+    The stream's first frame is the robot's cached last frame - often from
+    the previous command, before the robot moved. The robot only encodes
+    frames while someone watches, so the cache is not refreshed between
+    commands. Skip it and return the next frame, published after this
+    connection opened.
     """
     deadline = time.monotonic() + timeout
+    frames = 0
     try:
         with urllib.request.urlopen(f"http://{address}/camera.mjpg", timeout=timeout) as stream:
             buffer = b""
@@ -311,10 +327,16 @@ def fetch_camera_frame(address: str, timeout: float = 4.0) -> bytes | None:
                 if not chunk:
                     break
                 buffer += chunk
-                start = buffer.find(b"\xff\xd8")
-                end = buffer.find(b"\xff\xd9", start + 2) if start >= 0 else -1
-                if start >= 0 and end >= 0:
-                    return buffer[start:end + 2]
+                while True:
+                    start = buffer.find(b"\xff\xd8")
+                    end = buffer.find(b"\xff\xd9", start + 2) if start >= 0 else -1
+                    if start < 0 or end < 0:
+                        break
+                    frame = buffer[start:end + 2]
+                    buffer = buffer[end + 2:]
+                    frames += 1
+                    if frames >= 2:
+                        return frame
                 if len(buffer) > 2_000_000:
                     buffer = b""
     except OSError:
@@ -349,23 +371,45 @@ def summarize(telemetry: dict | None, fresh: dict | None = None) -> dict:
                 distance = math.hypot(x, y)
                 nearest = distance if nearest is None else min(nearest, distance)
         summary["sectors"][name] = None if nearest is None else round(nearest, 2)
-    ahead = [y for x, y in points if y > 0.0 and abs(x) <= LANE_HALF_WIDTH_M]
-    behind = [-y for x, y in points if y < 0.0 and abs(x) <= LANE_HALF_WIDTH_M]
-    if ahead:
-        summary["lane_ahead_m"] = round(max(0.0, min(ahead) - BODY_OVERHANG_M), 2)
-    if behind:
-        summary["lane_behind_m"] = round(max(0.0, min(behind) - BODY_OVERHANG_M), 2)
+    ahead = [(y, x) for x, y in points if y > 0.0 and abs(x) <= LANE_HALF_WIDTH_M]
+    behind = [(-y, x) for x, y in points if y < 0.0 and abs(x) <= LANE_HALF_WIDTH_M]
+    for name, lane in (("ahead", ahead), ("behind", behind)):
+        if not lane:
+            continue
+        nearest, side = min(lane)
+        summary[f"lane_{name}_m"] = round(max(0.0, nearest - BODY_OVERHANG_M), 2)
+        # Something nearly as close on both sides of centre is a wall or
+        # edge across the lane, not one thing at a corner.
+        close = [x for distance, x in lane if distance <= nearest + 0.03]
+        spans = min(close) <= -0.04 and max(close) >= 0.04
+        summary[f"lane_{name}_side_cm"] = "across" if spans else round(side * 100)
+    summary["lanes_from_scan"] = bool(points)
     latest = fresh or telemetry
     summary["range"] = (latest.get("health") or {}).get("range") or {}
-    for lane_key, range_key in (("lane_ahead_m", "front_m"), ("lane_behind_m", "rear_m")):
-        reading = summary["range"].get(range_key)
-        if reading is not None:
-            current = summary[lane_key]
-            summary[lane_key] = round(reading if current is None else min(current, reading), 2)
+    if not points:
+        # No scan to measure the lane from: fall back to the robot's own
+        # corridor readings, which include a 5.5 cm margin each side.
+        for lane_key, range_key in (("lane_ahead_m", "front_m"), ("lane_behind_m", "rear_m")):
+            reading = summary["range"].get(range_key)
+            if reading is not None:
+                summary[lane_key] = round(reading, 2)
     summary["reason"] = latest.get("reason")
     pose = latest.get("pose") or {}
     summary["pose"] = (pose.get("x"), pose.get("y"), pose.get("h"))
     return summary
+
+
+def _where(side_cm) -> str:
+    """Where across the robot's width the nearest thing in the lane is."""
+    if side_cm is None:
+        return ""
+    if side_cm == "across":
+        return " (across your whole width)"
+    if abs(side_cm) <= 4:
+        return " (dead centre)"
+    corner = abs(side_cm) >= 9
+    side = "right" if side_cm > 0 else "left"
+    return f" ({'at your ' + side + ' corner' if corner else 'slightly ' + side}, {abs(side_cm)} cm off centre)"
 
 
 def describe(summary: dict, control: dict) -> str:
@@ -381,13 +425,35 @@ def describe(summary: dict, control: dict) -> str:
     )
     return "\n".join([
         f"Mode: {mode}",
-        f"Clear in your own lane: ahead {metres(summary.get('lane_ahead_m'))}, "
-        f"behind {metres(summary.get('lane_behind_m'))}",
+        f"Clear in your own lane: ahead {metres(summary.get('lane_ahead_m'))}"
+        + _where(summary.get("lane_ahead_side_cm"))
+        + f", behind {metres(summary.get('lane_behind_m'))}"
+        + _where(summary.get("lane_behind_side_cm")),
         "Nearest LiDAR return by direction: " + ", ".join(
             f"{name} {metres(value)}" for name, value in summary.get("sectors", {}).items()
         ),
-        "Ultrasonic straight ahead: " + ("no echo" if ultra is None else f"{ultra} cm"),
-    ])
+        "Ultrasonic straight ahead: " + ("no echo" if ultra is None else f"{ultra} cm")
+        + " (a narrow beam at its own height; it can disagree with the LiDAR lane"
+        + " when something is off-centre or above/below the LiDAR's scan)",
+    ] + _low_object_warning(summary.get("lane_ahead_m"), ultra))
+
+
+def _low_object_warning(lane_ahead_m, ultra_cm) -> list[str]:
+    """Flag something the ultrasonic sees ahead that the LiDAR does not.
+
+    The LiDAR scans one flat slice of the room; a short object (a bottle, a
+    toy, a shoe) sits entirely below it. On 2026-10-08 the LiDAR lane read
+    1.68 m clear with a 10 cm bottle 35 cm ahead; only the ultrasonic and the
+    camera saw it.
+    """
+    if ultra_cm is None:
+        return []
+    if lane_ahead_m is not None and ultra_cm / 100.0 >= lane_ahead_m - 0.15:
+        return []
+    return [
+        f"WARNING: the ultrasonic sees something {ultra_cm} cm ahead that the LiDAR does not"
+        " - probably a low object below the LiDAR's scan. Check the camera before driving forward."
+    ]
 
 
 def _points(telemetry: dict | None, key: str = "scan") -> list[tuple[float, float]]:
@@ -606,16 +672,42 @@ def check_override(link: RobotLink, clock=time.monotonic) -> None:
         raise Override("telemetry from the robot stopped arriving")
 
 
+def _wheels_driving(telemetry: dict | None, command: str) -> bool:
+    """Whether the Uno reports the wheels at driving power for this command."""
+    actual = ((telemetry or {}).get("drive") or {}).get("act") or [0, 0]
+    try:
+        left, right = int(actual[0]), int(actual[1])
+    except (TypeError, ValueError, IndexError):
+        return False
+    wanted = {"F": (1, 1), "B": (-1, -1), "L": (-1, 1), "R": (1, -1)}.get(command)
+    if wanted is None:
+        return False
+    return (left * wanted[0] >= DRIVING_PWM) and (right * wanted[1] >= DRIVING_PWM)
+
+
 def hold(link: RobotLink, command: str, power: float, seconds: float,
-         clock=time.monotonic, sleep=time.sleep) -> str:
-    """Hold a drive command like a pressed button. Always ends stopped."""
+         clock=time.monotonic, sleep=time.sleep) -> tuple[str, float]:
+    """Hold a drive command like a pressed button. Always ends stopped.
+
+    ``seconds`` is time with the wheels actually driving: the clock starts
+    when telemetry shows the wheels at driving power, or SPINUP_MAX_S after
+    the first command, whichever comes first. Returns (note, spin-up seconds).
+    """
     started = clock()
+    driving_since = None
     note = ""
     try:
-        while clock() - started < seconds:
+        while True:
+            now = clock()
+            if driving_since is not None and now - driving_since >= seconds:
+                break
             check_override(link, clock)
             link.send({"type": "control", "drive": command, "mag": power})
             telemetry, _full, _at, _control = link.snapshot()
+            if driving_since is None and (
+                _wheels_driving(telemetry, command) or now - started >= SPINUP_MAX_S
+            ):
+                driving_since = now
             reason = (telemetry or {}).get("reason") or ""
             rng = ((telemetry or {}).get("health") or {}).get("range") or {}
             if reason.startswith("STOP:MANUAL_FORWARD_BLOCKED"):
@@ -629,7 +721,8 @@ def hold(link: RobotLink, command: str, power: float, seconds: float,
             sleep(HOLD_PERIOD_S)
     finally:
         link.send({"type": "control", "drive": "STOP"})
-    return note
+    spinup = (driving_since - started) if driving_since is not None else clock() - started
+    return note, spinup
 
 
 def report(link: RobotLink, address: str, heading: str = "",
@@ -738,14 +831,15 @@ def run(argv: list[str]) -> int:
         power = min(1.0, max(0.0, args.power))
         note = args.say or f"{args.command} {args.direction} {seconds:.1f}s"
         link.send({"type": "pilot", "note": note[:240], "model": "claude-haiku-5-5"})
-        cut_short = hold(link, COMMANDS[args.direction], power, seconds)
+        cut_short, spinup = hold(link, COMMANDS[args.direction], power, seconds)
         time.sleep(SETTLE_S)
         stopped_at = link.marks()
         link.wait_for_fresh(stopped_at, want_new_scan=True)
         telemetry, full, _at, _control = link.snapshot()
         after = summarize(full or telemetry, fresh=telemetry)
         heading = (
-            f"Did: {args.command} {args.direction} for {seconds:.1f} s at power {power:.1f}. "
+            f"Did: {args.command} {args.direction} for {seconds:.1f} s at power {power:.1f} "
+            f"(wheels took {spinup:.1f} s to reach driving power first). "
             + (cut_short + " " if cut_short else "")
             + pose_change(before.get("pose"), after.get("pose"))
         )
