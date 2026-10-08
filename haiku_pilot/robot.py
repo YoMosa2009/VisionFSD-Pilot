@@ -9,12 +9,15 @@ what the robot now senses, and exits.
     python haiku_pilot/robot.py observe
     python haiku_pilot/robot.py manual on
     python haiku_pilot/robot.py drive forward 1.0 0.5 --say "heading for the doorway"
-    python haiku_pilot/robot.py turn left 0.5 0.5
+    python haiku_pilot/robot.py turn left 30 0.3
     python haiku_pilot/robot.py stop
     python haiku_pilot/robot.py manual off
 
-Moves go through the dashboard's Manual Control, exactly like the phone's
-arrow buttons. At the operator's request there is no proximity limit in
+Moves go through the dashboard's Manual Control. From robot v1.9.32 the
+robot runs each move itself on a fast timer: a drive lasts exactly the
+seconds asked, and a turn is in DEGREES, stopped by the robot's gyro when it
+has turned that far. Older robots fall back to holding the command like the
+phone's arrow buttons, which is only roughly timed. At the operator's request there is no proximity limit in
 Manual Control (robot v1.9.31 onwards): the robot may drive right up to, and
 into, things, and this program does not refuse close moves either. What still
 stops it is what stops a robot nobody controls: STOP or turning Manual
@@ -57,7 +60,14 @@ OPENING_MIN_M = 0.8
 CORRIDOR_HALF_WIDTH_M = 0.16
 
 DRIVE_MAX_S = 2.0
-TURN_MAX_S = 1.5
+TURN_MAX_DEG = 180.0
+TURN_DEFAULT_POWER = 0.3
+# Robots before v1.9.32 have no precise moves; their turn is held for this
+# long per degree (the operator's 2026-10-08 turns implied ~140 deg/s).
+LEGACY_TURN_DPS = 140.0
+# Beyond the move itself: a turn the gyro cannot confirm ends after 3 s on
+# the robot, then it measures the coast for 0.35 s.
+MOVE_REPORT_GRACE_S = 5.0
 HOLD_PERIOD_S = 0.05          # the dashboard refreshes a held button this often
 SETTLE_S = 0.5                # let the chassis stop and a fresh scan arrive
 LANE_HALF_WIDTH_M = 0.15      # the chassis is 0.23 m wide
@@ -75,13 +85,6 @@ SCAN_WAIT_S = 10.0
 # stops within 0.35 s of this program going quiet, so waiting longer here
 # costs no safety.
 TELEMETRY_STALE_S = 3.0
-# The Arduino ramps motor power up by 4 PWM every 20 ms, so from a standstill
-# the wheels need about half a second to reach driving power, plus one robot
-# control tick to pick the command up. A move's seconds are counted from when
-# the wheels are actually driving - seen in telemetry, or after this long.
-# Before, a 0.6 s forward command moved ~1 cm and short turns did nothing.
-SPINUP_MAX_S = 0.7
-DRIVING_PWM = 100
 
 SECTORS = (
     ("ahead", 0.0), ("ahead-right", 45.0), ("right", 90.0), ("behind-right", 135.0),
@@ -672,46 +675,24 @@ def check_override(link: RobotLink, clock=time.monotonic) -> None:
         raise Override("telemetry from the robot stopped arriving")
 
 
-def _wheels_driving(telemetry: dict | None, command: str) -> bool:
-    """Whether the Uno reports the wheels at driving power for this command."""
-    actual = ((telemetry or {}).get("drive") or {}).get("act") or [0, 0]
-    try:
-        left, right = int(actual[0]), int(actual[1])
-    except (TypeError, ValueError, IndexError):
-        return False
-    wanted = {"F": (1, 1), "B": (-1, -1), "L": (-1, 1), "R": (1, -1)}.get(command)
-    if wanted is None:
-        return False
-    return (left * wanted[0] >= DRIVING_PWM) and (right * wanted[1] >= DRIVING_PWM)
-
-
 def hold(link: RobotLink, command: str, power: float, seconds: float,
-         clock=time.monotonic, sleep=time.sleep) -> tuple[str, float]:
-    """Hold a drive command like a pressed button. Always ends stopped.
+         clock=time.monotonic, sleep=time.sleep) -> str:
+    """Hold a drive command like a pressed button (robots before v1.9.32).
 
-    ``seconds`` is time with the wheels actually driving: the clock starts
-    when telemetry shows the wheels at driving power, or SPINUP_MAX_S after
-    the first command, whichever comes first. Returns (note, spin-up seconds).
+    Only roughly timed: the robot's control loop picks a held command up
+    about five times a second. Always ends stopped. Returns a note when the
+    Arduino cut the move short.
     """
     started = clock()
-    driving_since = None
     note = ""
     try:
-        while True:
-            now = clock()
-            if driving_since is not None and now - driving_since >= seconds:
-                break
+        while clock() - started < seconds:
             check_override(link, clock)
             link.send({"type": "control", "drive": command, "mag": power})
             telemetry, _full, _at, _control = link.snapshot()
-            if driving_since is None and (
-                _wheels_driving(telemetry, command) or now - started >= SPINUP_MAX_S
-            ):
-                driving_since = now
             reason = (telemetry or {}).get("reason") or ""
             rng = ((telemetry or {}).get("health") or {}).get("range") or {}
             if reason.startswith("STOP:MANUAL_FORWARD_BLOCKED"):
-                # Robots before v1.9.31 still refuse close forward moves.
                 note = "The robot cut the move short: something is close ahead."
                 break
             if command == "F" and rng.get("uno_blocked"):
@@ -721,8 +702,59 @@ def hold(link: RobotLink, command: str, power: float, seconds: float,
             sleep(HOLD_PERIOD_S)
     finally:
         link.send({"type": "control", "drive": "STOP"})
-    spinup = (driving_since - started) if driving_since is not None else clock() - started
-    return note, spinup
+    return note
+
+
+def precise_move(link: RobotLink, kind: str, direction: str, amount: float, power: float,
+                 clock=time.monotonic, sleep=time.sleep) -> dict:
+    """Have the robot run one move itself (v1.9.32+) and return its result.
+
+    The robot times a drive on its own 50 Hz clock and ends a turn when its
+    gyro has measured the angle - neither depends on Wi-Fi or on this
+    program's timing. STOP on the dashboard still ends it at once.
+    """
+    move_id = os.urandom(6).hex()
+    link.send({"type": "control", "move": {
+        "kind": kind, "dir": direction, "amount": amount, "mag": power, "id": move_id,
+    }})
+    expected = amount if kind == "drive" else 0.0
+    deadline = clock() + expected + MOVE_REPORT_GRACE_S
+    try:
+        while clock() < deadline:
+            check_override(link, clock)
+            _telemetry, _full, _at, control = link.snapshot()
+            result = control.get("move") or {}
+            if result.get("id") == move_id:
+                return result
+            sleep(HOLD_PERIOD_S)
+    except Override:
+        link.send({"type": "control", "drive": "STOP"})
+        raise
+    link.send({"type": "control", "drive": "STOP"})
+    raise Override("the robot did not report the move finishing")
+
+
+def _strip(note: str, prefix: str) -> str:
+    return note[len(prefix):] if note.startswith(prefix) else note
+
+
+def describe_move(kind: str, direction: str, amount: float, power: float, result: dict) -> str:
+    """One line on what a precise move actually did."""
+    note = result.get("note") or ""
+    if result.get("state") == "refused":
+        return f"Did not move: {_strip(note, 'refused: ') or 'the robot refused the move'}."
+    if kind == "turn":
+        turned = float(result.get("turned_deg") or 0.0)
+        how = ("measured by the robot's gyro" if result.get("measured")
+               else "ESTIMATED from time - the gyro was not available")
+        text = (f"Did: turn {direction} - asked {amount:.0f} degrees at power {power:.1f}, "
+                f"turned {turned:.0f} degrees ({how}).")
+    else:
+        drove = float(result.get("drove_s") or 0.0)
+        text = f"Did: drive {direction} for {drove:.2f} s at power {power:.1f}."
+    if note:
+        text += f" Cut short: {_strip(note, 'stopped: ')}."
+    return text
 
 
 def report(link: RobotLink, address: str, heading: str = "",
@@ -768,12 +800,13 @@ def run(argv: list[str]) -> int:
     sub.add_parser("observe", help="what the robot senses now, plus a camera image")
     manual = sub.add_parser("manual", help="take (on) or hand back (off) Manual Control")
     manual.add_argument("state", choices=("on", "off"))
-    for name, choices, limit in (("drive", ("forward", "backward"), DRIVE_MAX_S),
-                                 ("turn", ("left", "right"), TURN_MAX_S)):
-        move = sub.add_parser(name, help=f"{name} for up to {limit} s, then stop and observe")
+    for name, choices, unit, default_power in (
+            ("drive", ("forward", "backward"), f"seconds (up to {DRIVE_MAX_S:.0f})", 0.5),
+            ("turn", ("left", "right"), f"degrees (up to {TURN_MAX_DEG:.0f})", TURN_DEFAULT_POWER)):
+        move = sub.add_parser(name, help=f"{name} by {unit}, then stop and observe")
         move.add_argument("direction", choices=choices)
-        move.add_argument("seconds", type=float)
-        move.add_argument("power", type=float, nargs="?", default=0.5)
+        move.add_argument("amount", type=float, help=unit)
+        move.add_argument("power", type=float, nargs="?", default=default_power)
         move.add_argument("--say", default="", help="short note shown on the dashboard")
     sub.add_parser("stop", help="stop immediately")
     args = parser.parse_args(argv)
@@ -824,25 +857,37 @@ def run(argv: list[str]) -> int:
         # drive / turn
         link.wait_for_fresh()
         check_override(link)
-        telemetry, full, _at, _control = link.snapshot()
+        telemetry, full, _at, control = link.snapshot()
         before = summarize(full or telemetry, fresh=telemetry)
-        limit = DRIVE_MAX_S if args.command == "drive" else TURN_MAX_S
-        seconds = min(limit, max(0.1, args.seconds))
+        if args.command == "drive":
+            amount = min(DRIVE_MAX_S, max(0.05, args.amount))
+            unit = f"{amount:.1f}s"
+        else:
+            amount = min(TURN_MAX_DEG, max(1.0, args.amount))
+            unit = f"{amount:.0f}deg"
         power = min(1.0, max(0.0, args.power))
-        note = args.say or f"{args.command} {args.direction} {seconds:.1f}s"
+        note = args.say or f"{args.command} {args.direction} {unit}"
         link.send({"type": "pilot", "note": note[:240], "model": "claude-haiku-5-5"})
-        cut_short, spinup = hold(link, COMMANDS[args.direction], power, seconds)
+        command = COMMANDS[args.direction]
+        if control.get("moves"):
+            result = precise_move(link, args.command, command, amount, power)
+            done = describe_move(args.command, args.direction, amount, power, result)
+            if result.get("state") == "refused":
+                print(done)
+                return 3
+            cut_short = "18 cm" in (result.get("note") or "")
+        else:
+            seconds = amount if args.command == "drive" else amount / LEGACY_TURN_DPS
+            cut_short = hold(link, command, power, seconds)
+            done = (f"Did: {args.command} {args.direction} {unit} at power {power:.1f} "
+                    "(roughly timed - this robot is older than v1.9.32; restart it to update)."
+                    + (" " + cut_short if cut_short else ""))
         time.sleep(SETTLE_S)
         stopped_at = link.marks()
         link.wait_for_fresh(stopped_at, want_new_scan=True)
         telemetry, full, _at, _control = link.snapshot()
         after = summarize(full or telemetry, fresh=telemetry)
-        heading = (
-            f"Did: {args.command} {args.direction} for {seconds:.1f} s at power {power:.1f} "
-            f"(wheels took {spinup:.1f} s to reach driving power first). "
-            + (cut_short + " " if cut_short else "")
-            + pose_change(before.get("pose"), after.get("pose"))
-        )
+        heading = done + " " + pose_change(before.get("pose"), after.get("pose"))
         # The wait for a post-move scan already happened above.
         print(report(link, args.robot, heading, after=stopped_at, new_scan=False))
         return 4 if cut_short else 0

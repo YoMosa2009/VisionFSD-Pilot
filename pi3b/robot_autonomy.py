@@ -35,6 +35,7 @@ from lidar_visualizer import LD19_MAX_RANGE_MM, LD19Parser, LivePolarMap
 from robot_camera_motion import CameraMotionState, estimate_motion
 from robot_explorer import AsyncExplorer, ExplorationState, FrontierExplorer
 from robot_loop_budget import AdvisoryBudget, StageTimer
+from robot_manual_move import ManualMoveExecutor
 from robot_map_worker import MapWorker, MotionSample
 from robot_imu import AsyncIMULink, IMUState, LSM6DS3MCP2221Link
 from robot_local_planner import (
@@ -704,6 +705,8 @@ class ArduinoLink:
         self._drive_lease_until = 0.0
         self._drive_last_write = 0.0
         self._drive_expired = True
+        self._owner: object | None = None
+        self._owner_until = 0.0
         self._status = ArduinoStatus(None, "S", 0.0)
         self._supports_differential = False
         self._last_caps_sent_at = float("-inf")
@@ -824,7 +827,24 @@ class ArduinoLink:
     def send(self, command: str) -> None:
         self._write(command)
 
-    def publish_drive(self, left_pwm: int, right_pwm: int) -> None:
+    def claim(self, owner: object, until: float) -> None:
+        """Give ``owner`` the drive output until ``until`` (monotonic).
+
+        A precise manual move (robot_manual_move.py) writes at 50 Hz while
+        the control loop keeps publishing its own slower decisions; those are
+        ignored for the claim's life. The claim lapses on its own, so a
+        stalled owner cannot lock the control loop out.
+        """
+        with self._drive_lock:
+            self._owner = owner
+            self._owner_until = until
+
+    def release(self, owner: object) -> None:
+        with self._drive_lock:
+            if getattr(self, "_owner", None) is owner:
+                self._owner = None
+
+    def publish_drive(self, left_pwm: int, right_pwm: int, owner: object | None = None) -> None:
         """Publish a leased command and refresh it independently of planning.
 
         The short lease preserves fail-safe STOP behavior if the main loop
@@ -834,6 +854,10 @@ class ArduinoLink:
         command = f"DRIVE {left_pwm} {right_pwm}"
         with self._drive_lock:
             now = time.monotonic()
+            holder = getattr(self, "_owner", None)
+            if (holder is not None and owner is not holder
+                    and now <= getattr(self, "_owner_until", 0.0)):
+                return
             changed = command != self._drive_command
             self._drive_command = command
             self._drive_lease_until = now + UNO_CONTROL_LEASE_S
@@ -1332,6 +1356,7 @@ class AutonomousPolicy:
         self._last_output_at = 0.0
         self._output_elapsed_s = CONTROL_PERIOD_S
         self.control: RobotControl | None = None
+        self.manual_move: ManualMoveExecutor | None = None
         self.standby_s = standby_s
         self.speed = max(min_move_pwm, speed)
         self.min_move_pwm = min_move_pwm
@@ -1711,6 +1736,16 @@ class AutonomousPolicy:
             return self._hold_stop(self.reason)
         if not control.manual:
             return None
+        move = getattr(self, "manual_move", None)
+        if move is not None and move.active:
+            # A precise move (robot_manual_move.py) owns the Uno link and
+            # writes it at 50 Hz. Mirror its output here, unramped, so the
+            # IMU's stationary flag, motion tracking and telemetry see it.
+            self.left_pwm, self.right_pwm = move.output
+            self.reason = f"MANUAL:{move.label}"
+            self.drive_confidence = 0.0
+            self._arc_active = False
+            return "MANUAL_MOVE"
         command, magnitude = control.manual_input(now)
         left, right = manual_wheels(
             command, magnitude, self.speed, self.min_move_pwm
@@ -3984,6 +4019,15 @@ def main() -> int:
     dashboard_server = None
     robot_control = RobotControl()
     policy.control = robot_control
+    # Precise moves for an AI pilot: their own 50 Hz thread, see
+    # robot_manual_move.py.
+    manual_move = ManualMoveExecutor(
+        robot_control, arduino, imu,
+        lambda command, magnitude: manual_wheels(
+            command, magnitude, policy.speed, policy.min_move_pwm
+        ),
+    )
+    policy.manual_move = manual_move
     telemetry_hub = TelemetryHub()
     if not args.no_web:
         started = start_dashboard_server(
@@ -4416,6 +4460,7 @@ def main() -> int:
             if remaining > 0.0:
                 time.sleep(remaining)
     finally:
+        manual_move.close()
         arduino.close()
         lidar.close()
         camera.close()

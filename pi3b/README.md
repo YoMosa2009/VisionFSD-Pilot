@@ -1092,6 +1092,37 @@ version made contact in it, so it understates real collisions; treat it as a
 comparison, not a prediction. Desktop tests (475 pass). **Nothing here has run
 on the robot.**
 
+### v1.9.32: precise turns and drives for the AI pilot
+
+From the second AI-pilot session (2026-10-08). The pilot's turns were held
+buttons, and the control loop (~5 Hz on the Pi 3B) picks a held button up
+only once per tick, so a move could not start or end more precisely than
+~0.2 s - about 30 degrees of a pivot - and loop stalls made it worse. The
+same 0.1-0.5 s turn rotated anywhere from 0 to 178 degrees.
+
+- **Precise moves** (`robot_manual_move.py`): the pilot sends one move
+  (`{"type":"control","move":{"kind":"turn","dir":"L","amount":30,...}}`)
+  and the robot runs it on its own 50 Hz thread, writing straight to the Uno
+  link. A **turn is in degrees** and ends when the IMU gyro has measured that
+  rotation, stopping early by the coast it learns from each turn. A drive
+  lasts exactly the seconds asked. The result (angle actually turned, time
+  driven, whether the gyro measured it) is published in the control state.
+- The IMU measures only how far *this* turn has gone - never a heading. With
+  no fresh, calibrated IMU a turn is timed at a learned rate and reported as
+  an estimate. A turn the gyro cannot confirm ends after 3 s.
+- While a move runs the control loop's own drive output is ignored by the
+  Uno link (a claim that lapses on its own after 0.2 s), and the policy
+  mirrors the move's output so the IMU, motion tracking and telemetry see it.
+- A move ends at once on the dashboard STOP, on any pad button (a person
+  takes over), on leaving Manual Control, and - for forward - on the Uno's
+  18 cm stop. If its thread stalled, the 250 ms lease and the firmware's
+  350 ms timeout still stop the wheels.
+- The phone's hold-to-drive buttons are unchanged.
+
+Desktop tests only (the executor against a simulated chassis and gyro, and
+the pilot against the real dashboard server). **Not yet run on the robot**:
+the real pivot rate, coast and gyro lag are what the first turns will show.
+
 ### v1.9.31: no proximity limit in Manual Control, scans for viewers, better diagnostics
 
 From the first AI-pilot session (2026-10-07) and the operator.

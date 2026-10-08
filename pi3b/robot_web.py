@@ -86,6 +86,12 @@ class RobotControl:
         self._pilot_note = ""
         self._pilot_model = ""
         self._pilot_at = 0.0
+        # One precise move at a time (robot_manual_move.py): a request waiting
+        # for the executor, whether the running one must end, and the last
+        # result, which every client sees in the control state.
+        self._move_request = None
+        self._move_cancel = False
+        self._move_result: dict | None = None
 
     @property
     def halted(self) -> bool:
@@ -102,6 +108,8 @@ class RobotControl:
             self._halted = True
             self._command = "STOP"
             self._magnitude = 0.0
+            self._move_request = None
+            self._move_cancel = True
             self.revision += 1
 
     def resume(self) -> None:
@@ -115,6 +123,8 @@ class RobotControl:
             self._command = "STOP"
             self._magnitude = 0.0
             self._command_at = 0.0
+            self._move_request = None
+            self._move_cancel = True
             self.revision += 1
 
     def drive(self, command: str, magnitude: float = 1.0) -> bool:
@@ -134,6 +144,10 @@ class RobotControl:
         if not math.isfinite(magnitude):
             magnitude = 0.0
         with self._lock:
+            # Any held-button command - even STOP, even outside manual mode -
+            # ends a precise move: a person pressing the pad takes over.
+            self._move_request = None
+            self._move_cancel = True
             if not self._manual:
                 return False
             self._command = command
@@ -154,6 +168,34 @@ class RobotControl:
             if now - self._command_at > self.COMMAND_TTL_S:
                 return "STOP", 0.0
             return self._command, self._magnitude
+
+    def request_move(self, payload: object) -> bool:
+        """Queue one precise move (see robot_manual_move.parse_move)."""
+        from robot_manual_move import parse_move
+
+        request = parse_move(payload)
+        if request is None:
+            return False
+        with self._lock:
+            if not self._manual or self._halted:
+                return False
+            self._move_request = request
+            self._move_cancel = False
+            return True
+
+    def take_move(self):
+        with self._lock:
+            request, self._move_request = self._move_request, None
+            return request
+
+    def move_cancelled(self) -> bool:
+        with self._lock:
+            return self._move_cancel or self._halted or not self._manual
+
+    def finish_move(self, result: dict) -> None:
+        with self._lock:
+            self._move_result = dict(result)
+            self.revision += 1
 
     #: A pilot that has not reported for this long is shown as gone. Long
     #: enough to span a pilot thinking between moves.
@@ -178,7 +220,11 @@ class RobotControl:
                 "manual": self._manual,
                 "command": self._command,
                 "magnitude": round(self._magnitude, 2),
+                # This robot runs precise moves (v1.9.32+).
+                "moves": True,
             }
+            if self._move_result is not None:
+                state["move"] = dict(self._move_result)
             if self._pilot_at and time.monotonic() - self._pilot_at <= self.PILOT_STALE_S:
                 state["pilot"] = {"note": self._pilot_note, "model": self._pilot_model}
             return state
@@ -632,6 +678,12 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
         drive = payload.get("drive")
         if isinstance(drive, str):
             control.drive(drive, payload.get("mag", 1.0))
+        elif "move" in payload:
+            if not control.request_move(payload["move"]):
+                move = payload["move"] if isinstance(payload["move"], dict) else {}
+                control.finish_move({"id": str(move.get("id", ""))[:40], "state": "refused",
+                                     "note": "refused: not in Manual Control, STOP pressed, "
+                                             "or an invalid move"})
 
     def _control(self) -> None:
         control = getattr(self.stream, "control", None)

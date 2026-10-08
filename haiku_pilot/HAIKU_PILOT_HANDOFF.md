@@ -49,10 +49,10 @@ Run them exactly like this (works in PowerShell and Bash):
 | `status` | Is the robot reachable, and which mode it is in. No camera. |
 | `observe` | Prints what the robot senses and saves a fresh camera image and LiDAR map. Does not move. |
 | `manual on` | Takes Manual Control. Required before any move. The robot then holds still until you move it. |
-| `drive forward <seconds> [power]` | Drives straight, then stops and reports. seconds 0.1-2.0, power 0-1 (default 0.5). |
+| `drive forward <seconds> [power]` | Drives straight for exactly that long, then stops and reports. seconds 0.05-2.0, power 0-1 (default 0.5). |
 | `drive backward <seconds> [power]` | Reverses straight, then stops and reports. |
-| `turn left <seconds> [power]` | Turns on the spot, then stops and reports. seconds 0.1-1.5. |
-| `turn right <seconds> [power]` | Same, to the right. |
+| `turn left <degrees> [power]` | Turns on the spot **by that many degrees** (1-180), measured by the robot's gyro, then stops and reports. Power default 0.3. |
+| `turn right <degrees> [power]` | Same, to the right. |
 | `stop` | Stops at once. |
 | `manual off` | Hands the robot back to its own autonomous driving. Only when the operator asks. |
 
@@ -65,7 +65,7 @@ Exit codes tell you what happened:
 |---|---|---|
 | 0 | Done | Read the report, open both images, decide the next move |
 | 2 | Robot unreachable or did not confirm | Wait 15 s and run `status` again |
-| 3 | `REFUSED` - `manual on` while a person has the robot STOPPED | Ask the operator to press Resume on the dashboard |
+| 3 | `REFUSED` - `manual on` while a person has the robot STOPPED, or the robot refused a move ("Did not move: ...") | Read the reason; ask the operator to press Resume if STOP is pressed |
 | 4 | The Arduino's 18 cm ultrasonic stop held the robot: something is under 18 cm straight ahead | Look, then turn or back away; forward will not go further |
 | 5 | `STOPPED:` - a person took over, Manual Control is off, or the link failed | Stop. Tell the operator. Wait for their instruction |
 
@@ -74,7 +74,7 @@ Exit codes tell you what happened:
 A report looks like this:
 
 ```
-Did: drive forward for 1.0 s at power 0.5. Estimated change: moved 0.18 m, turned +2 degrees (approximate).
+Did: drive forward for 1.00 s at power 0.5. Estimated change: moved 0.18 m, turned +2 degrees (approximate).
 Mode: Manual Control (you may drive)
 Clear in your own lane: ahead 2.47 m, behind 1.27 m
 Nearest LiDAR return by direction: ahead 1.24 m, ahead-right 1.57 m, right 3.40 m, behind-right 1.52 m, behind 1.40 m, behind-left 1.52 m, left 1.60 m, ahead-left 1.41 m
@@ -129,9 +129,14 @@ A picture of the room seen from above, 3 m in every direction:
 
 - About 23 cm wide and 27 cm long. Indoor floors only; it cannot climb.
 - Speed at power 0.5 is roughly 0.2 m/s: 1 s forward covers about 15-25 cm.
-- Turning on the spot at power 0.5: 0.5 s is roughly 30-60 degrees on a hard
-  floor, less on carpet. Calibrate early: turn, then compare the image and the
-  LiDAR directions to see how far you actually turned.
+- Turns are in degrees. The robot runs the turn itself and stops it when
+  its gyro has measured the angle; the report says how far it actually
+  turned, e.g. "asked 30 degrees ..., turned 32 degrees (measured by the
+  robot's gyro)". Expect within a few degrees once it has done a few turns
+  (it learns how far it coasts). If the report says "ESTIMATED from time",
+  the gyro was unavailable: check the angle with the camera and the map.
+- Lower power turns more slowly and stops more precisely; 0.3 is a good
+  default, 0 is the slowest.
 - The LiDAR sees one flat slice of the room at its own height. It misses
   things above or below that slice - table tops, chair seats, low cables, rug
   edges. Use the camera for those.
@@ -175,12 +180,14 @@ to two minutes to boot and check for updates.
 
 ## Driving well
 
-- Make small moves: 0.5-1.0 s forward, 0.3-0.6 s turns, power 0.4-0.6. Use
-  longer drives only with a lot of clear lane ahead.
+- Make small moves: 0.5-1.0 s forward at power 0.4-0.6, turns of 10-45
+  degrees. Use longer drives only with a lot of clear lane ahead. To line up
+  on something, turn by the angle you see it at, then make 5-10 degree
+  corrections.
 - Before driving forward, check "Clear in your own lane: ahead", the green
   strip on the map, and the camera.
-- To head for an opening, turn toward its bearing (`R75` means turn right
-  about 75 degrees), then check the map: when that opening's yellow arrow
+- To head for an opening, turn toward its bearing (`R75` means
+  `turn right 75`), then check the map: when that opening's yellow arrow
   points straight up and the green strip is long, drive.
 - To find a way out, turn in steps and look each time, rather than one big
   turn.

@@ -25,26 +25,108 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "pi3b"))
 
 import robot  # noqa: E402
+from robot_manual_move import ManualMoveExecutor  # noqa: E402
 from robot_web import RobotControl, TelemetryHub, start_dashboard_server  # noqa: E402
+
+
+class LegacyControl(RobotControl):
+    """A robot before v1.9.32: no precise moves."""
+
+    def state(self) -> dict:
+        state = super().state()
+        state.pop("moves", None)
+        return state
+
+
+class _Status:
+    def __init__(self, blocked: bool) -> None:
+        self.blocked = blocked
+
+
+class _ImuState:
+    def __init__(self, yaw: float, rate: float) -> None:
+        self.fresh = True
+        self.calibrated = True
+        self.yaw_deg = yaw
+        self.gyro_z_dps = rate
+
+
+class FakeChassis:
+    """The Uno link and the IMU a precise move uses: wheel output turns the
+    chassis at a PWM-dependent rate and it coasts briefly after a stop."""
+
+    def __init__(self, robot: "FakeRobot") -> None:
+        self.robot = robot
+        self.differential_ready = True
+        self.output = (0, 0)
+        self.yaw = 0.0
+        self.rate = 0.0
+        self.imu_live = True
+        self._at = time.monotonic()
+        self._lock = threading.Lock()
+
+    def _advance(self) -> None:
+        now = time.monotonic()
+        elapsed, self._at = now - self._at, now
+        left, right = self.output
+        target = (right - left) / 2.0 * 1.25 if left * right < 0 else 0.0   # ~150 deg/s at 120 PWM
+        # First-order response, ~60 ms: spins up and coasts down.
+        blend = min(1.0, elapsed / 0.06)
+        self.rate += (target - self.rate) * blend
+        self.yaw = (self.yaw + self.rate * elapsed + 180.0) % 360.0 - 180.0
+
+    def publish_drive(self, left: int, right: int, owner=None) -> None:
+        with self._lock:
+            self._advance()
+            self.output = (left, right)
+        if (left, right) != (0, 0):
+            letter = "F" if left > 0 and right > 0 else "B" if left < 0 and right < 0 else (
+                "L" if left < right else "R")
+            self.robot.commands.append(letter)
+
+    def claim(self, owner, until) -> None:
+        pass
+
+    def release(self, owner) -> None:
+        pass
+
+    def status(self):
+        return _Status(self.robot.uno_blocked)
+
+    def state(self):
+        with self._lock:
+            self._advance()
+            state = _ImuState(self.yaw, self.rate)
+        state.fresh = self.imu_live
+        return state
 
 
 class FakeRobot:
     """Publishes telemetry like the runtime, and applies the manual-mode
     forward guard the real policy applies."""
 
-    def __init__(self, ahead_m: float = 2.0, behind_m: float = 1.5, scan_every_s: float = 0.0) -> None:
+    def __init__(self, ahead_m: float = 2.0, behind_m: float = 1.5, scan_every_s: float = 0.0,
+                 legacy: bool = False) -> None:
         self.ahead_m = ahead_m
         self.behind_m = behind_m
         # A busy robot sheds full telemetry: LiDAR points only this often.
         self.scan_every_s = scan_every_s
         self._next_scan_at = 0.0
         self.uno_blocked = False
-        # Actual wheel power ramps 4 PWM per 20 ms, as the Arduino does.
-        self.actual = [0, 0]
-        self.driving_ticks = 0
         self.frame_number = 0
         self.frame_value = 0
-        self.control = RobotControl()
+        self.commands: list[str] = []
+        self.control = LegacyControl() if legacy else RobotControl()
+        # The robot's real precise-move executor, on a simulated chassis.
+        self.chassis = FakeChassis(self)
+        self.mover = None if legacy else ManualMoveExecutor(
+            self.control, self.chassis, self.chassis,
+            lambda command, magnitude: {
+                "F": (110, 110), "B": (-110, -110),
+                "L": (-int(105 + 40 * magnitude), int(105 + 40 * magnitude)),
+                "R": (int(105 + 40 * magnitude), -int(105 + 40 * magnitude)),
+            }[command],
+        )
         self.hub = TelemetryHub()
         started = start_dashboard_server(
             port=0, version="9.9.9", control=self.control, camera_fps=10.0, telemetry=self.hub,
@@ -53,7 +135,6 @@ class FakeRobot:
             raise unittest.SkipTest("could not bind a dashboard port")
         self.stream, self.server = started
         self.address = f"127.0.0.1:{self.server._server.server_address[1]}"
-        self.commands: list[str] = []
         self.forward_blocked = False
         self._stop = threading.Event()
         threading.Thread(target=self._run, daemon=True).start()
@@ -72,19 +153,6 @@ class FakeRobot:
             command, _magnitude = self.control.manual_input()
             if command != "STOP":
                 self.commands.append(command)
-            target = {"F": (110, 110), "B": (-110, -110), "L": (-125, 125),
-                      "R": (125, -125)}.get(command, (0, 0))
-            for wheel in (0, 1):
-                step = 10   # 4 PWM per 20 ms over this 50 ms loop
-                current = self.actual[wheel]
-                if target[wheel] == 0:
-                    self.actual[wheel] = 0
-                elif abs(target[wheel] - current) <= step:
-                    self.actual[wheel] = target[wheel]
-                else:
-                    self.actual[wheel] = current + (step if target[wheel] > current else -step)
-            if min(abs(v) for v in self.actual) >= 100:
-                self.driving_ticks += 1
             reason = "EXPLORE_FRONTIER"
             if self.control.manual:
                 reason = f"MANUAL:{command}"
@@ -97,7 +165,6 @@ class FakeRobot:
                 "health": {"range": {"front_m": self.ahead_m, "rear_m": self.behind_m,
                                      "ultra_cm": int(self.ahead_m * 100), "uno_blocked": self.uno_blocked}},
                 "control": self.control.state(),
-                "drive": {"cmd": list(target), "act": list(self.actual)},
             }
             now = time.monotonic()
             if now >= self._next_scan_at:
@@ -117,6 +184,8 @@ class FakeRobot:
 
     def close(self) -> None:
         self._stop.set()
+        if self.mover is not None:
+            self.mover.close()
         self.server.close()
 
 
@@ -161,7 +230,7 @@ class PilotCommandTests(unittest.TestCase):
         self.assertTrue(self.robot.control.manual)
         code, out = run(self.robot.address, "drive", "forward", "0.4", "0.5", "--say", "testing")
         self.assertEqual(code, 0, out)
-        self.assertIn("Did: drive forward for 0.4 s", out)
+        self.assertRegex(out, r"Did: drive forward for 0\.4\d s")
         self.assertIn("F", self.robot.commands)
         time.sleep(0.4)
         self.assertEqual(self.robot.control.manual_input()[0], "STOP")
@@ -190,19 +259,10 @@ class PilotCommandTests(unittest.TestCase):
         self.assertEqual(code, 4, out)
         self.assertIn("18 cm ultrasonic stop", out)
 
-    def test_the_robots_own_refusal_cuts_a_move_short(self) -> None:
-        run(self.robot.address, "manual", "on")
-        self.robot.forward_blocked = True
-        started = time.monotonic()
-        code, out = run(self.robot.address, "drive", "forward", "2.0")
-        self.assertEqual(code, 4, out)
-        self.assertIn("cut the move short", out)
-        self.assertLess(time.monotonic() - started, 6.0)
-
     def test_a_person_pressing_stop_ends_the_move(self) -> None:
         run(self.robot.address, "manual", "on")
         threading.Timer(0.4, self.robot.control.halt).start()
-        code, out = run(self.robot.address, "turn", "left", "1.5")
+        code, out = run(self.robot.address, "turn", "left", "180", "0.0")
         self.assertEqual(code, 5, out)
         self.assertIn("STOP was pressed", out)
 
@@ -214,9 +274,12 @@ class PilotCommandTests(unittest.TestCase):
 
     def test_moves_are_capped(self) -> None:
         run(self.robot.address, "manual", "on")
-        code, out = run(self.robot.address, "turn", "right", "9", "0.5")
+        code, out = run(self.robot.address, "turn", "right", "900", "0.5")
         self.assertEqual(code, 0, out)
-        self.assertIn(f"for {robot.TURN_MAX_S:.1f} s", out)
+        self.assertIn("asked 180 degrees", out)
+        code, out = run(self.robot.address, "drive", "backward", "9")
+        self.assertEqual(code, 0, out)
+        self.assertRegex(out, r"for 2\.0\d s")
 
     def test_manual_off_hands_the_robot_back(self) -> None:
         run(self.robot.address, "manual", "on")
@@ -302,21 +365,30 @@ class FieldIssueTests(unittest.TestCase):
         self.addCleanup(self.robot.close)
         run(self.robot.address, "manual", "on")
 
-    def test_short_moves_drive_for_their_full_time(self) -> None:
-        """A 0.6 s forward moved ~1 cm and short turns did nothing: the
-        Arduino's ramp took ~0.5 s of each move before the wheels drove."""
-        self.robot.driving_ticks = 0
-        code, out = run(self.robot.address, "drive", "forward", "0.6")
-        self.assertEqual(code, 0, out)
-        # 0.6 s of driving at the fake's 50 ms loop is about 12 ticks.
-        self.assertGreaterEqual(self.robot.driving_ticks, 9)
-        self.assertIn("to reach driving power", out)
+    def test_a_turn_stops_at_the_angle_asked(self) -> None:
+        """2026-10-08 (2): a 0.1 s turn rotated 93 degrees and the same turn
+        anywhere from 0 to 178. A turn is now in degrees, run by the robot and
+        ended by its gyro."""
+        for asked in (15, 45, 90):
+            start = self.robot.chassis.yaw
+            code, out = run(self.robot.address, "turn", "left", str(asked))
+            self.assertEqual(code, 0, out)
+            turned = abs((self.robot.chassis.yaw - start + 180.0) % 360.0 - 180.0)
+            self.assertAlmostEqual(turned, asked, delta=8.0, msg=out)
+            self.assertIn(f"asked {asked} degrees", out)
+            self.assertIn("measured by the robot's gyro", out)
 
-    def test_short_turns_drive_too(self) -> None:
-        self.robot.driving_ticks = 0
-        code, out = run(self.robot.address, "turn", "left", "0.4")
+    def test_a_turn_without_the_gyro_is_marked_as_an_estimate(self) -> None:
+        self.robot.chassis.imu_live = False
+        code, out = run(self.robot.address, "turn", "right", "40")
         self.assertEqual(code, 0, out)
-        self.assertGreaterEqual(self.robot.driving_ticks, 5)
+        self.assertIn("ESTIMATED from time", out)
+
+    def test_the_arduinos_stop_ends_a_precise_drive(self) -> None:
+        self.robot.uno_blocked = True
+        code, out = run(self.robot.address, "drive", "forward", "1.5")
+        self.assertEqual(code, 4, out)
+        self.assertIn("18 cm ultrasonic stop", out)
 
     def test_the_camera_image_is_not_the_cached_frame(self) -> None:
         import cv2
@@ -349,6 +421,29 @@ class FieldIssueTests(unittest.TestCase):
         text = robot.describe(summary, {"manual": True})
         self.assertIn("right corner", text)
         self.assertIn("narrow beam", text)
+
+
+class LegacyRobotTests(unittest.TestCase):
+    """A robot not yet restarted onto v1.9.32 still gets roughly timed moves."""
+
+    def setUp(self) -> None:
+        self.robot = FakeRobot(legacy=True)
+        self.addCleanup(self.robot.close)
+        run(self.robot.address, "manual", "on")
+
+    def test_moves_fall_back_to_holding_the_button(self) -> None:
+        code, out = run(self.robot.address, "turn", "left", "30")
+        self.assertEqual(code, 0, out)
+        self.assertIn("L", self.robot.commands)
+        self.assertIn("older than v1.9.32", out)
+
+    def test_the_robots_own_refusal_cuts_a_move_short(self) -> None:
+        self.robot.forward_blocked = True
+        started = time.monotonic()
+        code, out = run(self.robot.address, "drive", "forward", "2.0")
+        self.assertEqual(code, 4, out)
+        self.assertIn("cut the move short", out)
+        self.assertLess(time.monotonic() - started, 6.0)
 
 
 class OpeningTests(unittest.TestCase):
