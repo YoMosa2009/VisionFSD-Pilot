@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="340" viewBox="0 0 1280 340" role="img" aria-labelledby="t d">
+<title id="t">VisionFSD Pilot</title>
+<desc id="d">Read-only forward-camera driving-scene visualizer: a perspective road with glowing lane lines and one tracked lead vehicle.</desc>
+<defs>
+<linearGradient id="sky" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#05080D"/><stop offset="0.52" stop-color="#0C1622"/><stop offset="1" stop-color="#060A10"/></linearGradient>
+<linearGradient id="road" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#1A2633" stop-opacity="0.2"/><stop offset="1" stop-color="#1E2C3B"/></linearGradient>
+<radialGradient id="glow" cx="0.72" cy="0.45" r="0.35"><stop offset="0" stop-color="#38D6F5" stop-opacity="0.16"/><stop offset="1" stop-color="#38D6F5" stop-opacity="0"/></radialGradient>
+<filter id="blur" x="-20%" y="-20%" width="140%" height="140%"><feGaussianBlur stdDeviation="4"/></filter>
+<pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse"><path d="M32 0 H0 V32" fill="none" stroke="#14212E" stroke-width="1"/></pattern>
+<clipPath id="c"><rect width="1280" height="340" rx="18"/></clipPath>
+</defs>
+<g clip-path="url(#c)">
+<rect width="1280" height="340" fill="url(#sky)"/>
+<rect width="1280" height="340" fill="url(#grid)" opacity="0.6"/>
+<rect width="1280" height="340" fill="url(#glow)"/>
+<line x1="560" y1="150" x2="1280" y2="150" stroke="#1F3445" stroke-width="1"/>
+<path d="M920 150 L 1280 340 L 560 340 Z" fill="url(#road)"/>
+<line x1="920" y1="150" x2="600" y2="340" stroke="#38D6F5" stroke-width="8" opacity="0.35" filter="url(#blur)"/>
+<line x1="920" y1="150" x2="600" y2="340" stroke="#DFF8FF" stroke-width="2.4"/>
+<line x1="920" y1="150" x2="1240" y2="340" stroke="#38D6F5" stroke-width="8" opacity="0.35" filter="url(#blur)"/>
+<line x1="920" y1="150" x2="1240" y2="340" stroke="#DFF8FF" stroke-width="2.4"/>
+<line x1="920" y1="150" x2="813" y2="340" stroke="#7FA6BF" stroke-width="1.6" stroke-dasharray="14 16" opacity="0.6"/>
+<line x1="920" y1="150" x2="1027" y2="340" stroke="#7FA6BF" stroke-width="1.6" stroke-dasharray="14 16" opacity="0.6"/>
+<path d="M920 170 L 980 340 L 860 340 Z" fill="#38D6F5" opacity="0.08"/>
+<ellipse cx="928" cy="256" rx="44" ry="6" fill="#000" opacity="0.5"/>
+<path d="M888 254 L 968 254 L 964 230 L 950 212 L 906 212 L 892 230 Z" fill="#D8DEE3"/>
+<path d="M908 228 L 948 228 L 942 216 L 914 216 Z" fill="#1A2633"/>
+<rect x="894" y="236" width="18" height="5" rx="2" fill="#FF3B3B"/><rect x="944" y="236" width="18" height="5" rx="2" fill="#FF3B3B"/>
+<rect x="876" y="198" width="104" height="66" rx="3" fill="none" stroke="#5FE440" stroke-width="2"/>
+<path d="M876 210 V198 H888" stroke="#5FE440" stroke-width="4" fill="none"/>
+<path d="M980 210 V198 H968" stroke="#5FE440" stroke-width="4" fill="none"/>
+<path d="M876 252 V264 H888" stroke="#5FE440" stroke-width="4" fill="none"/>
+<path d="M980 252 V264 H968" stroke="#5FE440" stroke-width="4" fill="none"/>
+<rect x="876" y="176" width="150" height="20" rx="3" fill="#5FE440"/>
+<text x="882" y="191" font-family="ui-monospace, 'Cascadia Code', Consolas, Menlo, monospace" font-size="12" font-weight="700" fill="#06210C">LEAD #12 CAR 18.4m</text>
+<rect x="930" y="160" width="14" height="8" rx="1.5" fill="#5D6E7C"/><rect x="927" y="157" width="20" height="14" fill="none" stroke="#E0A84A" stroke-width="1.2"/>
+<text x="1236" y="38" text-anchor="end" font-family="ui-monospace, 'Cascadia Code', Consolas, Menlo, monospace" font-size="12" fill="#8AA4B8">VIEW  SPLIT · WORLD + CAMERA</text>
+<text x="1236" y="58" text-anchor="end" font-family="ui-monospace, 'Cascadia Code', Consolas, Menlo, monospace" font-size="12" fill="#8AA4B8">LANES  LIVE</text>
+<text x="64" y="120" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="64" font-weight="800" fill="#E6EEF5" letter-spacing="-1">VisionFSD</text>
+<text x="390" y="120" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="64" font-weight="300" fill="#38D6F5" letter-spacing="-1">Pilot</text>
+<text x="66" y="162" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="20" fill="#B9CCDA">Forward-camera driving-scene visualizer.</text>
+<text x="66" y="190" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="20" fill="#B9CCDA">3D world + camera · Raspberry Pi 3B runtime · LD19 LiDAR view.</text>
+<rect x="66" y="222" width="300" height="34" rx="6" fill="#2A1508" stroke="#F59E0B"/>
+<circle cx="86" cy="239" r="5" fill="#F59E0B"/>
+<text x="100" y="244" font-family="ui-monospace, 'Cascadia Code', Consolas, Menlo, monospace" font-size="13" font-weight="700" fill="#FCD34D">READ-ONLY · NO VEHICLE CONTROL</text>
+<rect x="66" y="274" width="96" height="28" rx="14" fill="#0E1A26" stroke="#1F3A4E"/>
+<text x="114.0" y="293" text-anchor="middle" font-family="ui-monospace, 'Cascadia Code', Consolas, Menlo, monospace" font-size="12" fill="#38D6F5">OpenVINO</text>
+<rect x="170" y="274" width="176" height="28" rx="14" fill="#0E1A26" stroke="#1F3A4E"/>
+<text x="258.0" y="293" text-anchor="middle" font-family="ui-monospace, 'Cascadia Code', Consolas, Menlo, monospace" font-size="12" fill="#38D6F5">YOLO11n + ByteTrack</text>
+<rect x="354" y="274" width="86" height="28" rx="14" fill="#0E1A26" stroke="#1F3A4E"/>
+<text x="397.0" y="293" text-anchor="middle" font-family="ui-monospace, 'Cascadia Code', Consolas, Menlo, monospace" font-size="12" fill="#38D6F5">YOLOPv2</text>
+<rect x="448" y="274" width="64" height="28" rx="14" fill="#0E1A26" stroke="#1F3A4E"/>
+<text x="480.0" y="293" text-anchor="middle" font-family="ui-monospace, 'Cascadia Code', Consolas, Menlo, monospace" font-size="12" fill="#38D6F5">UFLD</text>
+<rect x="520" y="274" width="76" height="28" rx="14" fill="#0E1A26" stroke="#1F3A4E"/>
+<text x="558.0" y="293" text-anchor="middle" font-family="ui-monospace, 'Cascadia Code', Consolas, Menlo, monospace" font-size="12" fill="#38D6F5">LiteRT</text>
+</g></svg>
