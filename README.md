@@ -1,3 +1,7 @@
+<p align="center">
+  <img src=".github/assets/banner.svg" alt="VisionFSD Pilot: read-only forward-camera driving-scene visualizer" width="100%">
+</p>
+
 # VisionFSD Pilot
 
 **Read-only** forward-camera driving-scene visualizer with dual-pane **3D world + camera** display, a separate Raspberry Pi 3B runtime, and an LD19 2D LiDAR inspection tool.
@@ -19,6 +23,8 @@ deliberately separate paths:
   returns, suppresses weak near-sensor noise, and groups adjacent returns into
   geometric obstacle clusters. It does not classify or control anything.
 
+<p align="center"><img src=".github/assets/three-paths.svg" alt="Three separate read-only tools: Desktop Pilot, Pi 3B runtime, LD19 LiDAR viewer" width="100%"></p>
+
 ![status](https://img.shields.io/badge/status-prototype-blue)
 ![python](https://img.shields.io/badge/python-3.11%2B-green)
 ![license](https://img.shields.io/badge/license-MIT-lightgrey)
@@ -34,6 +40,8 @@ deliberately separate paths:
 | Modes | World / camera / split; webcam or YouTube highway clip |
 
 Designed for **Intel iGPU** (OpenVINO `intel:gpu` / `GPU`) with a target of ~25+ FPS split view on mid-range laptops. Performance depends on scene complexity, power mode, and drivers.
+
+<p align="center"><img src=".github/assets/pipeline-desktop.svg" alt="Desktop pipeline: camera or video, newest-frame reader, YOLO11n + ByteTrack, YOLOPv2, UFLD and Depth Anything at different intervals, scene logic with sticky lead selection, then 3D world and annotated camera views" width="100%"></p>
 
 ## Requirements
 
@@ -85,6 +93,29 @@ vehicle-overlap, and four-frame confirmation gates. These never appear in the
 camera view. It is still read-only visualization software and never controls
 a vehicle.
 
+```mermaid
+flowchart LR
+    CAM[Camera<br/>OpenCV V4L2] --> LC[LatestCamera<br/>newest frame only]
+    LC --> DET[AsyncDetector<br/>EfficientDet-Lite0 INT8<br/>fallback: SSD-MobileNetV1]
+    LC --> LANE[AsyncLaneDetector<br/>low-cost classical lanes]
+    DET --> SEL[TargetSelector<br/>one sticky lead vehicle<br/>ego lane first, then adjacent]
+    DET --> SCN[SceneObjectTracker<br/>pedestrians · traffic lights · stop signs]
+    LANE --> SEL
+    LANE --> WV
+    SEL --> WV[World view]
+    SEL --> CV[Camera view]
+    SCN --> WV
+    classDef pi fill:#0f1a26,stroke:#5fe440,color:#e6eef5
+    classDef io fill:#0f1a26,stroke:#38d6f5,color:#e6eef5
+    class DET,SEL,SCN,LANE pi
+    class CAM,LC,WV,CV io
+```
+
+<p align="center">
+  <img src=".github/assets/pi-world-view.png" alt="Pi 3B world view: glowing lane lines, ego car, one green lead car, a stop sign and a traffic light" width="720">
+  <br><sub>The Pi world view, drawn by <code>pi3b/visionfsd_pi.py</code>'s own renderer from a synthetic target (not a camera capture). The display/detect rate line is hidden because synthetic input has no meaningful rates.</sub>
+</p>
+
 On a networked Raspberry Pi 3B running **64-bit** Raspberry Pi OS, install
 everything with:
 
@@ -135,6 +166,11 @@ On the Pi, after the standard update/install:
 cd ~/visionfsd-pi/pi3b
 bash ./run_lidar.sh
 ```
+
+<p align="center">
+  <img src=".github/assets/lidar-view.png" alt="LD19 viewer: 360-degree point cloud of a rectangular room with range rings and labelled obstacle clusters" width="520">
+  <br><sub>Drawn by <code>pi3b/lidar_visualizer.py</code>'s own renderer from a synthetic room scan, not a live sensor capture. Rings are 1.5 m apart at the 6 m display range.</sub>
+</p>
 
 On Windows, run `run_lidar.bat`. The tool automatically selects a single USB
 serial adapter; use `--port COMx` or `--port /dev/ttyUSB0` if more than one is

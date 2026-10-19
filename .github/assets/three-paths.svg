@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="430" viewBox="0 0 1280 430" role="img" aria-labelledby="t d">
+<title id="t">Three separate read-only tools</title><desc id="d">Desktop Pilot on Windows with OpenVINO, a Raspberry Pi 3B runtime with LiteRT, and an LD19 LiDAR point-cloud viewer. None sends commands to a vehicle.</desc>
+<defs><marker id="a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 Z" fill="#38D6F5"/></marker></defs>
+<rect width="1280" height="430" rx="18" fill="#0A1119"/>
+<text x="40" y="46" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="24" font-weight="700" fill="#E6EEF5">Three deliberately separate paths</text>
+<text x="40" y="72" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="400" fill="#8AA4B8">they share a design, not a runtime — the Pi path is not a port of the desktop app</text>
+<rect x="40" y="100" width="384" height="276" rx="12" fill="#0F1A26" stroke="#38D6F5" stroke-width="1.5"/>
+<rect x="40" y="100" width="384" height="6" rx="3" fill="#38D6F5"/>
+<text x="62" y="142" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="19" font-weight="700" fill="#E6EEF5">Desktop Pilot</text>
+<text x="62" y="166" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="13" font-weight="400" fill="#8AA4B8">Windows 10/11 · Intel iGPU</text>
+<circle cx="68" cy="198" r="3.5" fill="#38D6F5"/>
+<text x="82" y="203" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="13.5" font-weight="400" fill="#C9D7E3">forward USB camera or video clip</text>
+<circle cx="68" cy="228" r="3.5" fill="#38D6F5"/>
+<text x="82" y="233" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="13.5" font-weight="400" fill="#C9D7E3">YOLO11n · YOLOPv2 · UFLD · depth</text>
+<circle cx="68" cy="258" r="3.5" fill="#38D6F5"/>
+<text x="82" y="263" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="13.5" font-weight="400" fill="#C9D7E3">OpenGL 3D world + camera, split view</text>
+<circle cx="68" cy="288" r="3.5" fill="#38D6F5"/>
+<text x="82" y="293" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="13.5" font-weight="400" fill="#C9D7E3">~25–30 FPS split view (reference laptop)</text>
+<rect x="62" y="326" width="340" height="30" rx="6" fill="#06101A" stroke="#1F3448"/>
+<text x="76" y="346" text-anchor="start" font-family="ui-monospace, 'Cascadia Code', Consolas, Menlo, monospace" font-size="12.5" font-weight="400" fill="#38D6F5">$ setup.bat → run.bat</text>
+<rect x="448" y="100" width="384" height="276" rx="12" fill="#0F1A26" stroke="#5FE440" stroke-width="1.5"/>
+<rect x="448" y="100" width="384" height="6" rx="3" fill="#5FE440"/>
+<text x="470" y="142" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="19" font-weight="700" fill="#E6EEF5">Pi 3B runtime</text>
+<text x="470" y="166" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="13" font-weight="400" fill="#8AA4B8">64-bit Raspberry Pi OS</text>
+<circle cx="476" cy="198" r="3.5" fill="#5FE440"/>
+<text x="490" y="203" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="13.5" font-weight="400" fill="#C9D7E3">Pi camera / USB camera</text>
+<circle cx="476" cy="228" r="3.5" fill="#5FE440"/>
+<text x="490" y="233" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="13.5" font-weight="400" fill="#C9D7E3">EfficientDet-Lite0 INT8 (LiteRT)</text>
+<circle cx="476" cy="258" r="3.5" fill="#5FE440"/>
+<text x="490" y="263" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="13.5" font-weight="400" fill="#C9D7E3">SSD-MobileNetV1 fallback, SHA-256 pinned</text>
+<circle cx="476" cy="288" r="3.5" fill="#5FE440"/>
+<text x="490" y="293" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="13.5" font-weight="400" fill="#C9D7E3">one sticky lead vehicle, max</text>
+<rect x="470" y="326" width="340" height="30" rx="6" fill="#06101A" stroke="#1F3448"/>
+<text x="484" y="346" text-anchor="start" font-family="ui-monospace, 'Cascadia Code', Consolas, Menlo, monospace" font-size="12.5" font-weight="400" fill="#5FE440">$ pi3b/install.sh</text>
+<rect x="856" y="100" width="384" height="276" rx="12" fill="#0F1A26" stroke="#C084FC" stroke-width="1.5"/>
+<rect x="856" y="100" width="384" height="6" rx="3" fill="#C084FC"/>
+<text x="878" y="142" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="19" font-weight="700" fill="#E6EEF5">LD19 LiDAR viewer</text>
+<text x="878" y="166" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="13" font-weight="400" fill="#8AA4B8">Pi or Windows · USB-UART</text>
+<circle cx="884" cy="198" r="3.5" fill="#C084FC"/>
+<text x="898" y="203" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="13.5" font-weight="400" fill="#C9D7E3">360° horizontal scan, 230,400 baud</text>
+<circle cx="884" cy="228" r="3.5" fill="#C084FC"/>
+<text x="898" y="233" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="13.5" font-weight="400" fill="#C9D7E3">CRC-checked 47-byte packets</text>
+<circle cx="884" cy="258" r="3.5" fill="#C084FC"/>
+<text x="898" y="263" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="13.5" font-weight="400" fill="#C9D7E3">returns expire after 300 ms</text>
+<circle cx="884" cy="288" r="3.5" fill="#C084FC"/>
+<text x="898" y="293" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="13.5" font-weight="400" fill="#C9D7E3">geometric clusters, no object classes</text>
+<rect x="878" y="326" width="340" height="30" rx="6" fill="#06101A" stroke="#1F3448"/>
+<text x="892" y="346" text-anchor="start" font-family="ui-monospace, 'Cascadia Code', Consolas, Menlo, monospace" font-size="12.5" font-weight="400" fill="#C084FC">$ run_lidar.sh / .bat</text>
+<rect x="40" y="388" width="1200" height="28" rx="8" fill="#2A1508" stroke="#F59E0B"/>
+<text x="640" y="407" text-anchor="middle" font-family="ui-monospace, 'Cascadia Code', Consolas, Menlo, monospace" font-size="12.5" font-weight="700" fill="#FCD34D">ALL THREE ARE VISUALIZERS · none makes or automates driving decisions</text>
+</svg>

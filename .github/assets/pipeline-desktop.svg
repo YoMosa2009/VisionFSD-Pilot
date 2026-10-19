@@ -1,0 +1,100 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="560" viewBox="0 0 1280 560" role="img" aria-labelledby="t d">
+<title id="t">VisionFSD desktop pipeline</title><desc id="d">Camera or video frames go to a newest-frame reader, then four throttled OpenVINO models, then scene logic with a sticky lead vehicle, then an OpenGL world view and an annotated camera view. Output is display only.</desc>
+<defs><marker id="a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 Z" fill="#38D6F5"/></marker></defs>
+<rect width="1280" height="560" rx="18" fill="#0A1119"/>
+<text x="40" y="46" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="24" font-weight="700" fill="#E6EEF5">Desktop Pilot · one frame's journey</text>
+<text x="40" y="72" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="400" fill="#8AA4B8">newest frame wins · each model runs asynchronously every N display frames, so the display never waits on inference</text>
+<text x="40" y="112" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="700" fill="#5F7C92">INPUT</text>
+<text x="330" y="112" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="700" fill="#5F7C92">PERCEPTION · OpenVINO</text>
+<text x="690" y="112" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="700" fill="#5F7C92">SCENE LOGIC</text>
+<text x="1000" y="112" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="700" fill="#5F7C92">RENDER</text>
+<rect x="40" y="128" width="250" height="70" rx="12" fill="#0F1A26" stroke="#1F3448" stroke-width="1.5"/>
+<text x="58" y="156" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#E6EEF5">USB webcam</text>
+<text x="58" y="178" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#8AA4B8">DirectShow · FFmpeg capture</text>
+<rect x="40" y="220" width="250" height="70" rx="12" fill="#0F1A26" stroke="#1F3448" stroke-width="1.5"/>
+<text x="58" y="246" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#E6EEF5">Video file / YouTube clip</text>
+<text x="58" y="268" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#8AA4B8">yt-dlp → short local clip</text>
+<rect x="40" y="330" width="250" height="92" rx="12" fill="#0F1A26" stroke="#38D6F5" stroke-width="1.5"/>
+<text x="58" y="358" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#E6EEF5">Latest-frame reader</text>
+<text x="58" y="380" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#8AA4B8">background thread</text>
+<text x="58" y="400" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#8AA4B8">stale frames are dropped</text>
+<text x="165" y="211" text-anchor="middle" font-family="ui-monospace, 'Cascadia Code', Consolas, Menlo, monospace" font-size="11" font-weight="700" fill="#5F7C92">OR</text>
+<line x1="165" y1="292" x2="165" y2="326" stroke="#38D6F5" stroke-width="1.8" marker-end="url(#a)"/>
+<rect x="330" y="128" width="320" height="78" rx="12" fill="#0F1A26" stroke="#38D6F5" stroke-width="1.5"/>
+<text x="348" y="158" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#E6EEF5">YOLO11n + ByteTrack</text>
+<text x="348" y="181" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#8AA4B8">objects + track IDs</text>
+<rect x="560" y="144" width="76" height="22" rx="11" fill="#0B2A35"/>
+<text x="598" y="159" text-anchor="middle" font-family="ui-monospace, 'Cascadia Code', Consolas, Menlo, monospace" font-size="11.5" font-weight="700" fill="#38D6F5">every 3</text>
+<text x="598" y="188" text-anchor="middle" font-family="ui-monospace, 'Cascadia Code', Consolas, Menlo, monospace" font-size="11.5" font-weight="400" fill="#8AA4B8">intel:gpu</text>
+<path d="M292 376 C 312 376, 310 167, 326 167" fill="none" stroke="#38D6F5" stroke-width="1.4" opacity="0.7" marker-end="url(#a)"/>
+<path d="M652 167 C 668 167, 668 300, 686 300" fill="none" stroke="#38D6F5" stroke-width="1.4" opacity="0.7" marker-end="url(#a)"/>
+<rect x="330" y="220" width="320" height="78" rx="12" fill="#0F1A26" stroke="#38D6F5" stroke-width="1.5"/>
+<text x="348" y="250" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#E6EEF5">YOLOPv2</text>
+<text x="348" y="273" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#8AA4B8">lanes + drivable area</text>
+<rect x="560" y="236" width="76" height="22" rx="11" fill="#0B2A35"/>
+<text x="598" y="251" text-anchor="middle" font-family="ui-monospace, 'Cascadia Code', Consolas, Menlo, monospace" font-size="11.5" font-weight="700" fill="#38D6F5">every 5</text>
+<text x="598" y="280" text-anchor="middle" font-family="ui-monospace, 'Cascadia Code', Consolas, Menlo, monospace" font-size="11.5" font-weight="400" fill="#8AA4B8">GPU</text>
+<path d="M292 376 C 312 376, 310 259, 326 259" fill="none" stroke="#38D6F5" stroke-width="1.4" opacity="0.7" marker-end="url(#a)"/>
+<path d="M652 259 C 668 259, 668 300, 686 300" fill="none" stroke="#38D6F5" stroke-width="1.4" opacity="0.7" marker-end="url(#a)"/>
+<rect x="330" y="312" width="320" height="78" rx="12" fill="#0F1A26" stroke="#38D6F5" stroke-width="1.5"/>
+<text x="348" y="342" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#E6EEF5">UFLD TuSimple</text>
+<text x="348" y="365" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#8AA4B8">painted ego lanes</text>
+<rect x="560" y="328" width="76" height="22" rx="11" fill="#0B2A35"/>
+<text x="598" y="343" text-anchor="middle" font-family="ui-monospace, 'Cascadia Code', Consolas, Menlo, monospace" font-size="11.5" font-weight="700" fill="#38D6F5">every 22</text>
+<text x="598" y="372" text-anchor="middle" font-family="ui-monospace, 'Cascadia Code', Consolas, Menlo, monospace" font-size="11.5" font-weight="400" fill="#8AA4B8">CPU</text>
+<path d="M292 376 C 312 376, 310 351, 326 351" fill="none" stroke="#38D6F5" stroke-width="1.4" opacity="0.7" marker-end="url(#a)"/>
+<path d="M652 351 C 668 351, 668 300, 686 300" fill="none" stroke="#38D6F5" stroke-width="1.4" opacity="0.7" marker-end="url(#a)"/>
+<rect x="330" y="404" width="320" height="78" rx="12" fill="#0F1A26" stroke="#1F3448" stroke-width="1.5" stroke-dasharray="5 4"/>
+<text x="348" y="434" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#E6EEF5">Depth Anything V2 S</text>
+<text x="348" y="457" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#8AA4B8">range stabilisation · --depth / --no-depth</text>
+<rect x="560" y="420" width="76" height="22" rx="11" fill="#0B2A35"/>
+<text x="598" y="435" text-anchor="middle" font-family="ui-monospace, 'Cascadia Code', Consolas, Menlo, monospace" font-size="11.5" font-weight="700" fill="#38D6F5">every 10</text>
+<text x="598" y="464" text-anchor="middle" font-family="ui-monospace, 'Cascadia Code', Consolas, Menlo, monospace" font-size="11.5" font-weight="400" fill="#8AA4B8">GPU</text>
+<path d="M292 376 C 312 376, 310 443, 326 443" fill="none" stroke="#38D6F5" stroke-width="1.4" opacity="0.7" marker-end="url(#a)"/>
+<path d="M652 443 C 668 443, 668 300, 686 300" fill="none" stroke="#38D6F5" stroke-width="1.4" opacity="0.7" marker-end="url(#a)"/>
+<rect x="690" y="128" width="270" height="366" rx="12" fill="#0F1A26" stroke="#1F3448" stroke-width="1.5"/>
+<circle cx="716" cy="164" r="11" fill="#0B2A35" stroke="#38D6F5"/>
+<text x="716" y="168" text-anchor="middle" font-family="ui-monospace, 'Cascadia Code', Consolas, Menlo, monospace" font-size="11" font-weight="700" fill="#38D6F5">1</text>
+<text x="738" y="169" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="13.5" font-weight="400" fill="#E6EEF5">road geometry + lane slots</text>
+<circle cx="716" cy="218" r="11" fill="#0B2A35" stroke="#38D6F5"/>
+<text x="716" y="222" text-anchor="middle" font-family="ui-monospace, 'Cascadia Code', Consolas, Menlo, monospace" font-size="11" font-weight="700" fill="#38D6F5">2</text>
+<text x="738" y="223" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="13.5" font-weight="400" fill="#E6EEF5">de-duplicate · merge presence</text>
+<circle cx="716" cy="272" r="11" fill="#0B2A35" stroke="#38D6F5"/>
+<text x="716" y="276" text-anchor="middle" font-family="ui-monospace, 'Cascadia Code', Consolas, Menlo, monospace" font-size="11" font-weight="700" fill="#38D6F5">3</text>
+<text x="738" y="277" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="13.5" font-weight="400" fill="#E6EEF5">filter relevant traffic</text>
+<circle cx="716" cy="326" r="11" fill="#0B2A35" stroke="#5FE440"/>
+<text x="716" y="330" text-anchor="middle" font-family="ui-monospace, 'Cascadia Code', Consolas, Menlo, monospace" font-size="11" font-weight="700" fill="#5FE440">4</text>
+<text x="738" y="331" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="13.5" font-weight="700" fill="#C9F7B8">pick a sticky LEAD vehicle</text>
+<circle cx="716" cy="380" r="11" fill="#0B2A35" stroke="#38D6F5"/>
+<text x="716" y="384" text-anchor="middle" font-family="ui-monospace, 'Cascadia Code', Consolas, Menlo, monospace" font-size="11" font-weight="700" fill="#38D6F5">5</text>
+<text x="738" y="385" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="13.5" font-weight="400" fill="#E6EEF5">stable world pose + heading</text>
+<circle cx="716" cy="434" r="11" fill="#0B2A35" stroke="#38D6F5"/>
+<text x="716" y="438" text-anchor="middle" font-family="ui-monospace, 'Cascadia Code', Consolas, Menlo, monospace" font-size="11" font-weight="700" fill="#38D6F5">6</text>
+<text x="738" y="439" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="13.5" font-weight="400" fill="#E6EEF5">calibration: height · horizon · FOV</text>
+<rect x="1000" y="128" width="240" height="110" rx="12" fill="#0F1A26" stroke="#5FE440" stroke-width="1.5"/>
+<text x="1018" y="158" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#E6EEF5">3D world</text>
+<text x="1018" y="180" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#8AA4B8">OpenGL low-poly meshes</text>
+<text x="1018" y="200" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#8AA4B8">road-locked lane slots</text>
+<text x="1018" y="220" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#8AA4B8">sticky LEAD highlighted</text>
+<rect x="1000" y="250" width="240" height="90" rx="12" fill="#0F1A26" stroke="#5FE440" stroke-width="1.5"/>
+<text x="1018" y="280" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#E6EEF5">Annotated camera</text>
+<text x="1018" y="302" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#8AA4B8">boxes · lanes · path overlay</text>
+<rect x="1000" y="352" width="240" height="142" rx="12" fill="#0F1A26" stroke="#1F3448" stroke-width="1.5"/>
+<text x="1018" y="382" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#E6EEF5">Views</text>
+<rect x="1018" y="396" width="46" height="18" rx="4" fill="#0B2A35" stroke="#1F3448"/>
+<text x="1041" y="409" text-anchor="middle" font-family="ui-monospace, 'Cascadia Code', Consolas, Menlo, monospace" font-size="11" font-weight="700" fill="#38D6F5">1 / M</text>
+<text x="1074" y="409" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#8AA4B8">world</text>
+<rect x="1018" y="419" width="46" height="18" rx="4" fill="#0B2A35" stroke="#1F3448"/>
+<text x="1041" y="432" text-anchor="middle" font-family="ui-monospace, 'Cascadia Code', Consolas, Menlo, monospace" font-size="11" font-weight="700" fill="#38D6F5">2</text>
+<text x="1074" y="432" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#8AA4B8">camera</text>
+<rect x="1018" y="442" width="46" height="18" rx="4" fill="#0B2A35" stroke="#1F3448"/>
+<text x="1041" y="455" text-anchor="middle" font-family="ui-monospace, 'Cascadia Code', Consolas, Menlo, monospace" font-size="11" font-weight="700" fill="#38D6F5">3</text>
+<text x="1074" y="455" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#8AA4B8">split</text>
+<rect x="1018" y="465" width="46" height="18" rx="4" fill="#0B2A35" stroke="#1F3448"/>
+<text x="1041" y="478" text-anchor="middle" font-family="ui-monospace, 'Cascadia Code', Consolas, Menlo, monospace" font-size="11" font-weight="700" fill="#38D6F5">L</text>
+<text x="1074" y="478" text-anchor="start" font-family="'Segoe UI', Inter, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#8AA4B8">lane overlay</text>
+<line x1="962" y1="183" x2="996" y2="183" stroke="#38D6F5" stroke-width="1.8" marker-end="url(#a)"/>
+<line x1="962" y1="295" x2="996" y2="295" stroke="#38D6F5" stroke-width="1.8" marker-end="url(#a)"/>
+<rect x="40" y="512" width="1200" height="32" rx="8" fill="#2A1508" stroke="#F59E0B"/>
+<text x="640" y="533" text-anchor="middle" font-family="ui-monospace, 'Cascadia Code', Consolas, Menlo, monospace" font-size="13" font-weight="700" fill="#FCD34D">OUTPUT = PIXELS ON A SCREEN · no CAN-bus, steering, braking, throttle or actuator code</text>
+</svg>
